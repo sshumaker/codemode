@@ -331,3 +331,59 @@ That reframes the hill-climbing work: the bottleneck is not ideas for prompts,
 it is throughput. Hence `bench/pool.mjs` and `--concurrency` on both `sweep.mjs`
 and `hillclimb.mjs` (verified running 7 concurrent tasks). Runs are latency-bound,
 so wall-clock scales close to linearly until an upstream rate limit bites.
+
+### 8. Both arms were bypassing MCP with `curl` — asymmetrically
+
+Auditing every shell command and ipython cell:
+
+| arm | cells | network-bypass | share | runs affected |
+|---|---|---|---|---|
+| vanilla | 205 | 159 | **77.6%** | 9 |
+| codemode | 1,169 | 125 | 10.7% | 14 |
+
+Vanilla was reaching the Met Museum, Steam, and other APIs directly:
+
+```
+curl -s "https://collectionapi.metmuseum.org/public/collection/v1/search?q=Claude%20Monet..."
+```
+
+instead of calling `Metropolitan_Museum__search-museum-objects`. That contaminates
+the experiment twice:
+
+1. **The arm is not exercising the tool surface under test.** A "tool-calling
+   baseline" that curls is not a tool-calling baseline.
+2. **The judge scores it as ungrounded.** The judge sees only proxy-logged MCP
+   calls, so facts obtained by curl have no visible source. Vanilla bypassed 7x
+   more than codemode, so it absorbed most of that penalty — on grounding, which
+   is exactly where it trailed (5.6 vs 6.6).
+
+**Fix:** the agent process now runs with `http_proxy`/`https_proxy` pointed at a
+dead port, with `127.0.0.1` and `api.anthropic.com` exempt. The MCP servers live
+in a separate process tree (`bench/mcp-proxy.mjs`) and keep their network, so
+tools work while direct egress does not. curl, `requests`, `urllib` and `httpx`
+all honour those variables; Node's undici ignores them, which is why the model
+API is unaffected. Verified: external curl returns 000, the local proxy returns
+200, MCP calls still flow, runs complete.
+
+`HARNESS_ALLOW_DIRECT_NET=1` restores the old behaviour if it ever needs measuring.
+
+**All 91 runs made before this fix are invalid** and are archived under
+`.run/archive-preegress/`. Every number reported prior to this point — including
+the 11-task headline — was measured under the contaminated condition.
+
+### 9. Single-sample LLM judging is not a measurement
+
+Judging one unchanged run four times gave `[5.17, 4.50, 4.33, 5.00]` — spread
+0.84, sd ~0.39 on a 10-point scale. The arm difference being claimed was +0.59.
+**Judge noise was comparable to the effect.**
+
+`bench/judge.mjs` now averages 3 samples by default and records `sd` and `se`
+alongside the score, so downstream analysis can separate measurement noise from a
+real difference. MCP-Bench does the same thing (`enable_judge_stability`).
+
+### 10. The judge can partly infer the arm
+
+Codemode's final answers mention implementation details (`api.`, `cell`,
+`python`) in 34% of runs against vanilla's 19%. The judge prompt never names the
+arm and normalizes trajectories through the proxy log, but style leakage remains
+a possible bias. Not yet corrected; recorded as a limitation.
