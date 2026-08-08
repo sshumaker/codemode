@@ -8,6 +8,17 @@
  *
  * Add a variant, run `bench/hillclimb.mjs`, keep it if it wins. Record what each
  * one was reacting to; a variant with no hypothesis is not worth a run.
+ *
+ * SAMPLE SIZE WARNING, measured rather than assumed. The same prompt on the same
+ * task, run twice, differed by 29% in turns and 26% in cost. That run-to-run
+ * noise is 2-5x larger than any prompt effect observed so far, so a 5-task
+ * comparison cannot separate these variants at all. Detecting a 10% effect at
+ * 80% power needs roughly 115 paired tasks per variant. Run hillclimb with high
+ * --concurrency and repeats, or do not believe the ranking.
+ *
+ * Standing result so far: every variant that adds guidance has scored at or
+ * below the minimal v1 on both cost and judge score. That is not yet significant,
+ * but four attempts have now failed to beat "say less".
  */
 
 /** Shared discovery instructions — the part no variant has reason to change. */

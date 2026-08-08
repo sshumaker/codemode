@@ -283,3 +283,51 @@ than stdio and needs a billing-enabled key.
   with no collisions.
 - **Seven real tools ship an empty description.** They render, but would be
   near-invisible in an L2 TOC.
+
+## Prompt hill-climbing: four variants, none beat the minimal prompt
+
+Trace analysis of 573 codemode cells showed where the turns actually go:
+
+| what the turn did | share |
+|---|---|
+| local compute / data wrangling | 45.2% |
+| inspecting local variables | 39.8% |
+| discovery (reading `api/`) | 7.9% |
+| actual tool calls | 6.8% |
+| cell failures | **0.0%** |
+
+**48% of cells make no tool call at all; median cell is 4 lines; 45% of everything
+codemode put back into its own context came from printing its own variables**
+(~117k tokens) rather than from tool results. It fetches a 182k-char payload,
+binds it to a variable, then prints it back 1,000 chars at a time — partially
+defeating the mechanism the arm exists for. Zero cells fail: this is not error
+recovery, it is a notebook-style print-and-look loop.
+
+Four variants attacked that (see `bench/prompts.mjs`):
+
+| variant | approach | vs v1 (paired) |
+|---|---|---|
+| v2 | explicit anti-notebook rules | worse (n=1) |
+| v3 | one worked example instead of rules | +5% cost, -0.03 score |
+| v4 | plan-then-execute | +13% cost, -0.30 score |
+
+**None beat the minimal v1 preamble on either cost or quality.**
+
+### But the more important finding is that this comparison cannot decide anything
+
+The same prompt, on the same task, run twice under identical configuration:
+
+```
+turns  24 -> 17   (-29%)
+cost   $0.196 -> $0.1443   (-26%)
+```
+
+**Run-to-run noise is ~27% — two to five times larger than any prompt effect
+measured.** At n=5 paired tasks these variants are indistinguishable from each
+other and from v1. Detecting a 10% effect at 80% power needs roughly **115
+paired tasks per variant**.
+
+That reframes the hill-climbing work: the bottleneck is not ideas for prompts,
+it is throughput. Hence `bench/pool.mjs` and `--concurrency` on both `sweep.mjs`
+and `hillclimb.mjs` (verified running 7 concurrent tasks). Runs are latency-bound,
+so wall-clock scales close to linearly until an upstream rate limit bites.
