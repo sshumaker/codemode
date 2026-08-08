@@ -48,6 +48,17 @@ export function pyIdent(name) {
 	return PY_KEYWORDS.has(prefixed) ? `${prefixed}_` : prefixed;
 }
 
+/**
+ * Package name for a server.
+ *
+ * Lowercased, per PEP 8 and because the agent has to type it from memory after
+ * reading an index — "OpenAPI Explorer" becoming `openapi_explorer` is a rule
+ * it can apply, whereas mixed case invites near-miss imports.
+ */
+export function pyPackage(server) {
+	return pyIdent(server).toLowerCase();
+}
+
 function pyType(schema) {
 	if (!schema || typeof schema !== "object") return "Any";
 	if (Array.isArray(schema.enum) && schema.enum.length > 0) {
@@ -100,24 +111,59 @@ export function signature(tool) {
 
 // --- renderers ---------------------------------------------------------------
 
+/**
+ * Provider-safe tool name.
+ *
+ * Anthropic requires `^[a-zA-Z0-9_-]{1,64}$`, so real server names ("OpenAPI
+ * Explorer") cannot be used raw, and server+tool can exceed 64 characters. The
+ * qualified name is what the model sees; the proxy maps it back to the real
+ * (server, tool) pair, so mangling here never reaches the wire.
+ */
+export function wireName(server, tool) {
+	const clean = (s) => s.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+	const full = server ? `${clean(server)}__${clean(tool)}` : clean(tool);
+	if (full.length <= 64) return full;
+	// Truncate the server half first; the tool half carries more information.
+	const toolPart = clean(tool).slice(0, 48);
+	const budget = 64 - toolPart.length - 2;
+	return `${clean(server).slice(0, Math.max(1, budget))}__${toolPart}`;
+}
+
 /** vanilla L4: the JSON tool definitions that occupy context every turn. */
 export function renderToolDefs(tools, { server } = {}) {
 	return tools.map((t) => ({
-		name: server ? `${server}__${t.name}` : t.name,
+		name: wireName(server, t.name),
 		description: t.description,
 		input_schema: t.schema,
+		// Not sent to the model — the proxy needs the real identifiers back.
+		_mcp: { server, tool: t.name },
 	}));
 }
 
-/** L2: one line per tool. */
-export function renderTocLines(tools, { server } = {}) {
-	const prefix = server ? `${server}.` : "";
-	return tools.map((t) => `${prefix}${signature(t)} — ${firstLine(t.description)}`);
+/**
+ * L2: one line per tool.
+ *
+ * `style` decides what the line is addressed by, because the two arms call
+ * tools differently and a TOC the agent cannot act on is worse than none:
+ *   "python"  api.math_mcp.add(a, b) — ...      (codemode: an importable path)
+ *   "wire"    Math_MCP__add(a, b) — ...         (vanilla: the tool name)
+ */
+export function renderTocLines(tools, { server, style = "python" } = {}) {
+	return tools.map((t) => {
+		const params = t.params.map((p) => (p.required ? p.pyName : `${p.pyName}?`)).join(", ");
+		const path =
+			style === "wire"
+				? `${wireName(server, t.name)}(${params})`
+				: `api.${pyPackage(server)}.${t.pyName}(${params})`;
+		return `${path} — ${firstLine(t.description)}`;
+	});
 }
 
 /** L1: names only. */
-export function renderNames(tools, { server } = {}) {
-	return tools.map((t) => (server ? `${server}.${t.name}` : t.name));
+export function renderNames(tools, { server, style = "python" } = {}) {
+	return tools.map((t) =>
+		style === "wire" ? wireName(server, t.name) : `api.${pyPackage(server)}.${t.pyName}`,
+	);
 }
 
 /**
@@ -150,7 +196,8 @@ export function renderToolModule(tool, { server }) {
 		"",
 		"from typing import Any, Literal",
 		"",
-		`from ._client import call as _call`,
+		// `_client` lives at the api/ root, one level above the server package.
+		`from .._client import call as _call`,
 		"",
 		"",
 		signatureLine,
@@ -162,12 +209,14 @@ export function renderToolModule(tool, { server }) {
 
 /** codemode: the per-server package index, one line per tool. */
 export function renderServerIndex(tools, { server }) {
+	const pkg = pyPackage(server);
 	return [
 		`# ${server}`,
 		"",
-		`${tools.length} tool${tools.length === 1 ? "" : "s"}. Read a tool's module for full documentation.`,
+		`${tools.length} tool${tools.length === 1 ? "" : "s"}. \`import api.${pkg}\`, then call any of the below.`,
+		`Each is \`async\`. Read \`api/${pkg}/<tool>.py\` for full parameter documentation.`,
 		"",
-		...tools.map((t) => `- \`${signature(t)}\` — ${firstLine(t.description)}`),
+		...tools.map((t) => `- \`api.${pkg}.${t.pyName}(${t.params.map((p) => (p.required ? p.pyName : `${p.pyName}?`)).join(", ")})\` — ${firstLine(t.description)}`),
 		"",
 	].join("\n");
 }
@@ -186,15 +235,90 @@ export function renderServerInit(tools, { server }) {
 	].join("\n");
 }
 
+/**
+ * codemode: the transport every generated module calls through.
+ *
+ * Deliberately the same proxy the vanilla arm's tools POST to, so the arms
+ * differ only in how the model is shown the catalogue — not in how calls are
+ * made, what they cost, or how they fail.
+ *
+ * Written with stdlib only: the kernel is a bare uv-managed environment and a
+ * missing `requests` would silently disable the entire arm.
+ */
+export function renderClient() {
+	return `"""Transport for the generated api/ modules. Do not edit.
+
+Every tool module calls \`_client.call\`, which forwards to the shared MCP proxy.
+"""
+
+import json
+import os
+import urllib.request
+
+_PROXY = os.environ.get("HARNESS_MCP_PROXY", "http://127.0.0.1:8765")
+_RUN_ID = os.environ.get("HARNESS_RUN_ID", "")
+_TIMEOUT = 180
+
+
+class McpError(RuntimeError):
+    """An MCP tool returned an error, or the server was unreachable."""
+
+
+async def call(server: str, tool: str, args: dict) -> str:
+    """Invoke an MCP tool and return its text result.
+
+    Arguments whose value is None are dropped, so optional parameters left at
+    their default are not sent as explicit nulls — several servers reject that.
+
+    Raises:
+        McpError: The server returned an error or could not be reached.
+    """
+    payload = {
+        "server": server,
+        "tool": tool,
+        "args": {k: v for k, v in (args or {}).items() if v is not None},
+        "meta": {"arm": "codemode", "runId": _RUN_ID},
+    }
+    request = urllib.request.Request(
+        _PROXY + "/call",
+        data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+            body = json.loads(response.read())
+    except Exception as exc:  # noqa: BLE001 - surfaced to the agent as-is
+        raise McpError(f"{server}.{tool}: proxy unreachable: {exc}") from exc
+
+    if not body.get("ok"):
+        raise McpError(f"{server}.{tool}: {body.get('error', 'unknown error')}")
+    return body.get("text", "")
+`;
+}
+
 /** codemode: the top-level index across servers. */
 export function renderRootIndex(catalogue) {
 	const total = catalogue.reduce((n, s) => n + s.tools.length, 0);
 	return [
 		"# api",
 		"",
-		`${catalogue.length} servers, ${total} tools. \`cat api/<server>/INDEX.md\` for a server's tools.`,
+		`${catalogue.length} servers, ${total} tools, all async.`,
 		"",
-		...catalogue.map((s) => `- \`${s.server}\` — ${s.tools.length} tools`),
+		"Find a tool:",
+		"  grep -ril '<keyword>' api/          # search every tool's documentation",
+		"  cat api/<package>/INDEX.md          # list one server's tools",
+		"  cat api/<package>/<tool>.py         # full parameter documentation",
+		"",
+		"Call one:",
+		"  import api.<package>",
+		"  result = await api.<package>.<tool>(...)",
+		"",
+		"| package | server | tools |",
+		"| --- | --- | --- |",
+		// The package column is what gets imported; the server column is the name
+		// the task description will use. The agent needs both to bridge them.
+		...catalogue.map((s) => `| \`${s.pyServer}\` | ${s.server} | ${s.tools.length} |`),
 		"",
 	].join("\n");
 }
@@ -212,7 +336,7 @@ export function generate(catalogue) {
 	// goes on the wire and what the TOC and tool defs display.
 	const normalized = catalogue.map((s) => ({
 		server: s.server,
-		pyServer: pyIdent(s.server),
+		pyServer: pyPackage(s.server),
 		tools: s.tools.map(normalizeTool),
 	}));
 
@@ -228,7 +352,13 @@ export function generate(catalogue) {
 	const toolDefs = [];
 	const tocLines = [];
 	const names = [];
-	const files = { "INDEX.md": renderRootIndex(normalized) };
+	// `__init__.py` at the root so `import api.<pkg>` resolves as a regular
+	// package rather than relying on namespace-package resolution.
+	const files = {
+		"INDEX.md": renderRootIndex(normalized),
+		"__init__.py": '"""Generated MCP tool catalogue. See INDEX.md."""\n',
+		"_client.py": renderClient(),
+	};
 
 	for (const { server, pyServer, tools } of normalized) {
 		toolDefs.push(...renderToolDefs(tools, { server }));
