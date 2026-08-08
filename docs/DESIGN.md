@@ -74,7 +74,38 @@ the parent.
 
 Replaces prime's `rlm.run()`, which is detached (returns a handle "once its task
 is admitted") and therefore needs the `rlm-heartbeat` / `agent-message`
-coordination machinery. Blocking `spawn` is the arm-symmetric primitive.
+coordination machinery.
+
+### Names
+
+`name=` is required, not optional (cf. `threading.Thread(name=...)`,
+`asyncio.create_task(name=...)`). It is what appears in `ps`, in
+`list_subagents()`, and in completion notifications; unnamed subagents make all
+three unreadable. `vanilla`'s `task()` tool carries the same required
+`description` field.
+
+### Completion notifications
+
+Hard constraint: **the model only exists at turn boundaries.** A done-callback
+fires in the kernel event loop while no model is running, so it can mutate state
+but cannot inform anyone. Signals are worse. Completion must land somewhere the
+model reads.
+
+Push a line, pull the detail — progressive disclosure applied to notifications:
+
+- On child exit the harness injects one line into the parent's next turn:
+  `subagent "test-fixer" exited 0 after 45s -> <session_dir>`. ~15 tokens.
+- Full transcript and output stay on disk, read only if the parent cares.
+- Events also append to `events.jsonl` in the run dir, so a parent that missed
+  one (kernel restart) can grep its own event log — same recovery story as the
+  conversation log.
+
+Identical in both arms, or the comparison breaks.
+
+This combination — async, steerable via `send()`, and notifying — has no
+equivalent in the tool-calling world, where subagent tools block. That is a
+capability argument for the design independent of the token argument, and it
+should be reported separately from the token results.
 
 ## Documentation is the tool schema
 
@@ -82,12 +113,49 @@ The two arms carry identical information in different containers:
 
 | | `vanilla` | `codemode` |
 |---|---|---|
-| container | JSON Schema tool definition | docstring + type hints |
-| delivery | injected every turn, unconditionally | pulled on demand via `help()` / `inspect.signature()` / `dir()` |
-| discovery | none needed — always resident | Python's introspection protocol |
+| container | JSON Schema tool definition | `api/` file: docstring + type hints |
+| delivery | injected every turn, unconditionally | pulled on demand |
+| discovery | none needed — always resident | `grep` / `ls` / `cat` over `api/` |
 
-Python's introspection protocol *is* the progressive-disclosure mechanism, and
-we get it free — `help(spawn)` is not something the model has to be taught.
+### The `api/` tree
+
+The MCP catalog is rendered to disk as real Python modules. Files *are* the
+modules, so `grep`, `import`, and `help()` all read the same text and cannot
+drift:
+
+```
+api/
+  INDEX.md                 one line per server
+  linear/
+    INDEX.md               one line per tool
+    __init__.py            re-exports -> `import api.linear as linear`
+    list_issues.py         full docstring + type hints
+    create_issue.py
+```
+
+Three disclosure levels with a measurable cost gradient: `ls api/` ->
+`cat api/linear/INDEX.md` -> `cat api/linear/list_issues.py`. Instrument which
+files are read, at what token cost, before which call — this measures discovery
+cost directly rather than inferring it from totals.
+
+Introspection (`help()`, `dir()`) still works and is worth mentioning in the
+preamble, but `grep` is the primary entry point: `dir()` requires already
+knowing the module name, which is the chicken-and-egg problem at 250 tools.
+
+**The `api/` tree is not arm-neutral.** In `vanilla`, MCP tools must be native
+tool definitions resident in context — that is the bloat condition being
+baselined. Same catalog, two renderings.
+
+### Fairness: one source, two renderings
+
+The generator is the fairness mechanism. MCP schema -> one description ->
+rendered into both a JSON tool definition (`vanilla`) and an `api/` file
+(`codemode`). Single source, two containers, diffable when either changes.
+Otherwise the experiment measures whose prose is better, not which architecture
+is better.
+
+Only harness-native capabilities (subagents, file ops) need the matched pair
+applied by hand.
 
 Two consequences:
 

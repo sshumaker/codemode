@@ -11,8 +11,9 @@ binary, so `--tools` makes the child inherit the parent's arm automatically:
 """
 
 
-async def run(prompt: str, *, model: str | None = None, tools: str | None = None,
-              max_tokens: int | None = None, timeout: float | None = None) -> str:
+async def run(prompt: str, *, name: str, model: str | None = None,
+              tools: str | None = None, max_tokens: int | None = None,
+              timeout: float | None = None) -> str:
     """Run a subagent to completion and return its final response.
 
     The blocking convenience form. Use `spawn` instead when you need to steer
@@ -21,6 +22,8 @@ async def run(prompt: str, *, model: str | None = None, tools: str | None = None
     Args:
         prompt: The task for the subagent. Self-contained — the child does not
             inherit the parent's conversation or kernel namespace.
+        name: Short descriptive label, e.g. "test-fixer". Required. Appears in
+            `ps`, in `list_subagents()`, and in completion notifications.
         model: Provider/model selector. Defaults to the parent's model.
         tools: Tool registry for the child. Defaults to the parent's arm.
         max_tokens: Token budget. The child is killed when it is exceeded.
@@ -34,13 +37,18 @@ async def run(prompt: str, *, model: str | None = None, tools: str | None = None
         TimeoutError: `timeout` elapsed before completion.
 
     Example:
-        >>> summary = await run("summarize the failing tests in ./tests")
+        >>> summary = await run("summarize the failing tests in ./tests",
+        ...                     name="test-summary")
     """
 
 
-def spawn(prompt: str, *, model: str | None = None, tools: str | None = None,
-          max_tokens: int | None = None) -> "Subagent":
+def spawn(prompt: str, *, name: str, model: str | None = None,
+          tools: str | None = None, max_tokens: int | None = None) -> "Subagent":
     """Start a subagent and return a handle without waiting for it.
+
+    You do not need to poll. When the child finishes or stops, a one-line
+    notification arrives at the top of your next turn naming it and pointing at
+    its session directory; read that directory only if you need the detail.
 
     Prefer the context-manager form, which guarantees the child is reaped even
     if the parent's cell raises:
@@ -53,7 +61,7 @@ def spawn(prompt: str, *, model: str | None = None, tools: str | None = None,
 
     Concurrent fan-out is ordinary asyncio:
 
-        agents = [spawn(p) for p in prompts]
+        agents = [spawn(p, name=f"worker-{i}") for i, p in enumerate(prompts)]
         results = await asyncio.gather(*(a.result() for a in agents))
 
     Args: see `run`.
@@ -72,6 +80,7 @@ class Subagent:
     reset can be recovered with `attach(pid)` rather than orphaned.
     """
 
+    name: str
     pid: int
     session_dir: str
     returncode: int | None
