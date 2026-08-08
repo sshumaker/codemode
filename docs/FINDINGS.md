@@ -224,6 +224,42 @@ codemode run. The sweep is resumable (it skips any task/arm with an existing
 Recorded because the resumability is what made it cheap to recover, and because
 process-name matching is broad enough to catch unrelated work.
 
+### 7. The deferred vanilla baseline (L1) is built but does not work yet
+
+The most important open question is whether codemode still wins against a
+*deferred* vanilla arm rather than the naive L4 one. That arm is implemented —
+`search_tools` + `load_tool`, where loading a tool activates it and makes it
+directly callable, mirroring how Claude Code's ToolSearch behaves — but it does
+not currently defer.
+
+Three attempts:
+
+1. **Meta-tools only** (`search_tools`/`describe_tool`/`call_tool`, names hidden).
+   Genuinely deferred — first-turn prompt fell to 2,862 tokens — but this is L0,
+   not L1, and the model never searched: it went straight to `curl` in bash.
+2. **Names in the prompt, calls routed through `call_tool`.** The model
+   repeatedly tried to invoke the listed names directly and burned 16 turns on
+   errors before timing out. Listing names that are not callable is its own trap.
+3. **Names in the prompt + `load_tool` activating the real tool.** Correct
+   design, but `pi.setActiveTools()` at `session_start` fires too late to affect
+   the first request, and the `--active-tools` CLI flag added by
+   `scripts/neutralize-prime.mjs` does not reach the print-mode path. First-turn
+   prompt stayed at 21,563 tokens — identical to L4.
+
+**A run labelled L1 that is silently L4 would corrupt every comparison it
+appears in**, so `run-task.mjs` now records `firstTurnPromptTokens` and marks a
+`residencyViolation` when it exceeds the level's budget; `report.mjs` excludes
+violating runs from pairing. The broken L1 run is correctly rejected:
+
+```
+violation: L1 first turn carried 21563 prompt tokens (budget 8000)
+           — the catalogue was resident, so this is not a L1 run
+```
+
+Fixing this means finding where print mode builds its session options and
+threading `initialActiveToolNames` through — the SDK already supports it
+(`sdk.ts:254`), it is only the CLI path that drops it.
+
 ## Setup problems worth recording
 
 MCP-Bench's `mcp_servers/requirements.txt` pins `mcp[cli]>=1.9.0` with no upper
