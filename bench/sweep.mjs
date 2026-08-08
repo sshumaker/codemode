@@ -44,6 +44,10 @@ const timeout = flag("timeout", "420");
 const tier = flag("tier", null);
 // Runs are latency-bound, so wall-clock scales close to linearly with this.
 const concurrency = Number(flag("concurrency", 1));
+// Best measured configuration on Opus — see CLAUDE.md.
+const codemodePrompt = flag("prompt", "q7");
+const vanillaPrompt = flag("vanilla-prompt", "w2");
+const nsMode = flag("ns", "delta");
 
 const tasks = tier
 	? loadTasks({ tier }).sort((a, b) => a.id.localeCompare(b.id)).slice(0, perTier)
@@ -74,8 +78,13 @@ function runOne(task, arm) {
 			levelFor(arm),
 			"--timeout",
 			timeout,
+			...(arm === "codemode" ? ["--prompt", codemodePrompt] : []),
+			...(arm === "vanilla" ? ["--vanilla-prompt", vanillaPrompt] : []),
 		];
-		const child = spawn("node", args, { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn("node", args, {
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, HARNESS_SHOW_NAMESPACE: nsMode },
+		});
 		let out = "";
 		child.stdout.on("data", (d) => (out += d));
 		child.stderr.on("data", (d) => (out += d));
