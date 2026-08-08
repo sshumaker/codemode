@@ -54,6 +54,18 @@ export const SUBSTITUTABLE_SERVERS = new Set([
 	"Movie Recommender",
 ]);
 
+/**
+ * Servers whose free tier rate-limits under parallel runs.
+ *
+ * DEX Paprika returns "Rate limit exceeded" as a *successful* MCP response, so
+ * the agent sees an error caused by the harness rather than by its own choices,
+ * and whichever arm happens to run when the limit trips absorbs the penalty.
+ * Throttling to ~2s between calls and retrying was not enough at 676 calls.
+ * Excluded as a required server; still fine as a distractor, since its
+ * definitions are part of the context bloat under test.
+ */
+export const RATE_LIMITED_SERVERS = new Set(["DEX Paprika"]);
+
 /** Servers whose schemas we successfully dumped — anything else can't be run. */
 export function availableServers() {
 	if (!existsSync(SCHEMAS)) return new Set();
@@ -107,7 +119,9 @@ export function loadTasks({ tier, runnable = true, grounded = true } = {}) {
 		.filter(
 			(task) =>
 				!grounded ||
-				task.servers.every((s) => !CREDENTIALED_SERVERS.has(s) && !SUBSTITUTABLE_SERVERS.has(s)),
+				task.servers.every(
+					(s) => !CREDENTIALED_SERVERS.has(s) && !SUBSTITUTABLE_SERVERS.has(s) && !RATE_LIMITED_SERVERS.has(s),
+				),
 		)
 		.map((task) => ({
 			...task,

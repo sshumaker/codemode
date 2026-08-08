@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import {
 	CREDENTIALED_SERVERS,
+	RATE_LIMITED_SERVERS,
 	SUBSTITUTABLE_SERVERS,
 	availableServers,
 	loadTasks,
@@ -72,6 +73,16 @@ describe("runnability filtering", opts, () => {
 		for (const task of loadTasks()) {
 			for (const server of task.servers) {
 				assert.ok(!CREDENTIALED_SERVERS.has(server), `${task.id} requires credentialed ${server}`);
+			}
+		}
+	});
+
+	it("drops tasks requiring a rate-limited server", () => {
+		// Their 429s arrive as successful MCP responses and are indistinguishable
+		// from real tool errors to both the agent and the judge.
+		for (const task of loadTasks()) {
+			for (const server of task.servers) {
+				assert.ok(!RATE_LIMITED_SERVERS.has(server), `${task.id} requires rate-limited ${server}`);
 			}
 		}
 	});
