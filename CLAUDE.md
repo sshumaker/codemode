@@ -64,3 +64,14 @@ prompt, which is not a question anyone cares about. Level up, not down.
 `bench/prompts.mjs` keeps every variant that lost, with its measured numbers and
 why it was expected to win. v2 (rules) and v8 ("slicing costs nothing", which is
 true for context and false for turns) are more informative than the winners.
+
+## Never cache tool results transparently
+
+Deduplicating identical MCP calls in `_client.py` looks like free efficiency —
+29% of calls in a run are byte-identical repeats — and it is not safe.
+**Read-only is not idempotent.** Reddit hot threads, Steam trending and market
+prices change between calls, so a cache serves stale data the model then reasons
+over; for any server with side effects it is simply wrong.
+
+Deduplication is the agent's judgement call, per tool, which is what the `q6`
+ledger prompt asks for. Do not move it into the transport.

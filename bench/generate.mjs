@@ -256,13 +256,14 @@ import os
 import urllib.request
 
 _PROXY = os.environ.get("HARNESS_MCP_PROXY", "http://127.0.0.1:8765")
-# Identical calls are answered from memory rather than re-issued. Measured: 29%
-# of all MCP calls in a run were byte-identical repeats, because the model cannot
-# see what it already fetched and re-requests it in a later cell. Deduping here
-# is what any real client would do, and it is only possible because the arm has
-# a persistent process to hold the cache in.
-_CACHE = {}
-_MEMOIZE = os.environ.get("HARNESS_MEMOIZE", "1") == "1"
+
+# NOTE: transparent memoization of identical calls was tried here and removed.
+# 29% of MCP calls in a run are byte-identical repeats, so caching them looks
+# like free efficiency — but it is not safe. "Read-only" is not "idempotent":
+# Reddit hot threads, Steam trending and market prices all change between calls,
+# so a cache silently serves stale data, and for any server with side effects it
+# is simply wrong. Deduplication has to be the agent's judgement call per tool,
+# which is what the q6 ledger prompt asks for.
 _RUN_ID = os.environ.get("HARNESS_RUN_ID", "")
 _TIMEOUT = 180
 
@@ -280,12 +281,12 @@ async def call(server: str, tool: str, args: dict) -> str:
     Raises:
         McpError: The server returned an error or could not be reached.
     """
-    clean = {k: v for k, v in (args or {}).items() if v is not None}
-    key = (server, tool, json.dumps(clean, sort_keys=True, default=str))
-    if _MEMOIZE and key in _CACHE:
-        return _CACHE[key]
-
-    payload = {"server": server, "tool": tool, "args": clean, "meta": {"arm": "codemode", "runId": _RUN_ID}}
+    payload = {
+        "server": server,
+        "tool": tool,
+        "args": {k: v for k, v in (args or {}).items() if v is not None},
+        "meta": {"arm": "codemode", "runId": _RUN_ID},
+    }
     request = urllib.request.Request(
         _PROXY + "/call",
         data=json.dumps(payload).encode(),
@@ -300,10 +301,7 @@ async def call(server: str, tool: str, args: dict) -> str:
 
     if not body.get("ok"):
         raise McpError(f"{server}.{tool}: {body.get('error', 'unknown error')}")
-    text = body.get("text", "")
-    if _MEMOIZE:
-        _CACHE[key] = text
-    return text
+    return body.get("text", "")
 `;
 }
 
