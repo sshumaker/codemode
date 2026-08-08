@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { generate, pyIdent } from "../generate.mjs";
+import { generate, pyIdent, pyPackage } from "../generate.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DATA = join(ROOT, "bench/data/mcp-schemas.json");
@@ -58,7 +58,7 @@ describe("real MCP-Bench catalogue", { skip: available ? false : "run bench/mcp-
 		const catalogue = load();
 		const { files } = generate(catalogue);
 		for (const { server, tools } of catalogue) {
-			const pkg = pyIdent(server);
+			const pkg = pyPackage(server);
 			const module = files[`${pkg}/${pyIdent(tools[0].name)}.py`];
 			assert.ok(module, `no module for ${server}`);
 			assert.ok(module.includes(`"${server}"`), `${server} module does not send its real server name`);
@@ -96,7 +96,11 @@ describe("real MCP-Bench catalogue", { skip: available ? false : "run bench/mcp-
 		assert.equal(toolDefs.length, total, "tool defs dropped a tool");
 		assert.equal(tocLines.length, total, "TOC dropped a tool");
 		assert.equal(names.length, total, "name list dropped a tool");
-		const modules = Object.keys(files).filter((p) => p.endsWith(".py") && !p.endsWith("__init__.py"));
+		// Exclude the package scaffolding: per-server __init__.py and the shared
+		// root-level _client.py transport.
+		const modules = Object.keys(files).filter(
+			(p) => p.endsWith(".py") && !p.endsWith("__init__.py") && !p.endsWith("_client.py"),
+		);
 		assert.equal(modules.length, total, "api/ tree dropped a tool");
 	});
 
@@ -109,7 +113,7 @@ describe("real MCP-Bench catalogue", { skip: available ? false : "run bench/mcp-
 		if (undocumented.length === 0) return;
 		const { files } = generate(catalogue);
 		for (const { server, name } of undocumented) {
-			const module = files[`${pyIdent(server)}/${pyIdent(name)}.py`];
+			const module = files[`${pyPackage(server)}/${pyIdent(name)}.py`];
 			assert.ok(module, `undocumented tool ${server}.${name} produced no module`);
 			assert.ok(module.includes('"""'), `undocumented tool ${name} has no docstring at all`);
 		}

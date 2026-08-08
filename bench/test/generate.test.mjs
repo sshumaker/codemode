@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { countTokens } from "../arms.mjs";
-import { generate, normalizeTool, pyIdent, signature } from "../generate.mjs";
+import { generate, normalizeTool, pyIdent, signature, wireName } from "../generate.mjs";
 import { adversarial, realistic, synthetic } from "./fixtures/catalogue.mjs";
 
 const allTools = (catalogue) => catalogue.flatMap((s) => s.tools.map((t) => ({ server: s.server, ...t })));
@@ -103,7 +103,7 @@ for (const [label, catalogue] of [["realistic", realistic], ["adversarial", adve
 		it("the tool-def description is the authored description, unmodified", () => {
 			const { toolDefs } = generate(catalogue);
 			for (const raw of allTools(catalogue)) {
-				const def = toolDefs.find((d) => d.name === `${raw.server}__${raw.name}`);
+				const def = toolDefs.find((d) => d.name === wireName(raw.server, raw.name));
 				assert.equal(def.description, (raw.description ?? "").trim());
 			}
 		});
@@ -123,7 +123,7 @@ for (const [label, catalogue] of [["realistic", realistic], ["adversarial", adve
 			for (const raw of allTools(catalogue)) {
 				if (!raw.description) continue;
 				const firstLine = raw.description.trim().split("\n")[0];
-				const line = tocLines.find((l) => l.startsWith(`${raw.server}.${raw.name}(`));
+				const line = tocLines.find((l) => l.includes(`.${pyIdent(raw.name)}(`));
 				assert.ok(line, `no TOC line for ${raw.name}`);
 				assert.ok(line.includes(firstLine), `TOC line for ${raw.name} lost its summary`);
 			}
@@ -133,7 +133,7 @@ for (const [label, catalogue] of [["realistic", realistic], ["adversarial", adve
 			const { toolDefs } = generate(catalogue);
 			for (const raw of allTools(catalogue)) {
 				if (!raw.inputSchema) continue;
-				const def = toolDefs.find((d) => d.name === `${raw.server}__${raw.name}`);
+				const def = toolDefs.find((d) => d.name === wireName(raw.server, raw.name));
 				assert.deepEqual(def.input_schema, raw.inputSchema);
 			}
 		});
