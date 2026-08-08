@@ -73,6 +73,53 @@ score difference is within noise.
 What does look robust across all four: **codemode does roughly 2x the MCP work
 for ~0.8x the cost, and pays for it in turns and wall-clock.**
 
+## The mechanism, caught on a real task
+
+`openapi_explorer_paper_search_hugging_face_000` is the clearest single
+demonstration in the pilot of what the thesis actually claims.
+
+Both arms needed the same two OpenAPI overviews. `getApiOverview("github")`
+returns **182,433 characters**; `getApiOverview("openai")` returns 50,183.
+
+**vanilla** called both as native tools. The results went straight into the
+transcript — 89,257 cacheWrite tokens in a single turn, $0.2332 for that one
+turn. It then produced an answer and stopped, scoring **2.33**.
+
+**codemode** wrote:
+
+```python
+openai_overview = await oe.getApiOverview("openai")
+github_overview = await oe.getApiOverview("github")
+print(openai_overview[:3000])
+```
+
+Both payloads bound to variables; 3,000 characters printed. Peak single-turn
+ingestion **3,552 tokens**. It went on to work the task over 50 turns, scoring
+**4.33**.
+
+| | vanilla/L4 | codemode/L0 |
+|---|---|---|
+| turns | 2 | 50 |
+| peak single-turn ingestion | **89,257 tok** | **3,552 tok** |
+| total cacheWrite | 119,653 | **43,128** |
+| total cacheRead | **30,396** | 1,138,851 |
+| total cost | **$0.3109** | $0.4667 |
+| judge score | 2.33 | **4.33** |
+
+**The context discipline is real and large — 25x lower peak ingestion, 2.8x
+lower total write.** But it is partly repaid: codemode's 50 turns each re-read
+the accumulated conversation, so `cacheRead` reaches 1.1M and total cost ends up
+*higher* than vanilla's on this task, despite writing far less into context.
+
+This is the displaced-bytes exchange rate made concrete. Codemode moves large
+payloads out of the transcript into the kernel, then spends turns — and
+cache-read tokens — reasoning over them incrementally. Whether that trades well
+depends on how much of the payload actually needed to be read, which is exactly
+what the residency dial is for.
+
+It also shows why cost alone is the wrong single metric here: vanilla was
+cheaper on this task *and* failed it.
+
 ## Methodological problems found before spending real budget
 
 ### 1. `--tools` is an allowlist, and it silently hid the vanilla arm's tools
