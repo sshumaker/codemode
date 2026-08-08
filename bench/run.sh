@@ -39,6 +39,10 @@ unset val
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$ROOT/vendor/prime-agent/packages/coding-agent/dist/cli.js"
 
+# The codemode arm bootstraps its Python kernel with uv, which the astral
+# installer puts in ~/.local/bin — not on PATH in every shell.
+[ -x "$HOME/.local/bin/uv" ] && export PATH="$HOME/.local/bin:$PATH"
+
 # Reproducibility: no telemetry, no persisted harness state, no ambient config
 # leaking into the prompt. See scripts/neutralize-prime.mjs.
 export DO_NOT_TRACK=1 PRIME_AGENT_TELEMETRY=0
