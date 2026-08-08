@@ -349,7 +349,111 @@ export const VARIANTS = {
 				"so you never re-fetch or re-parse.",
 			].join("\n"),
 	},
+
+	/**
+	 * q1 — target the worst-scoring dimension directly.
+	 *
+	 * v7's rubric breakdown (n=24): parallelism_and_efficiency 2.99, fulfilment
+	 * 4.81, dependency 4.83, tool-fit 5.35, params 6.18, grounding 6.47. The
+	 * efficiency dimension has 7.01 of headroom — more than double any other —
+	 * and MCP-Bench scores it on redundant calls and on whether parallelizable
+	 * work was actually parallelized, which `asyncio.gather` makes trivial.
+	 * Moving it 3 -> 8 is worth ~0.83 of overall score on its own.
+	 */
+	q1: {
+		note: "attack parallelism_and_efficiency, the worst dimension",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"You are scored on avoiding redundant calls and on running independent",
+				"work concurrently. Both are easy here and both are usually missed.",
+				"",
+				"Plan the full set of calls before the first one. Group them into waves:",
+				"everything that does not depend on another result goes in one",
+				"`asyncio.gather`; only genuinely dependent calls wait for a later wave.",
+				"",
+				"  import asyncio, json",
+				"  a, b, c = await asyncio.gather(",
+				"      api.svc_one.search(q='x'),",
+				"      api.svc_two.list(),",
+				"      api.svc_three.details(id=7),",
+				"  )",
+				"  ids = [r['id'] for r in json.loads(a)['items'][:20]]",
+				"  details = await asyncio.gather(*[api.svc_one.get(id=i) for i in ids])",
+				"",
+				"Never call the same tool twice with the same arguments — results persist",
+				"in variables, so reuse them. Fan out over a list with `gather`, never in",
+				"a loop of separate cells.",
+			].join("\n"),
+	},
+
+	/**
+	 * q2 — target completion and dependency handling.
+	 *
+	 * Fulfilment 4.81 means roughly half of each task's stated requirements are
+	 * met. MCP-Bench tasks are explicitly multi-part and numbered, and are scored
+	 * against that structure, so enumerating the parts and checking them off
+	 * before answering should convert directly into fulfilment and dependency
+	 * score.
+	 */
+	q2: {
+		note: "enumerate requirements, verify each before answering",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"These tasks are multi-part and you are scored on how many parts you",
+				"actually complete, not on how good the answer sounds.",
+				"",
+				"First, write out every distinct requirement in the request as a numbered",
+				"list, including the ones stated as asides or conditionals. Note which",
+				"depend on the output of another.",
+				"",
+				"Work through them in dependency order. Before you answer, go back over",
+				"your list and confirm each item is addressed with data you actually",
+				"retrieved. If a requirement could not be met, say so explicitly rather",
+				"than omitting it.",
+				"",
+				"Every claim must trace to a tool result. Do not fill gaps from memory.",
+			].join("\n"),
+	},
+
+	/**
+	 * q3 — q1 and q2 together, on the theory that they target disjoint dimensions
+	 * (efficiency vs fulfilment/dependency) and should compose rather than
+	 * interfere. v2 showed long prompts can backfire, so this is the test of
+	 * whether that was length or content.
+	 */
+	q3: {
+		note: "q1 + q2 combined",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"These tasks are multi-part and you are scored on how many parts you",
+				"complete, on grounding every claim in a tool result, and on avoiding",
+				"redundant or needlessly serial calls.",
+				"",
+				"Start by writing every requirement in the request as a numbered list,",
+				"marking which depend on another's output.",
+				"",
+				"Then fetch. Everything independent goes in one `asyncio.gather`:",
+				"",
+				"  import asyncio, json",
+				"  a, b = await asyncio.gather(api.svc_one.search(q='x'), api.svc_two.list())",
+				"  ids = [r['id'] for r in json.loads(a)['items'][:20]]",
+				"  details = await asyncio.gather(*[api.svc_one.get(id=i) for i in ids])",
+				"",
+				"Results persist in variables — never call the same tool twice with the",
+				"same arguments, and never loop over separate cells to fan out.",
+				"",
+				"Before answering, check your numbered list item by item against data you",
+				"actually retrieved. State explicitly anything you could not determine.",
+			].join("\n"),
+	},
 };
+
 
 
 
