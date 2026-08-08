@@ -38,6 +38,8 @@ if (!envFile || !model) {
 const perTier = Number(flag("tasks", 2));
 const arms = flag("arms", "vanilla,codemode").split(",");
 const residency = flag("residency", "L0");
+// Vanilla can also run deferred (L1); default stays the naive L4 baseline.
+const vanillaResidency = flag("vanilla-residency", "L4");
 const timeout = flag("timeout", "420");
 const tier = flag("tier", null);
 // Runs are latency-bound, so wall-clock scales close to linearly with this.
@@ -51,7 +53,7 @@ console.log(`sweep: ${tasks.length} tasks x ${arms.length} arms = ${tasks.length
 console.log(`model: ${model}  residency(codemode): ${residency}\n`);
 
 /** Residency label per arm; notools has none, vanilla is always L4. */
-const levelFor = (arm) => (arm === "codemode" ? residency : arm === "notools" ? "none" : "L4");
+const levelFor = (arm) => (arm === "codemode" ? residency : arm === "notools" ? "none" : vanillaResidency);
 
 const runId = (task, arm) => `${task.id}__${arm}__${levelFor(arm)}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 
