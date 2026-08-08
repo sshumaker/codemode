@@ -60,7 +60,9 @@ for (const r of runs) {
 const armKeys = [...new Set(runs.map((r) => r.armKey))].sort();
 const taskIds = [...new Set(runs.map((r) => r.task.id))].sort();
 
-const complete = (r) => !r.summary.timedOut && r.summary.exitCode === 0;
+// A residency violation invalidates the run: it did not test the condition it
+// claims to. Excluded from pairing rather than silently averaged in.
+const complete = (r) => !r.summary.timedOut && r.summary.exitCode === 0 && !r.summary.residencyViolation;
 const pairedTasks = taskIds.filter((id) => {
 	const forTask = runs.filter((r) => r.task.id === id);
 	return armKeys.every((a) => forTask.some((r) => r.armKey === a && complete(r)));

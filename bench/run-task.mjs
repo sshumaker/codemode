@@ -68,6 +68,31 @@ mkdirSync(runDir, { recursive: true });
  * counted against codemode's savings in docs/DESIGN.md.
  */
 function buildPreamble() {
+	// vanilla L1: names resident, schemas on demand. Putting the names in the
+	// prompt is what makes this L1 rather than L0 — a first attempt hid them
+	// behind a search tool, and the model never looked, falling back to curl.
+	if (arm === "vanilla" && residency === "L1") {
+		const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
+			task.exposedServers.includes(s.server),
+		);
+		const { toolDefs } = generate(catalogue);
+		return [
+			"## Tools",
+			"",
+			`${toolDefs.length} tools are available. Their names are listed below; their parameter`,
+			"schemas are not, to keep this prompt small.",
+			"",
+			"Load a tool before calling it:",
+			"",
+			"  load_tool(names=[\"Some_Server__some_tool\"])",
+			"",
+			"That returns its parameter schema and makes it directly callable for the",
+			"rest of the session. You can load several at once.",
+			"",
+			"Available tool names:",
+			...toolDefs.map((d) => d.name),
+		].join("\n");
+	}
 	if (arm !== "codemode") return "";
 
 	const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
@@ -150,8 +175,15 @@ if (arm === "notools") {
 		task.exposedServers.includes(s.server),
 	);
 	const { toolDefs } = generate(catalogue);
-	toolList = [...BUILTINS, ...toolDefs.map((d) => d.name)];
 	meta.mcpToolCount = toolDefs.length;
+	// L4 names every tool; L1 defers behind three meta-tools, which is what a
+	// modern harness ships. Both must be listed here because --tools is an
+	// allowlist that filters extension-registered tools too.
+	// Both levels allowlist every tool — `--tools` is a permission list, not the
+	// active set. L1 additionally narrows the *active* set at session start via
+	// pi.setActiveTools, so the schemas stay out of context until loaded.
+	toolList = [...BUILTINS, ...toolDefs.map((d) => d.name)];
+	if (residency === "L1") toolList.push("search_tools", "load_tool");
 } else {
 	toolList = ["ipython"];
 }
@@ -166,6 +198,12 @@ const cliArgs = [
 	"--model",
 	model,
 	...(arm === "notools" ? ["--no-tools"] : ["--tools", tools]),
+	// L1 allowlists all 250 but activates only the base set; load_tool activates
+	// the rest on demand. Requires the --active-tools flag added by
+	// scripts/neutralize-prime.mjs.
+	...(arm === "vanilla" && residency === "L1"
+		? ["--active-tools", [...BUILTINS, "search_tools", "load_tool"].join(",")]
+		: []),
 	"--cwd",
 	runDir,
 	"--no-skills",
@@ -277,6 +315,12 @@ child.stdout.on("data", (chunk) => {
 			const id = message.responseId;
 			if (id && !counted.has(id) && message.usage?.totalTokens) {
 				counted.add(id);
+				// Total context billed on the first turn: system prompt + tools + task.
+				// This is what residency actually controls, so it is what the guard checks.
+				if (summary.turns === 0) {
+					const u = message.usage;
+					summary.firstTurnPromptTokens = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+				}
 				summary.turns++;
 				for (const k of ["input", "output", "cacheRead", "cacheWrite"]) summary[k] += message.usage[k] ?? 0;
 				summary.cost += message.usage.cost?.total ?? 0;
@@ -292,6 +336,21 @@ child.on("close", (code) => {
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;
 	summary.stderrTail = stderr.split("\n").slice(-8).join("\n");
+
+	// Residency guard. A run labelled L1 whose first turn still carries the full
+	// tool catalogue is silently an L4 run under a different name, which would
+	// corrupt every comparison it appears in. Fail it loudly instead.
+	//
+	// Known broken: --active-tools (added by scripts/neutralize-prime.mjs) does
+	// not reach the print-mode path, so vanilla L1 currently does NOT defer.
+	if (summary.firstTurnPromptTokens !== undefined) {
+		const budget = { L0: 6_000, L1: 8_000, L2: 20_000, L4: Infinity, none: 6_000 }[residency] ?? Infinity;
+		if (summary.firstTurnPromptTokens > budget) {
+			summary.residencyViolation =
+				`${residency} first turn carried ${summary.firstTurnPromptTokens} prompt tokens ` +
+				`(budget ${budget}) — the catalogue was resident, so this is not a ${residency} run`;
+		}
+	}
 	summary.maxCost = maxCost;
 	// A run stopped by the budget is not a failed run — it is a run that spent
 	// its allowance. Reported separately from timeouts so the two never merge.

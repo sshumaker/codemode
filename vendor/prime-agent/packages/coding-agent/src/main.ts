@@ -648,6 +648,7 @@ function runtimeConfigFromArgs(
 		thinking: parsed.thinking,
 		models: parsed.models,
 		tools: parsed.tools,
+		initialActiveToolNames: parsed.activeTools,
 		noTools: parsed.noTools,
 		noBuiltinTools: parsed.noBuiltinTools,
 		extensions: resolveCliPaths(cwd, parsed.extensions),
@@ -696,7 +697,8 @@ export function resolveRuntimeSessionOptions(
 		tools: runtimeSessionOptions?.tools ?? sessionOptions.tools,
 		noTools: runtimeSessionOptions?.noTools ?? sessionOptions.noTools,
 		customTools: runtimeSessionOptions?.customTools ?? sessionOptions.customTools,
-		initialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,
+		initialActiveToolNames:
+			runtimeSessionOptions?.initialActiveToolNames ?? sessionOptions.initialActiveToolNames,
 		allowedToolNames: runtimeSessionOptions?.allowedToolNames,
 		includeGoals: runtimeSessionOptions?.includeGoals,
 		includeCompactSkill: runtimeSessionOptions?.includeCompactSkill,

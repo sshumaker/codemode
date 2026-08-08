@@ -26,6 +26,7 @@ export interface Args {
 	sessionDir?: string;
 	models?: string[];
 	tools?: string[];
+	activeTools?: string[];
 	noTools?: boolean;
 	noBuiltinTools?: boolean;
 	extensions?: string[];
@@ -165,6 +166,12 @@ export function parseArgs(args: string[]): Args {
 					message: `Unknown built-in tool(s): ${removedTools.join(", ")}. Available built-in tools: ${BUILTIN_TOOL_NAMES.join(", ")}`,
 				});
 			}
+		} else if (arg === "--active-tools" && i + 1 < args.length) {
+			// Initially-active subset of --tools. See scripts/neutralize-prime.mjs.
+			result.activeTools = args[++i]
+				.split(",")
+				.map((s) => s.trim())
+				.filter((name) => name.length > 0);
 		} else if (arg === "--thinking" && i + 1 < args.length) {
 			const level = args[++i];
 			if (isValidThinkingLevel(level)) {

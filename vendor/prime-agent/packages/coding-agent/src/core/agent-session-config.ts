@@ -15,6 +15,8 @@ export interface AgentSessionRuntimeConfig {
 	thinking?: ThinkingLevel;
 	models?: string[];
 	tools?: string[];
+	/** Initially-active subset of `tools`. See scripts/neutralize-prime.mjs. */
+	initialActiveToolNames?: string[];
 	noTools?: boolean;
 	noBuiltinTools?: boolean;
 	extensions?: string[];

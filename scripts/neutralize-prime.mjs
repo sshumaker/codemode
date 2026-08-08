@@ -59,4 +59,53 @@ sub(
 	"harness-state prompt injection",
 );
 
+// --- experiment-only CLI surface ---------------------------------------------
+// `--tools` sets both the allowlist and the initially-active set, so there is no
+// way from the CLI to allow a tool while leaving it dormant. The vanilla arm's
+// L1 (deferred) condition needs exactly that: all 250 MCP tools permitted, only
+// a handful active until `load_tool` activates one. The SDK already supports it
+// (`initialActiveToolNames`); this only exposes it.
+log("\nexperiment CLI surface:");
+
+sub(
+	"cli/args.ts",
+	`\t\t} else if (arg === "--thinking" && i + 1 < args.length) {`,
+	`\t\t} else if (arg === "--active-tools" && i + 1 < args.length) {
+			// Initially-active subset of --tools. See scripts/neutralize-prime.mjs.
+			result.activeTools = args[++i]
+				.split(",")
+				.map((s) => s.trim())
+				.filter((name) => name.length > 0);
+		} else if (arg === "--thinking" && i + 1 < args.length) {`,
+	"--active-tools flag",
+);
+
+sub(
+	"cli/args.ts",
+	`\ttools?: string[];`,
+	`\ttools?: string[];\n\tactiveTools?: string[];`,
+	"activeTools on Args",
+);
+
+sub(
+	"core/agent-session-config.ts",
+	`\ttools?: string[];`,
+	`\ttools?: string[];\n\t/** Initially-active subset of \`tools\`. See scripts/neutralize-prime.mjs. */\n\tinitialActiveToolNames?: string[];`,
+	"initialActiveToolNames on AgentSessionRuntimeConfig",
+);
+
+sub(
+	"main.ts",
+	`\t\ttools: parsed.tools,`,
+	`\t\ttools: parsed.tools,\n\t\tinitialActiveToolNames: parsed.activeTools,`,
+	"pass activeTools into session options",
+);
+
+sub(
+	"main.ts",
+	`\t\tinitialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,`,
+	`\t\tinitialActiveToolNames:\n\t\t\truntimeSessionOptions?.initialActiveToolNames ?? sessionOptions.initialActiveToolNames,`,
+	"fall back to CLI activeTools",
+);
+
 log("\ndone.");
