@@ -56,12 +56,21 @@ about code as a *control-flow* representation: loops, retries, conditional recov
 MCP-Bench has conditionals but no failures to recover from, so the half of Claim 2
 with the strongest published support is the half it exercises least.
 
-**2. ~~The rubric is structurally kind to codemode.~~ MEASURED AND FALSE — see the
-attribution table below. Retained for the record.** "Parallelism and Efficiency"
-rewards batching — that is `asyncio.gather`. "Grounding" rewards claims traceable to
-tool output — codemode makes 2.2x the calls. Meanwhile the measured failure mode
-(48% of cells make no tool call; 45% of context is reprinted local variables) is
-**invisible to the judge**. The +0.50 score delta may be partly a rubric artifact.
+**2. The rubric is NOT structurally kind to codemode — measured, and the reverse of
+what was predicted.**
+
+The worry was that "Parallelism and Efficiency" rewards batching (`asyncio.gather`)
+and "Grounding" rewards claims traceable to tool output (codemode makes 2.2x the
+calls), so the delta might be a rubric artifact. Attribution over 16 paired tasks
+says otherwise: **parallelism is +0.000 (t=+0.01)** — the suspected artifact is
+exactly zero — and grounding is only borderline (t=+1.92). The delta is carried by
+task fulfilment (+0.104, t=+3.04) and dependency awareness (+0.079, t=+2.73).
+Full table under the action items.
+
+The observation that survives is the other half: the measured failure mode — cells
+that make no tool call, and context spent reprinting local variables — is
+**invisible to the judge**, which sees only the MCP call list. So the rubric neither
+rewards codemode's strength nor penalises its waste. It scores task outcomes.
 
 **3. The predicted loss is untestable here.** The early prediction was that codemode
 *loses* on policy compliance, because code routes around guardrails encoded at tool
@@ -86,9 +95,13 @@ The sharpest falsifiable prediction of the thesis cannot be evaluated on this be
 
       The suspected artifact is **exactly zero**. Parallelism — the dimension
       `asyncio.gather` was supposed to farm — shows no difference at all, and
-      grounding is only borderline. The delta is carried by task fulfillment and
-      dependency awareness, i.e. codemode completing more of the task. Section
-      "2. The rubric is structurally kind to codemode" should be struck.
+      grounding is only borderline. The delta is carried by task fulfilment and
+      dependency awareness, i.e. codemode completing more of the task. Consequence
+      2 above has been rewritten accordingly.
+
+      Caveat: this is 16 paired tasks under one model, and the overall +0.056 is
+      smaller than the earlier +0.50 quoted on the 1-10 scale (same quantity,
+      different units — 0.056 on 0-1 is 0.56 of a point out of 10).
 - [ ] **Promote τ-bench to the next target.** Writes, a simulated user, and policy
       compliance as the score — it tests the opposite capability and is where the
       thesis was predicted to break. Worth more than additional MCP-Bench tasks.
@@ -138,19 +151,17 @@ urgent = [i for i in issues if i["priority"] == 1]     # both claims die here
 
 …iteration **forces materialization** (the full payload lands in the heap), and
 `urgent` is a top-level binding with **no content address** — nothing produced it but
-a cell of Python. And this is the main case, not an edge case: cell classification appeared to be
-45.2% local compute, 39.8% variable inspection, **6.8% actual tool calls**.
+a cell of Python. And this is the main case, not an edge case: **38.6% of cells make tool calls** (1,766 of 4,576, counted on `await`); the
+remaining ~61% are pure local compute. Ingress interception addresses only the
+former. Filtering server-side *is* the value proposition.
 
-**That 6.8% is a measurement artifact and the argument above depends on it.** The
-classifier matched a literal `api.`, but the model imports under aliases
-(`import api.reddit as reddit`), which hid 1,090 of 4,576 cells. Recounted on
-`await` presence: **38.6% of cells make tool calls, not 6.8%** — so pure local
-compute is ~61%, not 93%.
-
-The lineage design survives but the ratio is less favourable than stated: replay
-touches tool calls in nearly two cells in five, so it leans much harder on ingress
-memoization being complete, and the effectful-derived row of the recovery
-taxonomy is correspondingly larger than a read-only benchmark can reveal.
+> Correction: an earlier draft put this at 6.8%, which made the lineage argument
+> look far stronger than it is. That classifier matched a literal `api.`, but the
+> model imports under aliases (`import api.reddit as reddit`), hiding 1,090 cells.
+> Replay therefore touches a tool call in nearly two cells in five, not one in
+> fifteen — so it leans hard on ingress memoization being *complete*, and the
+> effectful-derived row of the recovery taxonomy is correspondingly larger than a
+> read-only benchmark can reveal.
 
 ### The design: store the recipe, not the value
 
@@ -167,10 +178,11 @@ from its blob, re-run cell 7, `urgent` is back. This is Spark RDD lineage —
 checkpoint the derivation, recompute on loss, materialize selectively where recompute
 is expensive.
 
-The ratio is unusually favorable, and our own traces say so: the expensive part (tool
-calls) is already memoized at ingress, and the recomputed part is the ~61% of cells
-that make no tool call (corrected from 93% — see above). Most lineage systems have
-the opposite problem, but the margin here is thinner than first claimed.
+The ratio still favours lineage — the expensive part (tool calls) is memoized at
+ingress, and ~61% of cells recompute with no I/O at all — but by roughly 3:2, not
+15:1. Most lineage systems have the opposite problem; this one has a real margin
+and a thin one. Whether it holds is an empirical question about **memo hit rate**,
+which is now the thing to measure.
 
 Better framing than snapshotting RAM: **the session log already contains the program
 that rebuilds the namespace** — cells are events. The work is making that replay cheap
@@ -184,10 +196,18 @@ and verifiable.
 | pure derived | recompute from lineage | `urgent` |
 | effectful derived | replay against logged tool results | value built from a `create_issue` |
 | external handle | rebind to durable ID | `spawn()` child |
+| memo-miss | **re-issues the call** — pure only while the blob survives | derived value whose upstream tool result was evicted |
 | opaque | **lost — tell the model** | live socket, open file, C object |
 
-Only the last row is unrecoverable, and it shrinks by design (subagents → durable
-session IDs; files → sandbox disk, which Managed Agents already persists).
+Only the last row is strictly unrecoverable, and it shrinks by design (subagents →
+durable session IDs; files → sandbox disk, which Managed Agents already persists).
+
+The memo-miss row is the one the corrected 38.6% figure creates. A pure-derived
+binding whose upstream blob has been evicted is not pure-derived any more — it is a
+network call wearing a recipe. On a read-only benchmark that is merely slow; against
+a server that writes, it is a correctness bug. **Blob retention must therefore
+outlive lineage retention**, which inverts the usual cache intuition: evict the
+cheap derived values, keep the expensive leaves.
 
 ### Determinism
 
@@ -222,8 +242,9 @@ Tiering, if still needed after the above:
 | expired | older | event log only; rebuild via lineage |
 
 Two properties make this cheap. **The duty cycle is extreme**: 323s wall over 32.4
-turns ≈ 10s/turn, MCP latency 563s across 756 calls ≈ 0.74s/call, 93% of cells are
-local compute — kernel-busy is roughly 5–10% of wall clock. And **restore latency is
+turns ≈ 10s/turn, MCP latency 563s across 756 calls ≈ 0.74s/call, and ~61% of cells
+are local compute — kernel-busy is a small fraction of wall clock (measure it; see
+action item 3). And **restore latency is
 free**: the model streams the cell 5–30s before it can execute, so a restore kicked
 off at generation-start is warm before the `tool_use` block closes. (This is the
 inverse of Anthropic's optimization — they decoupled so provisioning left the critical
@@ -289,8 +310,11 @@ Free (offline, over runs already on disk — no new spend, no new runs):
    the cloud version needs a stateful fleet with real snapshotting.
    *Caveat to record with the result:* MCP-Bench is read-only, so the effectful-derived
    and opaque rows are structurally under-represented. This census is a best case.
-2. **Residency profile.** Per turn, naive resident bytes vs bytes with >8KB values as
-   handles. Replaces the corrected estimate above with a measurement.
+2. **Residency profile + memo hit rate.** Per turn, naive resident bytes vs bytes
+   with >8KB values as handles — replaces the corrected estimate above with a
+   measurement. Promoted above the duty cycle because the corrected 38.6% makes memo
+   completeness, not recompute cost, the binding constraint: simulate replay over the
+   recorded cells and count how many would re-issue a call under a given blob budget.
 3. **Duty cycle.** From event timestamps: kernel-busy seconds / wall seconds, plus the
    idle-gap distribution (expected bimodal — intra-turn vs human-in-the-loop). Sets
    tier boundaries and the overcommit ratio; turns this from architecture into a
