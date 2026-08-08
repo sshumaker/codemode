@@ -69,6 +69,16 @@ for (const name of existsSync(RUNS) ? readdirSync(RUNS) : []) {
 		if (bypass > 0) reasons.push(`${bypass} network-bypass attempts`);
 	}
 
+	// Zero tool calls on a task that requires tools means the arm was never wired
+	// up — an extension that failed to load, or an empty allowlist. It scores at
+	// the floor and is indistinguishable from a genuine capability result.
+	if (run.arm !== "notools" && run.summary.toolCalls === 0) {
+		reasons.push("no tool calls at all — arm likely not wired up");
+	}
+	if (/Failed to load extension/.test(run.summary.stderrTail ?? "")) {
+		reasons.push("extension failed to load");
+	}
+
 	// A judged run with no stability estimate predates multi-sample judging.
 	if (run.judge && !run.judge.samples) reasons.push("single-sample judge score");
 

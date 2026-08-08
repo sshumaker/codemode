@@ -126,8 +126,12 @@ await pool(
 					job.variant,
 					"--run-id",
 					id,
+					// Residency levels are arm-specific: codemode has L0/L1/L2, vanilla
+					// has L4/L1. Passing codemode's default to vanilla made the
+					// extension throw, and the run completed with zero tools and a
+					// floor score that looked like a model result.
 					"--residency",
-					residency,
+					job.arm === "codemode" ? residency : job.arm === "notools" ? "none" : "L4",
 					"--timeout",
 					timeout,
 					"--max-cost",
