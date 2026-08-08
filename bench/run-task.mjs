@@ -237,6 +237,29 @@ const child = spawn(
 			// all 250 tools up front, L1 registers only search_tools/load_tool and
 			// adds real tools on demand.
 			HARNESS_RESIDENCY: residency,
+			// Force all outbound API access through the MCP proxy.
+			//
+			// Measured: 78% of the vanilla arm's bash calls were `curl` straight to
+			// the same APIs its MCP tools wrap (codemode: 11%). That contaminates the
+			// comparison twice over — the arm is not using the tool surface under
+			// test, and the judge, which only sees proxy-logged MCP calls, scores
+			// curl-obtained facts as ungrounded. Vanilla bypassed far more, so it was
+			// penalized more, on precisely the dimension where it trailed.
+			//
+			// The agent process gets a dead proxy for general egress; the MCP servers
+			// live in a separate process tree (bench/mcp-proxy.mjs) and keep their
+			// network. curl, requests, urllib and httpx all honour these.
+			...(process.env.HARNESS_ALLOW_DIRECT_NET === "1"
+				? {}
+				: {
+						http_proxy: "http://127.0.0.1:9",
+						https_proxy: "http://127.0.0.1:9",
+						HTTP_PROXY: "http://127.0.0.1:9",
+						HTTPS_PROXY: "http://127.0.0.1:9",
+						// The harness proxy and the model API must still work.
+						no_proxy: "127.0.0.1,localhost,api.anthropic.com",
+						NO_PROXY: "127.0.0.1,localhost,api.anthropic.com",
+					}),
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 	},
