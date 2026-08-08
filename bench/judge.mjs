@@ -42,6 +42,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pool } from "./pool.mjs";
+import { generate } from "./generate.mjs";
 import { loadTasks } from "./tasks.mjs";
 
 // Look tasks up without the grounded/runnable filters: runs made before a task
@@ -56,6 +57,20 @@ const findTask = (id) => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS = join(ROOT, ".run/runs");
 const MCP_LOG = join(ROOT, ".run/mcp-calls.jsonl");
+const SCHEMAS = join(ROOT, "bench/data/mcp-schemas.json");
+const CATALOGUE = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue;
+
+/**
+ * Wire names of every tool the agent could reach on this task.
+ *
+ * Tool appropriateness cannot be judged without knowing what was on offer —
+ * MCP-Bench passes this list and we were not, so the judge was scoring tool
+ * choice against an unknown menu.
+ */
+function availableToolNames(task) {
+	const selected = CATALOGUE.filter((s) => task.exposedServers.includes(s.server));
+	return generate(selected).toolDefs.map((d) => d.name);
+}
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback) => {
@@ -119,7 +134,26 @@ function trajectory(runId) {
 		.filter((r) => r.kind === "call" && r.meta?.runId === runId);
 }
 
-function buildPrompt(run, task, calls) {
+/**
+ * Deterministic shuffle, seeded by run id.
+ *
+ * MCP-Bench randomizes dimension order so the judge does not anchor on whichever
+ * dimension it reads first. Seeding by run id keeps that bias control while
+ * making a re-judge of the same run reproducible.
+ */
+function seededShuffle(items, seed) {
+	let h = 2166136261;
+	for (const ch of seed) h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0;
+	const out = [...items];
+	for (let i = out.length - 1; i > 0; i--) {
+		h = (Math.imul(h, 48271) + 11) >>> 0;
+		const j = h % (i + 1);
+		[out[i], out[j]] = [out[j], out[i]];
+	}
+	return out;
+}
+
+function buildPrompt(run, task, calls, availableTools) {
 	const steps = calls.map((c, i) => {
 		const status = c.ok ? "ok" : `FAILED: ${c.error}`;
 		return [
@@ -129,28 +163,53 @@ function buildPrompt(run, task, calls) {
 		].join("\n");
 	});
 
-	const rubric = Object.entries(DIMENSIONS)
-		.map(([group, subs]) => {
-			const lines = Object.entries(subs).map(([key, desc]) => `  - ${key}: ${desc}`);
-			return `${group}\n${lines.join("\n")}`;
+	const groups = seededShuffle(Object.keys(DIMENSIONS), run.runId);
+	const rubric = groups
+		.map((group) => {
+			const subs = seededShuffle(Object.keys(DIMENSIONS[group]), `${run.runId}:${group}`);
+			return `${group}\n${subs.map((k) => `  - ${k}: ${DIMENSIONS[group][k]}`).join("\n")}`;
 		})
 		.join("\n\n");
 
 	return [
-		"You are evaluating an AI agent's execution of a tool-using task.",
+		"You are an impartial evaluator judging an AI agent's multi-server tool-based task execution.",
 		"Assign scores only on evidence from the task, the agent's answer, and its tool usage.",
+		"Be objective: ignore narrative style, verbosity, and formatting polish.",
 		"Be strict: most real executions should score 4-6. Scores of 8+ should be exceptional.",
 		"Focus on completion ratios, not absolute numbers of calls.",
 		"",
-		"## CONCRETE TASK DESCRIPTION",
+		"## TASK PRESENTED TO THE AGENT",
+		task.fuzzy,
+		"",
+		// Without this caveat the judge marks the agent down for diverging from a
+		// specification it never saw. MCP-Bench states it explicitly and we had
+		// dropped it, which depressed task_fulfilment and dependency_awareness.
+		"## CONCRETE TASK REFERENCE (evaluation context only)",
+		"The agent did NOT see this version — it saw only the fuzzy task above.",
+		"The agent's interpretation may differ from this and still be entirely valid.",
+		"Judge whether the underlying need was met, not whether the wording matches.",
 		task.description,
 		"",
-		task.dependencies ? `## DEPENDENCY ANALYSIS\n${JSON.stringify(task.dependencies).slice(0, 3000)}\n` : "",
+		task.dependencies
+			? [
+					"## DEPENDENCY ANALYSIS (evaluation context only)",
+					"Generated during task creation. The agent did NOT see this.",
+					"Score the PROPORTION of dependencies handled, not exact conformance.",
+					JSON.stringify(task.dependencies).slice(0, 3000),
+					"",
+				].join("\n")
+			: "",
 		"## AGENT'S FINAL ANSWER",
 		(run.summary.finalText || "(the agent produced no final answer)").slice(0, 12000),
 		"",
-		`## TOOL CALLS (${calls.length} total)`,
+		`## TOOL CALLS (${calls.length} total, over ${run.summary.turns} rounds)`,
 		steps.length > 0 ? steps.join("\n") : "(the agent made no tool calls)",
+		"",
+		// Tool appropriateness cannot be judged without knowing what was on offer.
+		// MCP-Bench passes this list; we were not, so the judge was scoring tool
+		// choice against an unknown menu.
+		`## TOOLS AVAILABLE TO THE AGENT (${availableTools.length})`,
+		availableTools.join(", ") || "(unknown)",
 		"",
 		"## SCORING BANDS (apply to every dimension)",
 		BANDS.join("\n"),
@@ -213,7 +272,7 @@ async function judgeRun(dir) {
 
 	const task = findTask(run.task.id);
 	const calls = trajectory(run.runId);
-	const prompt = buildPrompt(run, task, calls);
+	const prompt = buildPrompt(run, task, calls, availableToolNames(task));
 
 	// The repeat samples are independent, so issue them together. Running them in
 	// series multiplied every worker's latency by `repeats` and quietly divided
@@ -263,6 +322,7 @@ const dirs = only
 			.filter((d) => !onlyPrefix || d.split("/").pop().startsWith(onlyPrefix));
 
 const rows = [];
+const failures = [];
 await pool(
 	dirs,
 	async (dir) => {
@@ -279,6 +339,7 @@ await pool(
 			});
 			process.stderr.write(".");
 		} catch (err) {
+			failures.push(`${dir.split("/").pop().slice(0, 50)}: ${err.message.slice(0, 90)}`);
 			process.stderr.write("x");
 			rows.push({ task: dir.split("/").pop().slice(0, 26), arm: "?", overall: `ERR: ${err.message.slice(0, 50)}` });
 		}
@@ -286,4 +347,16 @@ await pool(
 	concurrency,
 );
 process.stderr.write("\n");
+
+// Loudly, and with a non-zero exit. A quiet failure here looks identical to a
+// cache hit, and once hid every run failing on the same undefined reference.
+if (failures.length > 0) {
+	console.error(`\n!! ${failures.length}/${dirs.length} runs failed to judge:`);
+	for (const f of failures.slice(0, 5)) console.error(`   ${f}`);
+	if (failures.length > 5) console.error(`   … and ${failures.length - 5} more`);
+	if (failures.length === dirs.length) {
+		console.error("\n   EVERY run failed — this is a bug in judge.mjs, not the data.");
+		process.exitCode = 1;
+	}
+}
 console.table(rows);
