@@ -29,6 +29,7 @@ vendor/pi-mono        upstream @ e47b8e3, pinned
 ```bash
 npm install
 node scripts/port-vanilla-tools.mjs        # restore the five tools prime dropped
+node scripts/neutralize-prime.mjs          # disable run-to-run prompt mutation
 cd vendor/prime-agent && npm install && npm run build
 ```
 

@@ -4305,7 +4305,10 @@ export class AgentSession {
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
-			harnessState: this._loadMergedHarnessState(),
+			// Benchmark reproducibility: harness state persists across runs and
+			// mutates the system prompt, making run N depend on run N-1.
+			// See scripts/neutralize-prime.mjs.
+			harnessState: process.env.PRIME_HARNESS_STATE === "1" ? this._loadMergedHarnessState() : undefined,
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
