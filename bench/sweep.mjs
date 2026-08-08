@@ -48,6 +48,10 @@ const concurrency = Number(flag("concurrency", 1));
 const codemodePrompt = flag("prompt", "q7");
 const vanillaPrompt = flag("vanilla-prompt", "w2");
 const nsMode = flag("ns", "delta");
+// 0 disables the cap. It was never forwarded to run-task, so every run silently
+// used run-task's $1 default and truncated — a cap that is not passed through is
+// worse than no cap, because the runs look complete.
+const maxCost = flag("max-cost", "0");
 
 const tasks = tier
 	? loadTasks({ tier }).sort((a, b) => a.id.localeCompare(b.id)).slice(0, perTier)
@@ -78,6 +82,8 @@ function runOne(task, arm) {
 			levelFor(arm),
 			"--timeout",
 			timeout,
+			"--max-cost",
+			maxCost,
 			...(arm === "codemode" ? ["--prompt", codemodePrompt] : []),
 			...(arm === "vanilla" ? ["--vanilla-prompt", vanillaPrompt] : []),
 		];
