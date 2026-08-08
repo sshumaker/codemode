@@ -47,6 +47,10 @@ if (!["vanilla", "codemode"].includes(arm)) {
 
 const residency = flag("residency", arm === "codemode" ? "L0" : "L4");
 const timeoutSec = Number(flag("timeout", 900));
+// Budget cap in dollars — the arm-neutral control. 0 disables.
+const maxCost = Number(flag("max-cost", 1.0));
+// Optional hard turn cap, off by default (see enforceBudget).
+const maxTurns = Number(flag("max-turns", 0));
 const task = findTask(taskId);
 
 const runId = flag("run-id", `${taskId}__${arm}__${residency}__${model.replace(/[^a-z0-9]/gi, "-")}`);
@@ -218,6 +222,26 @@ const killTimer = setTimeout(() => {
 	child.kill("SIGKILL");
 }, timeoutSec * 1000);
 
+/**
+ * Budget cap, checked as usage streams in.
+ *
+ * Cost rather than turns or wall-clock. Turns are not comparable units across
+ * arms — vanilla batches parallel tool calls into a single turn while codemode
+ * issues one cell per turn — so a turn cap silently penalizes codemode's style.
+ * Wall-clock penalizes it too. A dollar budget asks the question the experiment
+ * actually cares about: given the same spend, which arm gets further?
+ */
+function enforceBudget() {
+	if (maxCost > 0 && summary.cost >= maxCost) {
+		summary.budgetExceeded = true;
+		child.kill("SIGKILL");
+	}
+	if (maxTurns > 0 && summary.turns >= maxTurns) {
+		summary.turnCapReached = true;
+		child.kill("SIGKILL");
+	}
+}
+
 child.stderr.on("data", (d) => {
 	stderr = (stderr + d).slice(-8000);
 });
@@ -252,6 +276,7 @@ child.stdout.on("data", (chunk) => {
 				summary.turns++;
 				for (const k of ["input", "output", "cacheRead", "cacheWrite"]) summary[k] += message.usage[k] ?? 0;
 				summary.cost += message.usage.cost?.total ?? 0;
+				enforceBudget();
 			}
 		}
 	}
@@ -263,13 +288,23 @@ child.on("close", (code) => {
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;
 	summary.stderrTail = stderr.split("\n").slice(-8).join("\n");
+	summary.maxCost = maxCost;
+	// A run stopped by the budget is not a failed run — it is a run that spent
+	// its allowance. Reported separately from timeouts so the two never merge.
+	summary.stopReason = summary.budgetExceeded
+		? "budget"
+		: summary.turnCapReached
+			? "turn-cap"
+			: summary.timedOut
+				? "timeout"
+				: "completed";
 	writeFileSync(join(runDir, "result.json"), `${JSON.stringify({ ...meta, summary }, null, 2)}\n`);
 
 	const tally = [...new Set(summary.toolNames)].join(",") || "none";
 	console.log(
 		`${arm}/${residency} ${taskId}: ${summary.turns} turns, ${summary.toolCalls} calls (${tally}), ` +
 			`${summary.toolErrors} errors, $${summary.cost.toFixed(4)}, ${(summary.wallMs / 1000).toFixed(0)}s` +
-			`${summary.timedOut ? " [TIMED OUT]" : ""}`,
+			`${summary.stopReason === "completed" ? "" : ` [${summary.stopReason.toUpperCase()}]`}`,
 	);
 	console.log(`  -> ${runDir}`);
 	process.exit(0);
