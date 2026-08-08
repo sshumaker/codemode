@@ -207,22 +207,38 @@ export function renderRootIndex(catalogue) {
  *          map rooted at `api/`, written to disk by the caller.
  */
 export function generate(catalogue) {
-	const normalized = catalogue.map((s) => ({ server: s.server, tools: s.tools.map(normalizeTool) }));
+	// Real MCP server names contain spaces ("OpenAPI Explorer", "Math MCP"), so
+	// the package directory needs its own identifier. The raw name is still what
+	// goes on the wire and what the TOC and tool defs display.
+	const normalized = catalogue.map((s) => ({
+		server: s.server,
+		pyServer: pyIdent(s.server),
+		tools: s.tools.map(normalizeTool),
+	}));
+
+	const seen = new Map();
+	for (const s of normalized) {
+		// Two servers could normalize to the same identifier; disambiguate rather
+		// than silently overwriting one package with the other.
+		const count = seen.get(s.pyServer) ?? 0;
+		seen.set(s.pyServer, count + 1);
+		if (count > 0) s.pyServer = `${s.pyServer}_${count + 1}`;
+	}
 
 	const toolDefs = [];
 	const tocLines = [];
 	const names = [];
 	const files = { "INDEX.md": renderRootIndex(normalized) };
 
-	for (const { server, tools } of normalized) {
+	for (const { server, pyServer, tools } of normalized) {
 		toolDefs.push(...renderToolDefs(tools, { server }));
 		tocLines.push(...renderTocLines(tools, { server }));
 		names.push(...renderNames(tools, { server }));
 
-		files[`${server}/INDEX.md`] = renderServerIndex(tools, { server });
-		files[`${server}/__init__.py`] = renderServerInit(tools, { server });
+		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server });
+		files[`${pyServer}/__init__.py`] = renderServerInit(tools, { server });
 		for (const tool of tools) {
-			files[`${server}/${tool.pyName}.py`] = renderToolModule(tool, { server });
+			files[`${pyServer}/${tool.pyName}.py`] = renderToolModule(tool, { server });
 		}
 	}
 
