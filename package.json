@@ -8,7 +8,9 @@
   },
   "scripts": {
     "test": "node --test \"bench/test/*.test.mjs\"",
-    "report": "node bench/residency-report.mjs"
+    "report": "node bench/residency-report.mjs",
+    "iterate": "node bench/quick.mjs",
+    "validate": "node bench/validate.mjs"
   },
   "keywords": [],
   "author": "",

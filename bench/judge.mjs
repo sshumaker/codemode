@@ -209,6 +209,7 @@ function judgeRun(dir) {
 		if (i === 0) run.judgeReasoning = s;
 	}
 
+
 	const avg = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 	const scores = Object.fromEntries(SCORE_KEYS.map((k) => [k, +avg(perDim[k]).toFixed(2)]));
 	const overall = avg(samples);
@@ -234,11 +235,13 @@ function judgeRun(dir) {
 }
 
 const only = flag("run", null);
+const onlyPrefix = flag("only-prefix", null);
 const dirs = only
 	? [join(RUNS, only)]
 	: readdirSync(RUNS)
 			.map((n) => join(RUNS, n))
-			.filter((d) => existsSync(join(d, "result.json")));
+			.filter((d) => existsSync(join(d, "result.json")))
+			.filter((d) => !onlyPrefix || d.split("/").pop().startsWith(onlyPrefix));
 
 const rows = [];
 await pool(

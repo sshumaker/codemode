@@ -65,6 +65,21 @@ const timeout = flag("timeout", "300");
 const withJudge = argv.includes("--judge");
 const judgeModel = flag("judge-model", "claude-opus-4-5");
 const residency = flag("residency", "L0");
+// Guardrails. Every one of these has cost real wall-clock in this project.
+if (concurrency < 8) {
+	console.error(
+		`concurrency ${concurrency} is too low — runs are latency-bound and the key supports far more.\n` +
+			"Use 24-48. Pass --i-know-what-im-doing to override.",
+	);
+	if (!argv.includes("--i-know-what-im-doing")) process.exit(2);
+}
+if (repeat < 2 && variants.length > 1) {
+	console.error(
+		"comparing variants with --repeat 1: run-to-run noise is ~27%, so this cannot rank them.\n" +
+			"Use --repeat 4 (see CLAUDE.md).",
+	);
+}
+
 const available = new Set(loadTasks().map((t) => t.id));
 const tasks = FAST_TASKS.filter((t) => available.has(t));
 
@@ -135,28 +150,16 @@ await pool(
 process.stderr.write("\n");
 
 if (withJudge) {
+	// One judge invocation for every run, parallel inside. Spawning judge.mjs
+	// per run with --concurrency 1 serialized the whole stage and took longer
+	// than the runs themselves.
 	console.log("judging...");
-	const { execFileSync } = await import("node:child_process");
-	const ids = jobs.map((j) => join(RUNS, runId(j))).filter((d) => existsSync(join(d, "result.json")));
-	await pool(
-		ids,
-		(dir) =>
-			new Promise((resolve) => {
-				try {
-					execFileSync(
-						"node",
-						[join(ROOT, "bench/judge.mjs"), envFile, "--model", judgeModel, "--run", dir.split("/").pop(), "--concurrency", "1"],
-						{ stdio: "ignore" },
-					);
-					process.stderr.write(".");
-				} catch {
-					process.stderr.write("x");
-				}
-				resolve();
-			}),
-		12,
+	const { spawnSync } = await import("node:child_process");
+	spawnSync(
+		"node",
+		[join(ROOT, "bench/judge.mjs"), envFile, "--model", judgeModel, "--concurrency", "24", "--only-prefix", "quick__"],
+		{ stdio: ["ignore", "ignore", "inherit"] },
 	);
-	process.stderr.write("\n");
 }
 
 // --- report -------------------------------------------------------------------
