@@ -544,7 +544,55 @@ export const VARIANTS = {
 				"better than a complete-looking answer about the wrong thing.",
 			].join("\n"),
 	},
+
+	/**
+	 * q6 — q1 plus an explicit results ledger.
+	 *
+	 * Measured: 29% of all MCP calls in a run are byte-identical repeats, and 19
+	 * of 40 runs contain at least one. The judge notices — "get_platform_usage
+	 * was called 4 times for each of the 6 platforms", "the reference task
+	 * required only 2 calls" against 61 made — and it is the single largest score
+	 * gap (parallelism_and_efficiency 0.422).
+	 *
+	 * q1 already forbids this in words and it changes nothing, because the model
+	 * cannot see what it already fetched: its only record is the transcript of
+	 * code it wrote. So give it a structure to look at instead of an instruction
+	 * to remember.
+	 */
+	q6: {
+		note: "q1 + an explicit results ledger the model can inspect",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"You are scored on avoiding redundant calls and on running independent",
+				"work concurrently.",
+				"",
+				"Keep every result in one dict, keyed by what produced it, and consult it",
+				"before fetching. You cannot remember across turns what you already have —",
+				"but you can look:",
+				"",
+				"  import asyncio, json",
+				"  R = {}                       # results ledger; survives every turn",
+				"",
+				"  async def fetch(key, coro):",
+				"      if key not in R:",
+				"          R[key] = json.loads(await coro)",
+				"      return R[key]",
+				"",
+				"  await asyncio.gather(",
+				"      fetch('svc_one:x', api.svc_one.search(q='x')),",
+				"      fetch('svc_two:list', api.svc_two.list()),",
+				"  )",
+				"  print(sorted(R))             # what you already have — check this first",
+				"",
+				"Fan out over a list with `gather`, never in a loop of separate cells.",
+				"Plan the whole set of calls before the first one: everything independent",
+				"goes in one wave, only genuinely dependent calls wait.",
+			].join("\n"),
+	},
 };
+
 
 
 
