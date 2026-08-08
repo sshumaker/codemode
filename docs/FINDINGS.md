@@ -44,6 +44,35 @@ That is the composition advantage behaving as predicted, and it also shows why
 turn count and token count move in opposite directions here: codemode spends
 turns to save context.
 
+## Live: pilot sweep, Sonnet 5, 4 fully-paired tasks
+
+Codemode at L0 (discovery only), vanilla at L4 (all definitions resident).
+Paired-only: tasks where both arms completed without timing out.
+
+| | codemode/L0 | vanilla/L4 |
+|---|---|---|
+| avg turns | 45 | **17.8** |
+| avg MCP calls | **48** | 24.3 |
+| avg tokens | **947,607** | 1,083,475 |
+| avg cost | **$0.418** | $0.520 |
+| avg wall | 295s | **151s** |
+| judge overall | **4.83** | 4.17 |
+| task fulfillment | **4.50** | 3.25 |
+| grounding | **5.50** | 4.75 |
+
+Mean cost ratio **1.26x** in codemode's favour; mean turn ratio 0.37x in
+vanilla's. Codemode scored higher on 3 of 4 tasks.
+
+**Read this as directional, not conclusive.** n=4 paired tasks is far below the
+power needed to separate a half-point on a 10-point rubric, it is one model, and
+a single outlier drives much of the gap: on `openapi_explorer_paper_search_*`
+vanilla effectively gave up after 2 turns and 4 calls (score 2.33) while
+codemode worked 50 turns and 27 calls (score 4.33). Remove that task and the
+score difference is within noise.
+
+What does look robust across all four: **codemode does roughly 2x the MCP work
+for ~0.8x the cost, and pays for it in turns and wall-clock.**
+
 ## Methodological problems found before spending real budget
 
 ### 1. `--tools` is an allowlist, and it silently hid the vanilla arm's tools
@@ -106,3 +135,24 @@ than stdio and needs a billing-enabled key.
   with no collisions.
 - **Seven real tools ship an empty description.** They render, but would be
   near-invisible in an L2 TOC.
+
+### 5. Wall-clock and turn caps are both biased controls
+
+Codemode uses 2-3x the turns for the same work — vanilla batches parallel tool
+calls into a single turn, codemode issues one cell per turn but can make many
+API calls inside it. So turns are not comparable units, and a turn cap penalizes
+codemode's style. A wall-clock cap does the same: in the pilot, codemode hit the
+400s limit on a task vanilla finished in 104s, with 67 turns against vanilla's 9.
+
+The control now is a **dollar budget** (`--max-cost`), applied identically to
+both arms. It asks the question the experiment actually cares about — given the
+same spend, which arm gets further — and it does not encode an assumption about
+which unit of work is the right one.
+
+### 6. Self-inflicted: a `pkill -f run-task.mjs` killed an in-flight sweep run
+
+Verifying a patch, a `pkill` matched the sweep's child process and destroyed one
+codemode run. The sweep is resumable (it skips any task/arm with an existing
+`result.json`), so re-running filled the gap without re-spending on the other 11.
+Recorded because the resumability is what made it cheap to recover, and because
+process-name matching is broad enough to catch unrelated work.
