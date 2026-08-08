@@ -102,10 +102,29 @@ Push a line, pull the detail — progressive disclosure applied to notifications
 
 Identical in both arms, or the comparison breaks.
 
-This combination — async, steerable via `send()`, and notifying — has no
-equivalent in the tool-calling world, where subagent tools block. That is a
-capability argument for the design independent of the token argument, and it
-should be reported separately from the token results.
+**Prior art: Claude Code already does this.** Background `Bash`, background
+`Agent` spawns, and a completion notification injected into the parent's next
+turn. Push-notification is a validated pattern, not a speculative one.
+
+The claim is therefore *not* that async steerable subagents are novel —
+`SendMessage` addresses a running agent by name, which is stdin injection under
+another spelling. The narrower and true claim is about representation cost:
+Claude Code spends nine tool definitions (`Agent`, `SendMessage`, `TaskCreate`,
+`TaskGet`, `TaskList`, `TaskOutput`, `TaskStop`, `TaskUpdate`, `Monitor`) on
+what `codemode` expresses as one module — and gets `asyncio.gather`,
+conditionals, retries, and pipes for free rather than by design.
+
+### The vanilla baseline must not be a strawman
+
+Claude Code's Task tools are **deferred**: names resident, schemas fetched on
+demand via `ToolSearch`. That is progressive disclosure, converged on
+independently — `ToolSearch("select:TaskStop")` is `grep api/` with a bespoke
+API instead of a filesystem. It sits at roughly L1 on the residency dial.
+
+So the mainstream tool-calling harness has already moved off L4, and pinning
+`vanilla` there would be a strawman. **Run `vanilla` at both L4 and
+L1-deferred.** This is the same dial, not a new arm. If `codemode` beats naive
+L4 but only ties deferred L1, that is the finding.
 
 ## Documentation is the tool schema
 
@@ -145,6 +164,42 @@ knowing the module name, which is the chicken-and-egg problem at 250 tools.
 **The `api/` tree is not arm-neutral.** In `vanilla`, MCP tools must be native
 tool definitions resident in context — that is the bloat condition being
 baselined. Same catalog, two renderings.
+
+### Residency is a dial, not a switch
+
+How much of the catalog sits resident in the system prompt is a continuous axis,
+and `vanilla` is simply its endpoint:
+
+| level | resident in prompt | est. tokens |
+|---|---|---|
+| L0 | nothing; `ls api/` to discover | 0 |
+| L1 | server index only (28 lines) | ~300 |
+| L2 | full TOC: every tool, one line, signature + summary | ~4k |
+| L3 | top-K inlined fully + TOC for the rest | ~4k + K*100 |
+| L4 | every tool as a full JSON schema (= `vanilla`) | ~15k |
+
+The ~15k anchor is Anthropic's reported tool-definition cost per call.
+
+**Selection leaks.** Preloading the tools the benchmark happens to need gives
+`codemode` an oracle. Any top-K must be derived from a disjoint task set. The
+default is therefore **L2, generated mechanically from the `api/` tree — every
+tool, no selection** — which is free, since the generator already walks the tree.
+L3 is a follow-up, not a default.
+
+**Deflationary hypothesis worth testing.** A TOC line is ~15 tokens; a JSON tool
+definition is 60-150. L2 is a 4-7x reduction against L4 while removing nearly
+all discovery latency. If that accounts for most of the token win, the savings
+come from schema->TOC compression rather than lazy loading — obtainable without
+a REPL, by writing terser tool descriptions. Claim 2 would then have to carry
+the entire quality delta.
+
+This recovers the mechanism split lost when the 2x2 was cut, cheaply: L0-L4
+differ **only by a preamble string**. No new implementations, no new arms.
+
+**Calibration pass.** Run L0/L1/L2/L4 on one model (Sonnet 5, mid-gradient) over
+the pilot subset, pick the level, lock it for the 2-arm x 3-model matrix. Costs
+one model's runs and pre-empts both symmetric objections: that `codemode` was
+handicapped by cold-start discovery, or that its preamble was hand-tuned.
 
 ### Fairness: one source, two renderings
 
