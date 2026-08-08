@@ -299,6 +299,53 @@ and the win is fragile. A win with a *small* namespace is the real result.
 3. **Non-monotone cost.** Re-reading a variable is free, but *rediscovering* it
    costs a turn. Turn count and token count can move in opposite directions.
 
+## Sandboxing
+
+Not on the critical path for this experiment, and the wrong reasons for picking
+one would invalidate it.
+
+**Sandboxing by changing the action language destroys the measurement.** The
+hypothesis is that code beats JSON *because of pretraining volume*. Swapping
+Python for TypeScript-in-a-VM moves the independent variable, so a null result
+becomes uninterpretable.
+
+Ordered by distribution shift rather than isolation strength:
+
+| option | isolation | shift | bash | notes |
+|---|---|---|---|---|
+| microVM (Firecracker/gVisor) | strong | none | yes | real Linux + CPython; ~100-500ms boot, poolable |
+| container + seccomp | medium | tiny | yes | cheapest option that changes nothing |
+| Pyodide (CPython -> WASM) | strong | medium | **no** | real Python, MEMFS, JupyterLite gives a true IPython kernel |
+| JS/WASI + virtual FS | strong | large | **no** | changes the experiment |
+
+**Observed constraint:** in both smoke tests Sonnet 5 opened its cell with
+`%%bash` and ran a shell command rather than writing Python. A sandbox without
+bash does not merely remove a feature — it changes what the agent does. That
+disqualifies Pyodide here despite being otherwise the most elegant fit.
+
+**Decisive practical constraint:** MCP-Bench's 28 servers are local processes
+making outbound calls (Wikipedia, NASA, HuggingFace, arXiv). A no-network
+sandbox breaks the benchmark outright, so isolation can only cover the host
+filesystem and process table. Container-with-host-network is the fit; the threat
+model is "the model does something careless," not a determined attacker.
+
+Decision: container now, microVM if this ever runs genuinely untrusted code,
+Pyodide only if browser/serverless distribution is needed.
+
+### A TypeScript arm is a good probe, not a good sandbox
+
+If the mechanism is pretraining coverage, it predicts a three-point ordering:
+**Python > TypeScript > JSON tool calls** — Python has far more notebook and
+script data than TypeScript has agentic-script data, and both dwarf tool-call
+JSON.
+
+The two-arm design cannot test that. A TS-REPL arm could, and if TS landed
+*below* JSON the pretraining story would be wrong and something else would have
+to explain CodeAct's results. Same infrastructure, different action language;
+sandboxability becomes a side benefit rather than the motivation.
+
+File as a third arm after the Python-vs-JSON number exists, not before.
+
 ## Benchmark
 
 MCP-Bench first (250 tools / 28 domains — where tool-definition bloat bites
