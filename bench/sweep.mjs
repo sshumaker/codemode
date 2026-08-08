@@ -47,8 +47,10 @@ const tasks = tier
 console.log(`sweep: ${tasks.length} tasks x ${arms.length} arms = ${tasks.length * arms.length} runs`);
 console.log(`model: ${model}  residency(codemode): ${residency}\n`);
 
-const runId = (task, arm) =>
-	`${task.id}__${arm}__${arm === "codemode" ? residency : "L4"}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+/** Residency label per arm; notools has none, vanilla is always L4. */
+const levelFor = (arm) => (arm === "codemode" ? residency : arm === "notools" ? "none" : "L4");
+
+const runId = (task, arm) => `${task.id}__${arm}__${levelFor(arm)}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 
 function runOne(task, arm) {
 	return new Promise((resolve) => {
@@ -64,7 +66,7 @@ function runOne(task, arm) {
 			task.id,
 			arm,
 			"--residency",
-			arm === "codemode" ? residency : "L4",
+			levelFor(arm),
 			"--timeout",
 			timeout,
 		];

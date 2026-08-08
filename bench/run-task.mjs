@@ -40,12 +40,15 @@ if (!envFile || !model || !taskId || !arm) {
 	console.error("usage: bench/run-task.mjs <env-file> <model> <task-id> <arm> [--residency L0|L1|L2]");
 	process.exit(2);
 }
-if (!["vanilla", "codemode"].includes(arm)) {
+// `notools` is a validity control, not a competitor: it gives the model nothing
+// and asks the same question. Any task it answers well cannot discriminate the
+// arms, because success there does not depend on tool use at all.
+if (!["vanilla", "codemode", "notools"].includes(arm)) {
 	console.error(`unknown arm: ${arm}`);
 	process.exit(2);
 }
 
-const residency = flag("residency", arm === "codemode" ? "L0" : "L4");
+const residency = flag("residency", arm === "codemode" ? "L0" : arm === "notools" ? "none" : "L4");
 const timeoutSec = Number(flag("timeout", 900));
 // Budget cap in dollars — the arm-neutral control. 0 disables.
 const maxCost = Number(flag("max-cost", 1.0));
@@ -65,7 +68,7 @@ mkdirSync(runDir, { recursive: true });
  * counted against codemode's savings in docs/DESIGN.md.
  */
 function buildPreamble() {
-	if (arm === "vanilla") return "";
+	if (arm !== "codemode") return "";
 
 	const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
 		task.exposedServers.includes(s.server),
@@ -140,7 +143,9 @@ const prompt = task.fuzzy;
 // 250 tool definitions silently never reach the model and it falls back to bash.
 const BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 let toolList;
-if (arm === "vanilla") {
+if (arm === "notools") {
+	toolList = [];
+} else if (arm === "vanilla") {
 	const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
 		task.exposedServers.includes(s.server),
 	);
@@ -160,8 +165,7 @@ const cliArgs = [
 	"json",
 	"--model",
 	model,
-	"--tools",
-	tools,
+	...(arm === "notools" ? ["--no-tools"] : ["--tools", tools]),
 	"--cwd",
 	runDir,
 	"--no-skills",
