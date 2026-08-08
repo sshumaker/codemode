@@ -123,6 +123,30 @@ function buildPreamble() {
 	throw new Error(`unsupported residency for codemode: ${residency}`);
 }
 
+/**
+ * Base system prompt, identical for every arm.
+ *
+ * prime's own base prompt is 6,284 chars for codemode and 615 for vanilla —
+ * whole sections are gated on `hasIpython`, so the code arm was receiving 10x
+ * more workflow guidance (guidance prime describes as trained) plus RLM subagent
+ * instructions this experiment does not use. That makes the comparison "tuned
+ * code prompt vs bare tool prompt" rather than code vs tools.
+ *
+ * Replacing it with one neutral prompt restores the matched pair required by
+ * docs/DESIGN.md: identical framing, with only the tool-specific instructions
+ * differing in the appended preamble.
+ */
+const BASE_SYSTEM_PROMPT = [
+	"You are an agent that completes tasks using the tools available to you.",
+	"Work step by step: decide what you need, use your tools to get it, and",
+	"reason over the results.",
+	"",
+	"Ground every claim in something a tool actually returned. Do not state facts",
+	"you have not retrieved.",
+	"",
+	"When the task is complete, stop calling tools and give your final answer.",
+].join("\n");
+
 const preamble = buildPreamble();
 writeFileSync(join(runDir, "prompt.txt"), preamble);
 
@@ -220,6 +244,8 @@ const cliArgs = [
 	"--no-skills",
 	"--no-context-files",
 	"--no-prompt-templates",
+	"--system-prompt",
+	BASE_SYSTEM_PROMPT,
 ];
 if (arm === "vanilla") {
 	cliArgs.push("--extension", EXTENSION);
