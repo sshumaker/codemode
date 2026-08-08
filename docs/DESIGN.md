@@ -76,6 +76,48 @@ Replaces prime's `rlm.run()`, which is detached (returns a handle "once its task
 is admitted") and therefore needs the `rlm-heartbeat` / `agent-message`
 coordination machinery. Blocking `spawn` is the arm-symmetric primitive.
 
+## Documentation is the tool schema
+
+The two arms carry identical information in different containers:
+
+| | `vanilla` | `codemode` |
+|---|---|---|
+| container | JSON Schema tool definition | docstring + type hints |
+| delivery | injected every turn, unconditionally | pulled on demand via `help()` / `inspect.signature()` / `dir()` |
+| discovery | none needed — always resident | Python's introspection protocol |
+
+Python's introspection protocol *is* the progressive-disclosure mechanism, and
+we get it free — `help(spawn)` is not something the model has to be taught.
+
+Two consequences:
+
+**1. Docstring quality is not cosmetic — it is the arm's tool documentation.**
+Every function reachable from the kernel namespace needs a complete docstring:
+purpose, args, returns, raises, and a worked example. A thin docstring
+handicaps `codemode` in a way that has nothing to do with the hypothesis.
+
+**2. Fairness rule: the two containers must be semantically matched.** The
+docstring for `spawn` and the JSON description for `task` must say the same
+things. Otherwise the experiment measures whose prose is better, not which
+architecture is better. Concretely: write the description once per capability,
+then render it into both containers, and diff them when either changes.
+
+For MCP tools this is automatic — `mcp_base.py` generates modules from the
+server's own `description` field and JSON Schema, so both arms inherit the same
+upstream text. Only harness-native capabilities (subagents, file ops) need the
+matched-pair discipline applied by hand.
+
+**3. This yields the cleanest measurement of the progressive-disclosure claim:**
+documentation tokens *actually consumed* (codemode) versus documentation tokens
+*always resident* (vanilla). Log both. If codemode's agents rarely call `help()`
+and still succeed, the always-resident definitions were largely dead weight,
+which is the claim stated precisely.
+
+The `codemode` system prompt therefore needs a small fixed preamble pointing at
+the discovery entry points (`dir()`, `help()`, the module list). That preamble
+is a real, permanent context cost and must be counted against codemode's
+savings rather than treated as free.
+
 ## Central metric: displaced bytes
 
 The thesis is not "code mode uses fewer tokens" — it is that code mode
