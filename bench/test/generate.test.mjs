@@ -227,3 +227,42 @@ describe("residency scaling", () => {
 		assert.ok(ratio > 8 && ratio < 12, `expected ~10x growth, got ${ratio.toFixed(2)}x`);
 	});
 });
+
+describe("wire names satisfy provider constraints", () => {
+	// Anthropic requires ^[a-zA-Z0-9_-]{1,64}$. Real server names contain spaces
+	// and server+tool can exceed 64 chars, so a regression here rejects the whole
+	// request rather than degrading gracefully.
+	const VALID = /^[a-zA-Z0-9_-]{1,64}$/;
+
+	it("sanitizes spaces and punctuation", () => {
+		assert.match(wireName("OpenAPI Explorer", "getApiOverview"), VALID);
+		assert.equal(wireName("OpenAPI Explorer", "getApiOverview"), "OpenAPI_Explorer__getApiOverview");
+	});
+
+	it("caps length at 64 characters", () => {
+		const name = wireName("A Very Long Server Name That Goes On", "an_extremely_long_tool_name_that_also_goes_on_and_on");
+		assert.ok(name.length <= 64, `got ${name.length} chars`);
+		assert.match(name, VALID);
+	});
+
+	it("keeps the tool half when truncating, since it carries more information", () => {
+		const name = wireName("Some Extremely Long Server Name Here Indeed", "distinctive_tool");
+		assert.ok(name.includes("distinctive_tool"), `tool name was truncated away: ${name}`);
+	});
+
+	it("produces valid, unique names across the whole realistic catalogue", () => {
+		const { toolDefs } = generate(realistic);
+		const names = toolDefs.map((d) => d.name);
+		for (const n of names) assert.match(n, VALID);
+		assert.equal(new Set(names).size, names.length, "wire names collided");
+	});
+
+	it("carries the real server and tool back for the proxy", () => {
+		// The mangled name is what the model sees; the proxy needs the originals.
+		const { toolDefs } = generate(realistic);
+		for (const def of toolDefs) {
+			assert.ok(def._mcp?.server, `${def.name} lost its server`);
+			assert.ok(def._mcp?.tool, `${def.name} lost its tool name`);
+		}
+	});
+});
