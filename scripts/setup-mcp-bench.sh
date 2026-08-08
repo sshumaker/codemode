@@ -43,7 +43,15 @@ VENV_PY="$BENCH/.venv/bin/python"
 
 echo "==> python deps (shared venv)"
 VIRTUAL_ENV="$BENCH/.venv" uv pip install -q -r "$SERVERS/requirements.txt" 2>&1 | tail -2
-VIRTUAL_ENV="$BENCH/.venv" uv pip install -q fastmcp mcp 2>&1 | tail -1
+
+# Version pins mcp-bench's requirements.txt lacks. Its `mcp[cli]>=1.9.0` is
+# unbounded, so a fresh resolve picks up mcp 2.x, which dropped
+# `mcp.server.fastmcp` and renamed McpError -> MCPError. That alone breaks 14 of
+# the 28 servers. pydantic >=2.12 additionally rejects `default` alongside
+# `default_factory`, breaking 4 more. Without these pins only 11/28 servers start.
+echo "==> pinning SDK versions (mcp<2, pydantic<2.12)"
+VIRTUAL_ENV="$BENCH/.venv" uv pip install -q \
+	"mcp>=1.9,<2" "fastmcp<2.4" "pydantic>=2.10,<2.12" pydantic-settings 2>&1 | tail -1
 
 # Editable installs for the Python servers that are packages rather than scripts.
 for pkg in unit-converter-mcp time-mcp paper-search-mcp medcalc mcp-nixos; do
@@ -70,13 +78,27 @@ for dir in "$SERVERS"/*/; do
 	echo "    npm: $name"
 	(cd "$dir" && npm install --silent --no-audit --no-fund >/dev/null 2>&1) \
 		|| { echo "    (npm install failed for $name)"; continue; }
-	# Build only when the entry point the launcher expects is absent.
+	# Build when the entry point the launcher expects is missing. Checking for
+	# "build/ or dist/ exists" is not enough — metmuseum-mcp ships a build/ but
+	# is launched from dist/, so it silently stayed unbuilt.
+	entry="$(node -e "
+		const c = require('$SERVERS/commands.json');
+		const d = Object.values(c).find(v => v.cwd && v.cwd.replace(/^\.\.\//,'') === '$name');
+		const m = d && /(?:^|\s)((?:build|dist|src)\/\S+\.js)/.exec(d.cmd);
+		process.stdout.write(m ? m[1] : '');
+	" 2>/dev/null)"
+	[ -n "$entry" ] && [ -f "$dir/$entry" ] && continue
+
 	if node -e "process.exit(require('$dir/package.json').scripts?.build?0:1)" 2>/dev/null; then
-		if [ ! -d "$dir/build" ] && [ ! -d "$dir/dist" ]; then
-			(cd "$dir" && npm run build --silent >/dev/null 2>&1) \
-				|| echo "    (build failed for $name)"
-		fi
+		(cd "$dir" && npm run build --silent >/dev/null 2>&1) || echo "    (npm build failed for $name)"
+	elif [ -f "$dir/tsconfig.json" ]; then
+		# No build script, just a tsconfig — mcp-bench's own installer relied on a
+		# globally installed tsc for these. Install it locally instead.
+		echo "    tsc: $name"
+		(cd "$dir" && npm install --silent --no-audit --no-fund typescript @types/node >/dev/null 2>&1 \
+			&& ./node_modules/.bin/tsc >/dev/null 2>&1) || true
 	fi
+	[ -n "$entry" ] && [ ! -f "$dir/$entry" ] && echo "    (warning: $name still missing $entry)"
 done
 
 echo "==> done. verify with: node bench/mcp-schemas.mjs --probe"

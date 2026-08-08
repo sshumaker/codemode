@@ -8,13 +8,36 @@
  *
  *   node bench/residency-report.mjs [toolCount]   # default 250 (MCP-Bench scale)
  */
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildArm, countTokens, renderResidency } from "./arms.mjs";
 import { generate } from "./generate.mjs";
 import { synthetic } from "./test/fixtures/catalogue.mjs";
 
-const toolCount = Number(process.argv[2] ?? 250);
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const REAL = join(ROOT, "bench/data/mcp-schemas.json");
 
-const { toolDefs, tocLines, names } = generate(synthetic(toolCount));
+/**
+ * Prefer the real MCP-Bench catalogue when it has been dumped; fall back to a
+ * synthetic one of the requested size. Real descriptions are far longer and
+ * more varied than synthetic ones, so the two are not interchangeable — the
+ * synthetic path exists only so the report runs before setup.
+ */
+let catalogue;
+let source;
+let toolCount;
+if (existsSync(REAL) && !process.argv.includes("--synthetic")) {
+	catalogue = JSON.parse(readFileSync(REAL, "utf8")).catalogue;
+	toolCount = catalogue.reduce((n, s) => n + s.tools.length, 0);
+	source = `real MCP-Bench catalogue — ${catalogue.length} servers`;
+} else {
+	toolCount = Number(process.argv[2] ?? 250);
+	catalogue = synthetic(toolCount);
+	source = "synthetic catalogue";
+}
+
+const { toolDefs, tocLines, names } = generate(catalogue);
 const mcp = {
 	L0: 0,
 	L1: countTokens(names.join("\n")),
@@ -45,7 +68,7 @@ const rows = configs.map(({ config, arm, builtinLevel, mcpLevel }) => {
 const naive = rows[0].resident;
 for (const r of rows) r["vs naive"] = `${(naive / r.resident).toFixed(1)}x`;
 
-console.log(`\nResident tokens per request — ${toolCount} MCP tools\n`);
+console.log(`\nResident tokens per request — ${toolCount} MCP tools\n(${source})\n`);
 console.table(rows);
 
 const deferred = rows[1].resident;
