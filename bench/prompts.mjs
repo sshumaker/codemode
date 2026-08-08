@@ -95,17 +95,16 @@ export const VARIANTS = {
 	 * failure mode, show the shape of a good cell once. Demonstration tends to
 	 * transfer better than a rule list, and it is far shorter.
 	 *
-	 * WINNER, and the first prompt change with a significant effect. Paired over
-	 * 24 (task, repeat) cells against v1:
+	 * REJECTED once scored. Cheap, but worse at the task. Paired over 23 cells
+	 * against v1:
 	 *
-	 *   cost            0.77x geometric mean   t = -3.11   better on 16/24
-	 *   turns           +1.0                   t = +0.58   (no effect)
-	 *   text printed    47% less back into context
+	 *   cost      0.77x   t = -3.60   significantly cheaper
+	 *   SCORE     -0.40   t = -2.19   significantly WORSE
 	 *
-	 * The win is entirely in payload size per turn, not in turn count — exactly
-	 * the mechanism the example demonstrates. An earlier 5-task comparison ranked
-	 * v3 *worse*; that sample was far below the noise floor. Verified with
-	 * `bench/quick.mjs --variants v1,v3 --repeat 4 --concurrency 48`.
+	 * It prints 47% less back into context, which is what it was designed to do,
+	 * and buys that by doing less of the task. This is the trap in optimizing
+	 * cost: a variant can win on every proxy metric by giving up sooner. Rank on
+	 * `score`, use cost as a tiebreak.
 	 */
 	v3: {
 		note: "one worked example; 0.77x cost vs v1, t=-3.11, n=24 paired",
@@ -212,9 +211,19 @@ export const VARIANTS = {
 	 * v2 (rules) lost and v3 (one example) won, which suggests the model imitates
 	 * the demonstrated shape closely. If that is right, demonstrating a complete
 	 * fetch-to-answer flow should compress the trajectory more than telling it to.
+	 *
+	 * CURRENT BEST. Paired over 23 cells against v1:
+	 *
+	 *   cost      0.74x   t = -2.88   significantly cheaper
+	 *   turns     -15%
+	 *   SCORE     -0.15   t = -0.78   no significant loss
+	 *
+	 * and against v3, score +0.24 (t = +2.01). So v7 gets v3's savings without
+	 * v3's quality regression — the whole-task example compresses the trajectory
+	 * rather than truncating the work.
 	 */
 	v7: {
-		note: "v3 but the example spans the whole task, not one step",
+		note: "whole-task example; 0.74x cost vs v1 with no score loss — current best",
 		build: ({ toolCount, serverCount }) =>
 			[
 				...discovery(toolCount, serverCount),

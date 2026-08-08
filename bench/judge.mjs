@@ -215,10 +215,13 @@ async function judgeRun(dir) {
 	const calls = trajectory(run.runId);
 	const prompt = buildPrompt(run, task, calls);
 
+	// The repeat samples are independent, so issue them together. Running them in
+	// series multiplied every worker's latency by `repeats` and quietly divided
+	// the effective concurrency by the same factor.
+	const raw = await Promise.all(Array.from({ length: repeats }, () => callJudge(prompt)));
 	const samples = [];
 	const perDim = {};
-	for (let i = 0; i < repeats; i++) {
-		const s = await callJudge(prompt);
+	for (const [i, s] of raw.entries()) {
 		const values = SCORE_KEYS.map((k) => Number(s[k]) || 0);
 		samples.push(+(values.reduce((a, b) => a + b, 0) / values.length).toFixed(2));
 		for (const k of SCORE_KEYS) (perDim[k] ??= []).push(Number(s[k]) || 0);

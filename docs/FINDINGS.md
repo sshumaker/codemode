@@ -475,3 +475,45 @@ analysis said was wrong with v1.
 Note the earlier 5-task comparison ranked v3 *worse*. That sample was an order of
 magnitude below the noise floor. The lesson is the one already recorded above:
 below ~20 paired cells, this benchmark cannot rank prompts at all.
+
+## Optimizing cost selects for giving up
+
+Ranked by cost, v3 looked like a clear win: 0.77x against v1, t=-3.11, and the
+mechanism checked out (47% less text returned into context). It was adopted.
+
+Scored, it is a regression:
+
+| vs v1, n=23 paired | cost ratio | t | score delta | t |
+|---|---|---|---|---|
+| v3 | **0.77x** | -3.60 | **-0.40** | **-2.19** |
+| v7 | **0.74x** | -2.88 | -0.15 | -0.78 (ns) |
+
+**v3 is significantly cheaper and significantly worse at the task.** It bought
+its savings by doing less. Every proxy metric — turns, cost, bytes returned to
+context — improved while the thing being measured got worse.
+
+v7 gets the same savings with no significant score loss, and beats v3 on score
+directly (+0.24, t=+2.01). It is the current best prompt.
+
+The rule this earns: **rank on score, use cost as a tiebreak.** A cheaper agent
+that stops early wins every efficiency metric there is.
+
+## Judging was the slow path, for three separate reasons
+
+Scoring 54 runs took longer than producing them. Three compounding bugs, each
+mine:
+
+1. `bench/quick.mjs` spawned `judge.mjs` **once per run with `--concurrency 1`**,
+   serializing the entire stage.
+2. `judge.mjs` used **`execFileSync`**, which blocks the event loop — so the
+   worker pool ran on one thread and `--concurrency` did nothing.
+3. Switching to `promisify(execFile)` looked correct but **`execFile` has no
+   `input` option**, so curl waited on stdin until the run timed out. `spawn`
+   with an explicit `stdin.end()` is the form that works.
+4. The three repeat samples per run ran **in series**, dividing effective
+   concurrency by three.
+
+Single judge call: 17.6s. 68 runs now score in well under five minutes.
+
+`CLAUDE.md` records the rule: one iteration command, never hand-rolled, and
+`bench/quick.mjs` refuses concurrency below 8.
