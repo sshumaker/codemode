@@ -452,7 +452,49 @@ export const VARIANTS = {
 				"actually retrieved. State explicitly anything you could not determine.",
 			].join("\n"),
 	},
+
+	/**
+	 * q4 — compose the per-dimension winners, kept short.
+	 *
+	 * Measured leaders (0-1): q1 owns fulfilment 0.502, tool-fit 0.630, params
+	 * 0.688 and parallelism 0.453; q2 owns grounding 0.704. q3 concatenated both
+	 * and beat neither, which — with v2's failure — suggests length itself costs
+	 * something. So this takes q1 whole and adds only q2's grounding demand and
+	 * its one-line requirement sweep, rather than both prompts end to end.
+	 */
+	q4: {
+		note: "q1 + q2's grounding demand, kept tight",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"You are scored on completing every part of the request, on grounding each",
+				"claim in a tool result, and on avoiding redundant or needlessly serial calls.",
+				"",
+				"Plan the full set of calls before the first one. Group them into waves:",
+				"everything that does not depend on another result goes in one",
+				"`asyncio.gather`; only genuinely dependent calls wait for a later wave.",
+				"",
+				"  import asyncio, json",
+				"  a, b, c = await asyncio.gather(",
+				"      api.svc_one.search(q='x'),",
+				"      api.svc_two.list(),",
+				"      api.svc_three.details(id=7),",
+				"  )",
+				"  ids = [r['id'] for r in json.loads(a)['items'][:20]]",
+				"  details = await asyncio.gather(*[api.svc_one.get(id=i) for i in ids])",
+				"",
+				"Never call the same tool twice with the same arguments — results persist",
+				"in variables, so reuse them. Fan out over a list with `gather`, never in",
+				"a loop of separate cells.",
+				"",
+				"Before answering, check the request part by part and confirm each is",
+				"covered by data you actually retrieved. Never fill a gap from memory —",
+				"say explicitly what you could not determine.",
+			].join("\n"),
+	},
 };
+
 
 
 
