@@ -43,6 +43,13 @@ const flag = (name, fallback) => {
 const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
 const judgeModel = flag("model", "claude-opus-4-5");
 const force = argv.includes("--force");
+// Judge the same run N times to measure judge noise; results go to judgeSamples.
+// Judge the same run N times and average. Measured judge-only noise on an
+// unchanged run was sd ~0.39 on the 10-point scale — comparable to the arm
+// difference being measured — so a single sample is not a measurement.
+// Averaging N samples cuts that by sqrt(N). MCP-Bench does the same
+// (`enable_judge_stability`).
+const repeats = Number(flag("repeat", 3));
 
 if (!envFile) {
 	console.error("usage: bench/judge.mjs <env-file> [--model ...] [--run <runId>] [--all]");
@@ -187,11 +194,38 @@ function judgeRun(dir) {
 
 	const task = findTask(run.task.id);
 	const calls = trajectory(run.runId);
-	const scores = callJudge(buildPrompt(run, task, calls));
+	const prompt = buildPrompt(run, task, calls);
 
-	const values = SCORE_KEYS.map((k) => Number(scores[k]) || 0);
-	const overall = values.reduce((a, b) => a + b, 0) / values.length;
-	run.judge = { model: judgeModel, scores, overall: +overall.toFixed(2), mcpCalls: calls.length };
+	const samples = [];
+	const perDim = {};
+	for (let i = 0; i < repeats; i++) {
+		const s = callJudge(prompt);
+		const values = SCORE_KEYS.map((k) => Number(s[k]) || 0);
+		samples.push(+(values.reduce((a, b) => a + b, 0) / values.length).toFixed(2));
+		for (const k of SCORE_KEYS) (perDim[k] ??= []).push(Number(s[k]) || 0);
+		if (i === 0) run.judgeReasoning = s;
+	}
+
+	const avg = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+	const scores = Object.fromEntries(SCORE_KEYS.map((k) => [k, +avg(perDim[k]).toFixed(2)]));
+	const overall = avg(samples);
+	const sd =
+		samples.length > 1
+			? Math.sqrt(samples.reduce((a, b) => a + (b - overall) ** 2, 0) / (samples.length - 1))
+			: 0;
+
+	run.judge = {
+		model: judgeModel,
+		samples,
+		// Standard error of the averaged score — carry it so downstream analysis
+		// can tell measurement noise from a real difference.
+		sd: +sd.toFixed(3),
+		se: +(sd / Math.sqrt(samples.length)).toFixed(3),
+		scores,
+		overall: +overall.toFixed(2),
+		mcpCalls: calls.length,
+	};
+
 	writeFileSync(resultPath, `${JSON.stringify(run, null, 2)}\n`);
 	return run;
 }
