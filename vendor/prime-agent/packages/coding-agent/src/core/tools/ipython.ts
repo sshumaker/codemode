@@ -685,6 +685,23 @@ function recordAssignments(code: string, cwd: string): void {
 		}
 		for (const m of line.matchAll(/\bas\s+([A-Za-z_]\w*)/g)) nonData.add(m[1]);
 
+		// Comprehension and lambda locals leak into the listing as bare names with
+		// no provenance, and they are never data the model needs reminding of.
+		for (const m of line.matchAll(/\bfor\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+in\b/g)) {
+			for (const n of m[1].split(",")) nonData.add(n.trim());
+		}
+		for (const m of line.matchAll(/\blambda\s+([^:]+):/g)) {
+			for (const n of m[1].split(",")) {
+				const bare = n.trim().split("=")[0].trim();
+				if (/^[A-Za-z_]\w*$/.test(bare)) nonData.add(bare);
+			}
+		}
+		// Walrus targets are intermediates, not results: `if (m := re.search(…))`.
+		for (const m of line.matchAll(/([A-Za-z_]\w*)\s*:=/g)) nonData.add(m[1]);
+		// Function and class definitions.
+		const def = /^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/.exec(line);
+		if (def) nonData.add(def[1]);
+
 		// Top-level bindings only: no leading indentation, single or tuple target.
 		const m = /^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)/.exec(line);
 		if (!m) continue;
