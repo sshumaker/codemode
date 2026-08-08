@@ -59,6 +59,12 @@ const arms = flag("arms", "codemode").split(",").map((a) => a.trim());
 const repeat = Number(flag("repeat", 1));
 const concurrency = Number(flag("concurrency", 16));
 const timeout = flag("timeout", "300");
+// Score the runs. Turns and cost are cheap proxies, but the question MCP-Bench
+// actually asks is whether the task was completed with the right tools — a
+// variant can be cheaper because it gave up sooner.
+const withJudge = argv.includes("--judge");
+const judgeModel = flag("judge-model", "claude-opus-4-5");
+const residency = flag("residency", "L0");
 const available = new Set(loadTasks().map((t) => t.id));
 const tasks = FAST_TASKS.filter((t) => available.has(t));
 
@@ -105,6 +111,8 @@ await pool(
 					job.variant,
 					"--run-id",
 					id,
+					"--residency",
+					residency,
 					"--timeout",
 					timeout,
 					"--max-cost",
@@ -125,6 +133,31 @@ await pool(
 );
 
 process.stderr.write("\n");
+
+if (withJudge) {
+	console.log("judging...");
+	const { execFileSync } = await import("node:child_process");
+	const ids = jobs.map((j) => join(RUNS, runId(j))).filter((d) => existsSync(join(d, "result.json")));
+	await pool(
+		ids,
+		(dir) =>
+			new Promise((resolve) => {
+				try {
+					execFileSync(
+						"node",
+						[join(ROOT, "bench/judge.mjs"), envFile, "--model", judgeModel, "--run", dir.split("/").pop(), "--concurrency", "1"],
+						{ stdio: "ignore" },
+					);
+					process.stderr.write(".");
+				} catch {
+					process.stderr.write("x");
+				}
+				resolve();
+			}),
+		12,
+	);
+	process.stderr.write("\n");
+}
 
 // --- report -------------------------------------------------------------------
 const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
@@ -149,6 +182,12 @@ for (const variant of variants) {
 			"cut short": cut > 0 ? `${cut} !!` : 0,
 			avgTurns: ok.length ? +mean(ok.map((r) => r.summary.turns)).toFixed(1) : "—",
 			avgCost: ok.length ? +mean(ok.map((r) => r.summary.cost)).toFixed(3) : "—",
+			score: ok.filter((r) => r.judge).length
+				? +mean(ok.filter((r) => r.judge).map((r) => r.judge.overall)).toFixed(2)
+				: "—",
+			fulfil: ok.filter((r) => r.judge).length
+				? +mean(ok.filter((r) => r.judge).map((r) => r.judge.scores.task_fulfillment)).toFixed(2)
+				: "—",
 			p90Sec: ok.length
 				? Math.round([...ok.map((r) => r.summary.wallMs / 1000)].sort((a, b) => a - b)[Math.floor(ok.length * 0.9)])
 				: "—",

@@ -286,7 +286,62 @@ export const VARIANTS = {
 				"with `asyncio.gather`. Print only what you need to decide the next step.",
 			].join("\n"),
 	},
+
+	/**
+	 * v9 — collapse discovery into one cell.
+	 *
+	 * Trace of v7 (18 runs, 231 cells): the first three cells are discovery in
+	 * 18/18, 18/18 and 14/18 runs — root index, then a server index, then a tool
+	 * file — before any work begins. Discovery is 24% of all cells and it is
+	 * purely mechanical.
+	 *
+	 * Every server's INDEX.md already lists each tool's full signature, so one
+	 * glob over them yields everything needed to start, and the per-tool module
+	 * is only worth opening when a parameter is genuinely unclear. That trades
+	 * ~3 turns for ~1.5k tokens of index text, which at these turn costs is a
+	 * good trade.
+	 */
+	v9: {
+		note: "v7 + one-cell discovery via glob over INDEX.md",
+		build: ({ toolCount, serverCount }) =>
+			[
+				"## Tools",
+				"",
+				`The \`api/\` directory holds ${toolCount} async tool functions across ${serverCount} services,`,
+				"generated from their live API schemas.",
+				"",
+				"Start by reading every service index in ONE cell:",
+				"",
+				"  import glob",
+				"  for f in sorted(glob.glob('api/*/INDEX.md')):",
+				"      print(open(f).read())",
+				"",
+				"That gives you every tool's full signature. Only open",
+				"`api/<package>/<tool>.py` if a parameter is still unclear after that.",
+				"",
+				"Each cell costs a turn, and whatever you print re-enters your context.",
+				"After discovery, a task usually needs two more cells. Fetch everything",
+				"independent at once:",
+				"",
+				"  import asyncio, json",
+				"  import api.svc_one, api.svc_two",
+				"  raw_a, raw_b = await asyncio.gather(api.svc_one.search(q='x'), api.svc_two.list())",
+				"  a, b = json.loads(raw_a), json.loads(raw_b)",
+				"  print(len(a['items']), len(b['items']), list(a['items'][0]))",
+				"",
+				"Then derive the answer and print only that:",
+				"",
+				"  ids = {x['id'] for x in b['items']}",
+				"  merged = sorted((r for r in a['items'] if r['id'] in ids), key=lambda r: -r['score'])",
+				"  for r in merged[:10]:",
+				"      print(r['name'], r['score'])",
+				"",
+				"The large payloads never leave `raw_a`/`raw_b`. They persist across cells,",
+				"so you never re-fetch or re-parse.",
+			].join("\n"),
+	},
 };
+
 
 
 /** Build a preamble for a named variant. Throws on an unknown name. */
