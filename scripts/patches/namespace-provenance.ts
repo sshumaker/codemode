@@ -21,6 +21,8 @@ interface Provenance {
 }
 
 const assignedAt = new Map<string, Provenance>();
+/** What has already been shown to the model, for delta mode. */
+const shownNames = new Map<string, string>();
 let cellTurn = 0;
 
 function recordAssignments(code: string, cwd: string): void {

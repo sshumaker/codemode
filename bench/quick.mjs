@@ -61,7 +61,9 @@ const concurrency = Number(flag("concurrency", 16));
 const timeout = flag("timeout", "300");
 // Show the live kernel namespace after every cell (harness-side fix for the
 // redundancy gap, as opposed to the prompt-side fix in variant q7).
-const showNamespace = argv.includes("--show-namespace");
+// "full" repeats the whole namespace each cell; "delta" shows only what is new,
+// which is far cheaper in context because the repetition is where the cost is.
+const nsMode = argv.includes("--ns-delta") ? "delta" : argv.includes("--show-namespace") ? "1" : "0";
 // Score the runs. Turns and cost are cheap proxies, but the question MCP-Bench
 // actually asks is whether the task was completed with the right tools — a
 // variant can be cheaper because it gave up sooner.
@@ -103,7 +105,7 @@ for (const variant of variants) {
 // Repeats need distinct ids, and quick runs are throwaway — never let them
 // collide with or overwrite a sweep's recorded results.
 const runId = ({ variant, arm, task, rep }) =>
-	`quick__${task}__${arm}__${variant}${showNamespace ? "-ns" : ""}__r${rep}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+	`quick__${task}__${arm}__${variant}${nsMode === "1" ? "-ns" : nsMode === "delta" ? "-nsd" : ""}__r${rep}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 
 console.log(`quick: ${variants.join(",")} x ${arms.join(",")} x ${tasks.length} tasks x ${repeat} = ${jobs.length} runs`);
 console.log(`concurrency ${concurrency}, timeout ${timeout}s, no judge\n`);
@@ -142,7 +144,7 @@ await pool(
 				],
 				{
 					stdio: ["ignore", "pipe", "pipe"],
-					env: { ...process.env, HARNESS_SHOW_NAMESPACE: showNamespace ? "1" : "0" },
+					env: { ...process.env, HARNESS_SHOW_NAMESPACE: nsMode },
 				},
 			);
 			let out = "";

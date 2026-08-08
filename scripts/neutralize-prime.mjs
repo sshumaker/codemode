@@ -34,11 +34,19 @@ const PRIME = join(ROOT, "vendor/prime-agent/packages/coding-agent/src");
 
 const log = (...a) => console.log(...a);
 
-/** Replace `find` with `replace`, asserting the match is unique. */
-function sub(relPath, find, replace, label) {
+/**
+ * Replace `find` with `replace`, asserting the match is unique.
+ *
+ * `marker` overrides the already-applied check. The vendored tree is committed
+ * with patches in place, so a checkout restores a patched file; comparing
+ * against the full replacement text then fails whenever the patch body is
+ * edited, and the block gets inserted twice. A short stable marker survives
+ * edits to the surrounding text.
+ */
+function sub(relPath, find, replace, label, marker) {
 	const path = join(PRIME, relPath);
 	const src = readFileSync(path, "utf8");
-	if (src.includes(replace)) return log(`  present ${relPath} :: ${label}`);
+	if (src.includes(marker ?? replace)) return log(`  present ${relPath} :: ${label}`);
 	const count = src.split(find).length - 1;
 	if (count !== 1) throw new Error(`${relPath}: expected 1 match for ${label}, found ${count}`);
 	writeFileSync(path, src.replace(find, replace));
@@ -171,6 +179,7 @@ sub(
 	"export function createIpythonToolDefinition(",
 	`${patch("namespace-provenance.ts")}\n\nexport function createIpythonToolDefinition(`,
 	"track assignment provenance",
+	"const assignedAt = new Map<string, Provenance>()",
 );
 
 sub(
@@ -181,6 +190,7 @@ sub(
 		.map((l) => (l ? `\t\t\t\t${l}` : l))
 		.join("\n")}\n\n\t\t\t\tconst imageBlocks = imageBlocksFromAttachments(r.attachments);`,
 	"append live namespace to each cell result",
+	"HARNESS_SHOW_NAMESPACE",
 );
 
 log("\ndone.");
