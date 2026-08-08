@@ -20,6 +20,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pool } from "./pool.mjs";
 import { loadTasks } from "./tasks.mjs";
 
 // Look tasks up without the grounded/runnable filters: runs made before a task
@@ -50,6 +51,8 @@ const force = argv.includes("--force");
 // Averaging N samples cuts that by sqrt(N). MCP-Bench does the same
 // (`enable_judge_stability`).
 const repeats = Number(flag("repeat", 3));
+// Judging is API-latency bound, so it parallelizes as well as the runs do.
+const concurrency = Number(flag("concurrency", 8));
 
 if (!envFile) {
 	console.error("usage: bench/judge.mjs <env-file> [--model ...] [--run <runId>] [--all]");
@@ -238,26 +241,27 @@ const dirs = only
 			.filter((d) => existsSync(join(d, "result.json")));
 
 const rows = [];
-for (const dir of dirs) {
-	try {
-		const run = judgeRun(dir);
-		rows.push({
-			task: run.task.id.slice(0, 28),
-			arm: `${run.arm}/${run.residency}`,
-			fulfil: run.judge.scores.task_fulfillment,
-			ground: run.judge.scores.grounding,
-			toolFit: run.judge.scores.tool_appropriateness,
-			params: run.judge.scores.parameter_accuracy,
-			deps: run.judge.scores.dependency_awareness,
-			effic: run.judge.scores.parallelism_and_efficiency,
-			overall: run.judge.overall,
-			cached: run.skipped ? "cached" : "",
-		});
-		process.stderr.write(".");
-	} catch (err) {
-		process.stderr.write("x");
-		rows.push({ task: dir.split("/").pop().slice(0, 28), arm: "?", overall: `ERR: ${err.message.slice(0, 60)}` });
-	}
-}
+await pool(
+	dirs,
+	(dir) => {
+		try {
+			const run = judgeRun(dir);
+			rows.push({
+				task: run.task.id.slice(0, 26),
+				arm: `${run.arm}/${run.residency}`,
+				fulfil: run.judge.scores.task_fulfillment,
+				ground: run.judge.scores.grounding,
+				overall: run.judge.overall,
+				sd: run.judge.sd ?? "—",
+				cached: run.skipped ? "cached" : "",
+			});
+			process.stderr.write(".");
+		} catch (err) {
+			process.stderr.write("x");
+			rows.push({ task: dir.split("/").pop().slice(0, 26), arm: "?", overall: `ERR: ${err.message.slice(0, 50)}` });
+		}
+	},
+	concurrency,
+);
 process.stderr.write("\n");
 console.table(rows);

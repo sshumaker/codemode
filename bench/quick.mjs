@@ -1,0 +1,162 @@
+#!/usr/bin/env node
+/**
+ * Fast iteration loop.
+ *
+ *   bench/quick.mjs <env-file> [--variants v1,v5] [--arms codemode] [--repeat 2]
+ *
+ * The full sweep takes ~2 hours because a handful of tasks run 10-12 minutes
+ * each; the median task finishes in 137s. This runs only the fast tasks, at high
+ * concurrency, with no judge — turns and cost are enough signal to reject a bad
+ * prompt, and rejecting fast is the point.
+ *
+ *   full sweep   18 tasks x 3 arms, 1200s timeout, judge   ~2 hours
+ *   quick        6 fast tasks, 300s timeout, no judge      ~3 minutes
+ *
+ * Use quick to kill bad ideas, then confirm survivors with the full sweep.
+ *
+ * `--repeat N` runs each cell N times. Measured run-to-run noise on an identical
+ * configuration is ~27% in turns and cost, so a single run per cell cannot rank
+ * two variants; repeats are usually a better use of budget than more tasks.
+ */
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { pool } from "./pool.mjs";
+import { loadTasks } from "./tasks.mjs";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const RUNS = join(ROOT, ".run/runs");
+
+/**
+ * Tasks whose median wall-clock is under ~150s, measured over prior runs.
+ * They span single- and multi-server tiers so the subset is not trivially easy;
+ * re-derive with the timing analysis in docs/FINDINGS.md if the set drifts.
+ */
+export const FAST_TASKS = [
+	"huge_icons_000",
+	"call_for_papers_000",
+	"reddit_001",
+	"openapi_explorer_000",
+	"fruityvice_001",
+	"game_trends_reddit_000",
+];
+
+const argv = process.argv.slice(2);
+const flag = (name, fallback) => {
+	const i = argv.indexOf(`--${name}`);
+	return i >= 0 ? argv[i + 1] : fallback;
+};
+const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
+if (!envFile) {
+	console.error("usage: bench/quick.mjs <env-file> [--variants v1,v5] [--arms codemode] [--repeat 2]");
+	process.exit(2);
+}
+
+const model = flag("model", "anthropic/claude-sonnet-5");
+const variants = flag("variants", "v1").split(",").map((v) => v.trim());
+const arms = flag("arms", "codemode").split(",").map((a) => a.trim());
+const repeat = Number(flag("repeat", 1));
+const concurrency = Number(flag("concurrency", 16));
+const timeout = flag("timeout", "300");
+const available = new Set(loadTasks().map((t) => t.id));
+const tasks = FAST_TASKS.filter((t) => available.has(t));
+
+if (tasks.length === 0) {
+	console.error("no fast tasks are currently runnable — check bench/validate.mjs and the task filters");
+	process.exit(1);
+}
+
+const jobs = [];
+for (const variant of variants) {
+	for (const arm of arms) {
+		for (const task of tasks) {
+			for (let rep = 0; rep < repeat; rep++) jobs.push({ variant, arm, task, rep });
+		}
+	}
+}
+
+// Repeats need distinct ids, and quick runs are throwaway — never let them
+// collide with or overwrite a sweep's recorded results.
+const runId = ({ variant, arm, task, rep }) =>
+	`quick__${task}__${arm}__${variant}__r${rep}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+
+console.log(`quick: ${variants.join(",")} x ${arms.join(",")} x ${tasks.length} tasks x ${repeat} = ${jobs.length} runs`);
+console.log(`concurrency ${concurrency}, timeout ${timeout}s, no judge\n`);
+
+const started = Date.now();
+let done = 0;
+
+await pool(
+	jobs,
+	(job) =>
+		new Promise((resolve) => {
+			const id = runId(job);
+			rmSync(join(RUNS, id), { recursive: true, force: true });
+			const child = spawn(
+				"node",
+				[
+					join(ROOT, "bench/run-task.mjs"),
+					envFile,
+					model,
+					job.task,
+					job.arm,
+					"--prompt",
+					job.variant,
+					"--run-id",
+					id,
+					"--timeout",
+					timeout,
+					"--max-cost",
+					"1.0",
+				],
+				{ stdio: ["ignore", "pipe", "pipe"] },
+			);
+			let out = "";
+			child.stdout.on("data", (d) => (out += d));
+			child.stderr.on("data", (d) => (out += d));
+			child.on("close", () => {
+				done++;
+				process.stderr.write(`[${done}/${jobs.length}] `);
+				resolve();
+			});
+		}),
+	concurrency,
+);
+
+process.stderr.write("\n");
+
+// --- report -------------------------------------------------------------------
+const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+const rows = [];
+for (const variant of variants) {
+	for (const arm of arms) {
+		const results = jobs
+			.filter((j) => j.variant === variant && j.arm === arm)
+			.map((j) => join(RUNS, runId(j), "result.json"))
+			.filter(existsSync)
+			.map((p) => JSON.parse(readFileSync(p, "utf8")));
+		if (!results.length) continue;
+		const ok = results.filter((r) => r.summary.stopReason === "completed");
+		rows.push({
+			variant,
+			arm,
+			runs: results.length,
+			completed: ok.length,
+			avgTurns: +mean(results.map((r) => r.summary.turns)).toFixed(1),
+			avgCost: +mean(results.map((r) => r.summary.cost)).toFixed(3),
+			avgSec: Math.round(mean(results.map((r) => r.summary.wallMs / 1000))),
+			noMcp: results.filter((r) => (r.judge?.mcpCalls ?? 1) === 0).length,
+		});
+	}
+}
+
+const base = rows[0];
+for (const r of rows) {
+	r["turns vs first"] = base ? `${((r.avgTurns / base.avgTurns - 1) * 100).toFixed(0)}%` : "";
+	r["cost vs first"] = base ? `${((r.avgCost / base.avgCost - 1) * 100).toFixed(0)}%` : "";
+}
+
+console.log(`\nwall clock: ${((Date.now() - started) / 1000 / 60).toFixed(1)} min\n`);
+console.table(rows);
+console.log("Negative is better. Run-to-run noise is ~27%: treat anything smaller as nothing.\n");
