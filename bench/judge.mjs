@@ -16,7 +16,28 @@
  *
  * Scores are written back into each run's result.json under `judge`.
  */
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
+
+/**
+ * Run a command asynchronously, writing `input` to its stdin.
+ *
+ * Not `execFileSync` — the sync form blocks the event loop, so every pool worker
+ * waited on one thread and `--concurrency` did nothing. Not `promisify(execFile)`
+ * either: it has no `input` option, so curl sat waiting on stdin until the run
+ * timed out. spawn is the form that actually works.
+ */
+function run(cmd, args, input) {
+	return new Promise((resolve, reject) => {
+		const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+		let out = "";
+		let err = "";
+		child.stdout.on("data", (d) => (out += d));
+		child.stderr.on("data", (d) => (err += d));
+		child.on("error", reject);
+		child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(err.slice(-200) || `exit ${code}`))));
+		child.stdin.end(input);
+	});
+}
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -155,7 +176,7 @@ function buildPrompt(run, task, calls) {
 }
 
 /** Call Anthropic directly; the key is sourced in a subshell, never read here. */
-function callJudge(prompt) {
+async function callJudge(prompt) {
 	const payload = JSON.stringify({
 		model: judgeModel,
 		max_tokens: 2000,
@@ -168,12 +189,7 @@ curl -sS https://api.anthropic.com/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   --data-binary @-`;
-	const raw = execFileSync("bash", ["-c", script, "_", envFile], {
-		input: payload,
-		encoding: "utf8",
-		maxBuffer: 20e6,
-	});
-	const body = JSON.parse(raw);
+	const body = JSON.parse(await run("bash", ["-c", script, "_", envFile], payload));
 	if (body.error) throw new Error(`judge API: ${body.error.message}`);
 	const text = (body.content ?? []).map((c) => c.text ?? "").join("");
 	const match = text.match(/\{[\s\S]*\}/);
@@ -190,7 +206,7 @@ const SCORE_KEYS = [
 	"parallelism_and_efficiency",
 ];
 
-function judgeRun(dir) {
+async function judgeRun(dir) {
 	const resultPath = join(dir, "result.json");
 	const run = JSON.parse(readFileSync(resultPath, "utf8"));
 	if (run.judge && !force) return { ...run, skipped: true };
@@ -202,7 +218,7 @@ function judgeRun(dir) {
 	const samples = [];
 	const perDim = {};
 	for (let i = 0; i < repeats; i++) {
-		const s = callJudge(prompt);
+		const s = await callJudge(prompt);
 		const values = SCORE_KEYS.map((k) => Number(s[k]) || 0);
 		samples.push(+(values.reduce((a, b) => a + b, 0) / values.length).toFixed(2));
 		for (const k of SCORE_KEYS) (perDim[k] ??= []).push(Number(s[k]) || 0);
@@ -246,9 +262,9 @@ const dirs = only
 const rows = [];
 await pool(
 	dirs,
-	(dir) => {
+	async (dir) => {
 		try {
-			const run = judgeRun(dir);
+			const run = await judgeRun(dir);
 			rows.push({
 				task: run.task.id.slice(0, 26),
 				arm: `${run.arm}/${run.residency}`,
