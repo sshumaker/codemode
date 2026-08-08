@@ -591,7 +591,69 @@ export const VARIANTS = {
 				"goes in one wave, only genuinely dependent calls wait.",
 			].join("\n"),
 	},
+
+	/**
+	 * q7 — state persistence plainly, and point at the introspection that exists.
+	 *
+	 * The largest score gap is parallelism_and_efficiency (0.422), and reading the
+	 * judge's reasoning it is almost entirely redundancy, not serialization: 29%
+	 * of all MCP calls are byte-identical repeats, and the judge notices
+	 * ("get_platform_usage called 4 times for each of 6 platforms"; "the reference
+	 * task required only 2 calls" against 61 made).
+	 *
+	 * q1 forbids this in words and it changes nothing, because the model has no
+	 * way to see what it already fetched — its only record is the transcript of
+	 * code it wrote. Two fixes, both concrete rather than exhortative:
+	 *
+	 *   1. Say the kernel is persistent, in one unambiguous sentence.
+	 *   2. Name `%whos`, which lists every live variable. IPython has always had
+	 *      it; nothing had told the model it could look.
+	 *
+	 * Deliberately avoids v8's mistake of calling operations "free": that is true
+	 * of context and false of turns, and v8 came back +24% on turns.
+	 */
+	q7: {
+		note: "explicit persistence + %whos introspection; targets the 29% duplicate-call rate",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"## The kernel is persistent",
+				"",
+				"Every cell runs in the SAME long-lived IPython session. Any top-level",
+				"variable you bind stays available in every later cell, for the whole task.",
+				"Data you have already fetched is still in memory — you never need to",
+				"fetch it twice.",
+				"",
+				"You will not remember across turns what you already have. So look:",
+				"",
+				"  %whos                        # every live variable, with its type and size",
+				"",
+				"Run that before fetching anything you might already hold. Re-requesting",
+				"data you already have is the single most common mistake here, and it is",
+				"scored against you directly.",
+				"",
+				"## Fetching",
+				"",
+				"Plan the full set of calls before the first one. Everything that does not",
+				"depend on another result goes in ONE `asyncio.gather`; only genuinely",
+				"dependent calls wait for a later wave.",
+				"",
+				"  import asyncio, json",
+				"  a, b, c = await asyncio.gather(",
+				"      api.svc_one.search(q='x'),",
+				"      api.svc_two.list(),",
+				"      api.svc_three.details(id=7),",
+				"  )",
+				"  ids = [r['id'] for r in json.loads(a)['items'][:20]]",
+				"  details = await asyncio.gather(*[api.svc_one.get(id=i) for i in ids])",
+				"",
+				"Fan out over a list with `gather`, never in a loop of separate cells.",
+				"Bind every result to a name so a later cell can reuse it.",
+			].join("\n"),
+	},
 };
+
 
 
 
