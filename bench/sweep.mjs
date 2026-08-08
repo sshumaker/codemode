@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pool } from "./pool.mjs";
 import { sampleTasks, loadTasks } from "./tasks.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -39,6 +40,8 @@ const arms = flag("arms", "vanilla,codemode").split(",");
 const residency = flag("residency", "L0");
 const timeout = flag("timeout", "420");
 const tier = flag("tier", null);
+// Runs are latency-bound, so wall-clock scales close to linearly with this.
+const concurrency = Number(flag("concurrency", 1));
 
 const tasks = tier
 	? loadTasks({ tier }).sort((a, b) => a.id.localeCompare(b.id)).slice(0, perTier)
@@ -82,10 +85,18 @@ function runOne(task, arm) {
 	});
 }
 
-for (const task of tasks) {
-	console.log(`\n${task.id}  [${task.tier}]  ${task.servers.join(" + ")}  (${task.exposedServers.length} exposed)`);
-	for (const arm of arms) await runOne(task, arm);
-}
+const jobs = tasks.flatMap((task) => arms.map((arm) => ({ task, arm })));
+console.log(`concurrency: ${concurrency}\n`);
+let done = 0;
+await pool(
+	jobs,
+	({ task, arm }) => runOne(task, arm),
+	concurrency,
+	() => {
+		done++;
+		if (concurrency > 1) process.stderr.write(`  [${done}/${jobs.length}]\n`);
+	},
+);
 
 // --- report -------------------------------------------------------------------
 

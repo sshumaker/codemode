@@ -15,6 +15,17 @@ const BENCH = join(ROOT, "vendor/mcp-bench");
 const SERVERS = join(BENCH, "mcp_servers");
 const VENV_PY = join(BENCH, ".venv/bin/python");
 
+/**
+ * Tools that must not be called concurrently, from MCP-Bench's own
+ * benchmark_config.yaml (`sequential_only_tools`).
+ */
+export const SEQUENTIAL_ONLY = new Set([
+	"Google Maps:search_nearby",
+	"Google Maps:get_place_details",
+	"Google Maps:maps_geocode",
+	"Google Maps:maps_reverse_geocode",
+]);
+
 export const START_TIMEOUT_MS = 60_000;
 export const CALL_TIMEOUT_MS = 120_000;
 
@@ -131,6 +142,16 @@ export class McpServer {
 
 	async callTool(name, args) {
 		await this.start();
+		// A few servers cannot take concurrent calls (MCP-Bench lists them under
+		// `sequential_only_tools`). Chain those onto a per-server queue so parallel
+		// runs do not produce server-side errors that look like agent mistakes.
+		if (SEQUENTIAL_ONLY.has(`${this.name}:${name}`)) {
+			const prior = this.queue ?? Promise.resolve();
+			this.queue = prior
+				.catch(() => {})
+				.then(() => this._request("tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS));
+			return this.queue;
+		}
 		return this._request("tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
 	}
 

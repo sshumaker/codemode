@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pool } from "./pool.mjs";
 import { VARIANT_NAMES } from "./prompts.mjs";
 import { sampleTasks } from "./tasks.mjs";
 
@@ -39,6 +40,7 @@ const variants = flag("variants", VARIANT_NAMES.join(",")).split(",").map((v) =>
 const perTier = Number(flag("tasks", 2));
 const timeout = flag("timeout", "900");
 const maxCost = flag("max-cost", "2.0");
+const concurrency = Number(flag("concurrency", 4));
 
 const tasks = sampleTasks(perTier);
 const runId = (taskId, variant) =>
@@ -82,10 +84,14 @@ function runOne(task, variant) {
 	});
 }
 
-for (const variant of variants) {
-	console.log(`\n--- ${variant} ---`);
-	for (const task of tasks) await runOne(task, variant);
-}
+// Every (variant, task) pair is independent, so the whole grid runs at once.
+const jobs = variants.flatMap((variant) => tasks.map((task) => ({ variant, task })));
+console.log(`concurrency: ${concurrency}\n`);
+let done = 0;
+await pool(jobs, ({ task, variant }) => runOne(task, variant), concurrency, () => {
+	done++;
+	process.stderr.write(`  [${done}/${jobs.length}]\n`);
+});
 
 // --- report -------------------------------------------------------------------
 const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);

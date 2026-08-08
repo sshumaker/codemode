@@ -16,7 +16,7 @@
  * re-spending tokens — the parse is derived, the stream is the record.
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, writeFileSync, createWriteStream, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, createWriteStream, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generate } from "./generate.mjs";
@@ -62,6 +62,15 @@ const promptName = flag("prompt", "v1");
 const promptSuffix = arm === "codemode" && promptName !== "v1" ? `__${promptName}` : "";
 const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
 const runDir = join(ROOT, ".run/runs", runId);
+
+// Never silently overwrite a completed run. A runId scheme change once caused
+// two v1 runs to be replaced mid-experiment by re-runs that happened to reuse
+// their ids, which quietly removed them (and their judge scores) from a result
+// that had already been reported.
+if (existsSync(join(runDir, "result.json")) && !argv.includes("--force")) {
+	console.error(`run already exists: ${runId}\n  pass --force to overwrite, or delete the directory`);
+	process.exit(3);
+}
 mkdirSync(runDir, { recursive: true });
 
 /**
