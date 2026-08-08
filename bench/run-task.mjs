@@ -235,6 +235,10 @@ const child = spawn(
 			HARNESS_MCP_CATALOGUE: SCHEMAS,
 			HARNESS_MCP_SERVERS: task.exposedServers.join(","),
 			HARNESS_RUN_ID: runId,
+			// Selects the vanilla extension's registration strategy: L4 registers
+			// all 250 tools up front, L1 registers only search_tools/load_tool and
+			// adds real tools on demand.
+			HARNESS_RESIDENCY: residency,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 	},

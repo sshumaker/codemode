@@ -92,34 +92,32 @@ export default function (pi: ExtensionAPI) {
 
 	if (RESIDENCY !== "L1") throw new Error(`unsupported vanilla residency: ${RESIDENCY}`);
 
-	// L1 mirrors how deferred tools actually work in a modern harness (Claude
-	// Code's ToolSearch): names are cheap and visible, schemas are fetched on
-	// demand, and once fetched the tool becomes *directly callable*. An earlier
-	// attempt returned only the schema and left the model to route every call
-	// through a generic call_tool; it repeatedly tried to invoke the listed names
-	// directly and burned 16 turns on errors. Making load_tool activate the tool
-	// removes that friction without giving L1 the resident cost of L4.
+	// Deferral by *registration*, not activation.
+	//
+	// The obvious route — allowlist all 250 via --tools, activate a few via
+	// initialActiveToolNames — does not work: _buildRuntime unconditionally
+	// activates every allowed tool (patched), and the CLI flag is then dropped
+	// again when print mode re-spawns a session worker with a rebuilt argv.
+	//
+	// Only *registered* tools are sent to the provider, so registering a tool
+	// lazily achieves the same deferral with none of that plumbing. load_tool
+	// registers on demand; everything else stays unknown to the model.
 	const summary = [...index].map(([name, { tool }]) => `${name} — ${firstLine(tool.description)}`);
+	const loaded = new Set<string>();
 
-	// Every MCP tool is registered so it *can* be activated, but only the base
-	// set is active initially — registration is not residency; activation is.
-	for (const [name, { server, tool }] of index) {
+	function registerReal(name: string) {
+		if (loaded.has(name)) return;
+		const entry = index.get(name);
+		if (!entry) throw new Error(`Unknown tool "${name}". Use search_tools to find valid names.`);
+		loaded.add(name);
 		pi.registerTool({
 			name,
-			label: `${server}: ${tool.name}`,
-			description: tool.description ?? "",
-			parameters: (tool.inputSchema ?? { type: "object", properties: {} }) as never,
-			execute: (_id: string, params: unknown) => invoke(server, tool.name, params),
+			label: `${entry.server}: ${entry.tool.name}`,
+			description: entry.tool.description ?? "",
+			parameters: (entry.tool.inputSchema ?? { type: "object", properties: {} }) as never,
+			execute: (_id: string, params: unknown) => invoke(entry.server, entry.tool.name, params),
 		});
 	}
-
-	const BASE = ["read", "bash", "edit", "write", "grep", "find", "ls", "search_tools", "load_tool"];
-	const active = new Set(BASE);
-
-	pi.on("session_start", async () => {
-		// Narrow to the base set: the 250 registered tools stay dormant until loaded.
-		pi.setActiveTools([...active]);
-	});
 
 	pi.registerTool({
 		name: "search_tools",
@@ -134,8 +132,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id: string, params: { query?: string }) {
 			const q = (params?.query ?? "").toLowerCase().trim();
 			const hits = q ? summary.filter((l) => q.split(/\s+/).some((w) => l.toLowerCase().includes(w))) : summary;
-			const text = hits.length > 0 ? hits.join("\n") : `No tools match "${params?.query}".`;
-			return { content: [{ type: "text", text }], details: {} };
+			return { content: [{ type: "text", text: hits.join("\n") || `No tools match "${params?.query}".` }], details: {} };
 		},
 	});
 
@@ -144,22 +141,15 @@ export default function (pi: ExtensionAPI) {
 		label: "Load tool",
 		description:
 			"Load one or more tools by exact name. Returns their parameter schemas AND makes them directly " +
-			"callable for the rest of this session. Load a tool before calling it.",
+			"callable for the rest of this session. You must load a tool before you can call it.",
 		parameters: {
 			type: "object",
-			properties: {
-				names: { type: "array", items: { type: "string" }, description: "Exact tool names to load." },
-			},
+			properties: { names: { type: "array", items: { type: "string" }, description: "Exact tool names." } },
 			required: ["names"],
 		} as never,
 		async execute(_id: string, params: { names: string[] }) {
 			const wanted = params?.names ?? [];
-			const unknown = wanted.filter((n) => !index.has(n));
-			if (unknown.length > 0) {
-				throw new Error(`Unknown tool(s): ${unknown.join(", ")}. Use search_tools to find valid names.`);
-			}
-			for (const n of wanted) active.add(n);
-			pi.setActiveTools([...active]);
+			for (const n of wanted) registerReal(n);
 			const schemas = wanted.map((n) => {
 				const e = index.get(n)!;
 				return {
@@ -170,10 +160,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return {
 				content: [
-					{
-						type: "text",
-						text: `Loaded ${wanted.length} tool(s); they are now directly callable.\n\n${JSON.stringify(schemas, null, 2)}`,
-					},
+					{ type: "text", text: `Loaded ${wanted.length} tool(s); now directly callable.\n\n${JSON.stringify(schemas, null, 2)}` },
 				],
 				details: {},
 			};

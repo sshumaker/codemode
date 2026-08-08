@@ -584,6 +584,9 @@ function buildSessionOptions(
 	if (config.tools) {
 		options.tools = [...config.tools];
 	}
+	if (config.initialActiveToolNames) {
+		options.initialActiveToolNames = [...config.initialActiveToolNames];
+	}
 	if (config.autonomous) {
 		options.autonomous = mergeAutonomousConfig(undefined, config.autonomous);
 	}

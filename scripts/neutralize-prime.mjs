@@ -101,11 +101,51 @@ sub(
 	"pass activeTools into session options",
 );
 
+// The missing link: prepareRuntimeServices maps config -> session options, and
+// mapped `tools` but not the active subset, so the flag died here.
+sub(
+	"main.ts",
+	`\tif (config.tools) {\n\t\toptions.tools = [...config.tools];\n\t}`,
+	`\tif (config.tools) {\n\t\toptions.tools = [...config.tools];\n\t}\n` +
+		`\tif (config.initialActiveToolNames) {\n\t\toptions.initialActiveToolNames = [...config.initialActiveToolNames];\n\t}`,
+	"map initialActiveToolNames through prepareRuntimeServices",
+);
+
 sub(
 	"main.ts",
 	`\t\tinitialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,`,
 	`\t\tinitialActiveToolNames:\n\t\t\truntimeSessionOptions?.initialActiveToolNames ?? sessionOptions.initialActiveToolNames,`,
 	"fall back to CLI activeTools",
+);
+
+// `initialActiveToolNames` is dead whenever an allowlist is present: _buildRuntime
+// unconditionally activates every allowed tool, overriding the explicit active
+// set. That makes "allow a tool but leave it dormant" unexpressible, which is
+// exactly what the vanilla L1 (deferred) condition needs. Restrict the blanket
+// activation to the case where no explicit active set was supplied — existing
+// behaviour is unchanged when the caller does not pass one.
+sub(
+	"core/agent-session.ts",
+	`\t\tif (allowedToolNames) {\n\t\t\tfor (const toolName of this._toolRegistry.keys()) {\n\t\t\t\tif (allowedToolNames.has(toolName)) {\n\t\t\t\t\tnextActiveToolNames.push(toolName);\n\t\t\t\t}\n\t\t\t}\n\t\t} else if (options?.includeAllExtensionTools) {`,
+	`\t\tif (allowedToolNames && !options?.activeToolNames) {\n\t\t\tfor (const toolName of this._toolRegistry.keys()) {\n\t\t\t\tif (allowedToolNames.has(toolName)) {\n\t\t\t\t\tnextActiveToolNames.push(toolName);\n\t\t\t\t}\n\t\t\t}\n\t\t} else if (options?.includeAllExtensionTools && !options?.activeToolNames) {`,
+	"honour an explicit active set over the allowlist",
+);
+
+// mergeAgentSessionRuntimeConfig and its clone helper copy known fields one by
+// one, so a new config field is silently dropped between the CLI and the
+// session. This is the last link in the --active-tools chain.
+sub(
+	"core/agent-session-config.ts",
+	`\t\ttools: cloneArray(override.tools ?? base.tools),`,
+	`\t\ttools: cloneArray(override.tools ?? base.tools),\n\t\tinitialActiveToolNames: cloneArray(override.initialActiveToolNames ?? base.initialActiveToolNames),`,
+	"merge initialActiveToolNames",
+);
+
+sub(
+	"core/agent-session-config.ts",
+	`\t\ttools: cloneArray(config.tools),`,
+	`\t\ttools: cloneArray(config.tools),\n\t\tinitialActiveToolNames: cloneArray(config.initialActiveToolNames),`,
+	"clone initialActiveToolNames",
 );
 
 log("\ndone.");
