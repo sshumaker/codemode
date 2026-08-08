@@ -70,3 +70,15 @@ export type ToolRenderResultLike<TDetails> = {
 export function invalidArgText(theme: { fg: (name: any, text: string) => string }): string {
 	return theme.fg("error", "[invalid arg]");
 }
+
+export function renderToolPath(
+	rawPath: string | null,
+	theme: { fg: (name: any, text: string) => string },
+	_cwd: string,
+	options?: { emptyFallback?: string },
+): string {
+	if (rawPath === null) return invalidArgText(theme);
+	const value = rawPath || options?.emptyFallback;
+	if (!value) return theme.fg("toolOutput", "...");
+	return theme.fg("accent", shortenPath(value));
+}

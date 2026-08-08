@@ -60,8 +60,8 @@ export interface Args {
 }
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const REMOVED_BUILTIN_TOOL_NAMES = new Set(["read", "write", "grep", "find", "ls"]);
-const BUILTIN_TOOL_NAMES = ["ipython"];
+const REMOVED_BUILTIN_TOOL_NAMES = new Set<string>([]);
+const BUILTIN_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls", "ipython"];
 
 export const INTERNAL_RUNTIME_COMMAND_MARKER = "\0prime-agent-runtime-command";
 
