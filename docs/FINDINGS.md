@@ -387,3 +387,53 @@ Codemode's final answers mention implementation details (`api.`, `cell`,
 `python`) in 34% of runs against vanilla's 19%. The judge prompt never names the
 arm and normalizes trajectories through the proxy log, but style leakage remains
 a possible bias. Not yet corrected; recorded as a limitation.
+
+### 11. The arms were getting different base system prompts (10x)
+
+Reconstructing prime's base prompt per arm from its own builder:
+
+| arm | base system prompt |
+|---|---|
+| codemode | **6,284 chars (~1,571 tokens)** |
+| vanilla | **615 chars (~154 tokens)** |
+| notools | 615 chars |
+
+Whole sections of prime's prompt are gated on `hasIpython`, so the code arm was
+receiving 10x more workflow guidance — guidance prime's own source calls
+"trained" — plus RLM subagent instructions this experiment does not use and had
+supposedly disabled.
+
+The comparison was therefore **tuned-code-prompt vs bare-tool-prompt**, not code
+vs tools. This is the matched-pair rule from `docs/DESIGN.md`, applied to tool
+descriptions from the start and never applied to the system prompt itself.
+
+**Fix:** both arms now run with one neutral `BASE_SYSTEM_PROMPT` via
+`--system-prompt`, which mentions no arm's mechanics. Only the appended preamble
+differs. Codemode's first-turn prompt fell from 3,461 to 1,330 tokens; the RLM
+instructions are gone.
+
+`bench/test/fairness.test.mjs` pins this and the other invariants: no shell in
+vanilla, egress blocked, catalogue parity, description parity, no arm branching
+in the shared prompt.
+
+### 12. The vanilla arm no longer has `bash`
+
+A shell is an escape hatch out of the tool surface under test. Proxy-based egress
+blocking helps but raw sockets evade it; removing the shell is what actually
+holds. Vanilla keeps local file tools (`read`, `edit`, `write`, `grep`, `find`,
+`ls`), which MCP-Bench tasks do not need but which avoid crippling the arm in an
+unrelated way. Codemode keeps `%%bash` inside the REPL, because a shell nested
+in the code action is part of what "code as the action space" means — a separate
+bash *tool* is not.
+
+## Status of results
+
+**Every number in this document above section 8 was measured under at least one
+of these confounds** and should be treated as void:
+
+- vanilla curling past its own tools (77.6% of its shell calls)
+- codemode receiving 10x the system prompt
+- single-sample judging with noise comparable to the effect
+
+The harness is now clean and 140 tests pin the invariants. Results are being
+re-collected from scratch.
