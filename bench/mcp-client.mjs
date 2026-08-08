@@ -26,6 +26,19 @@ export const SEQUENTIAL_ONLY = new Set([
 	"Google Maps:maps_reverse_geocode",
 ]);
 
+/**
+ * Servers with free-tier rate limits that trip under parallel runs.
+ *
+ * Observed at concurrency 12: DEX Paprika returned "Rate limit exceeded" as a
+ * *successful* MCP response, so the agent saw an error that had nothing to do
+ * with its own behaviour — and whichever arm happened to run when the limit
+ * tripped absorbed the penalty. Calls to these servers are spaced out and
+ * retried rather than handed to the model.
+ */
+export const RATE_LIMITED = new Map([["DEX Paprika", 1100]]);
+const RATE_LIMIT_PATTERN = /rate.?limit|too many requests|429/i;
+const MAX_RATE_LIMIT_RETRIES = 4;
+
 export const START_TIMEOUT_MS = 60_000;
 export const CALL_TIMEOUT_MS = 120_000;
 
@@ -140,8 +153,34 @@ export class McpServer {
 		});
 	}
 
+	/** Space calls to a rate-limited server, serialized across concurrent runs. */
+	async _throttle() {
+		const interval = RATE_LIMITED.get(this.name);
+		if (!interval) return;
+		const prior = this.throttleChain ?? Promise.resolve();
+		let release;
+		this.throttleChain = new Promise((r) => (release = r));
+		await prior;
+		const wait = interval - (Date.now() - (this.lastCallAt ?? 0));
+		if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+		this.lastCallAt = Date.now();
+		setTimeout(release, 0);
+	}
+
 	async callTool(name, args) {
 		await this.start();
+
+		if (RATE_LIMITED.has(this.name)) {
+			// Retry a rate-limited reply rather than letting it reach the model as a
+			// tool result; the agent has no way to act on it and it corrupts scoring.
+			for (let attempt = 0; ; attempt++) {
+				await this._throttle();
+				const result = await this._request("tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
+				const text = (result?.content ?? []).map((c) => c.text ?? "").join(" ");
+				if (!RATE_LIMIT_PATTERN.test(text) || attempt >= MAX_RATE_LIMIT_RETRIES) return result;
+				await new Promise((r) => setTimeout(r, 1500 * 2 ** attempt));
+			}
+		}
 		// A few servers cannot take concurrent calls (MCP-Bench lists them under
 		// `sequential_only_tools`). Chain those onto a per-server queue so parallel
 		// runs do not produce server-side errors that look like agent mistakes.
