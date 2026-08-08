@@ -20,7 +20,7 @@ import { mkdirSync, writeFileSync, createWriteStream, readFileSync, existsSync }
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generate } from "./generate.mjs";
-import { buildPreamble as buildCodemodePreamble } from "./prompts.mjs";
+import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./prompts.mjs";
 import { findTask } from "./tasks.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -58,8 +58,10 @@ const maxTurns = Number(flag("max-turns", 0));
 const task = findTask(taskId);
 
 // Codemode preamble variant — see bench/prompts.mjs and bench/hillclimb.mjs.
-const promptName = flag("prompt", "v1");
-const promptSuffix = arm === "codemode" && promptName !== "v1" ? `__${promptName}` : "";
+const promptName = flag("prompt", "v3");
+const vanillaPromptName = flag("vanilla-prompt", "w2");
+const promptSuffix =
+	arm === "codemode" ? (promptName === "v1" ? "" : `__${promptName}`) : arm === "vanilla" ? (vanillaPromptName === "w1" ? "" : `__${vanillaPromptName}`) : "";
 const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
 const runDir = join(ROOT, ".run/runs", runId);
 
@@ -105,6 +107,16 @@ function buildPreamble() {
 			"Available tool names:",
 			...toolDefs.map((d) => d.name),
 		].join("\n");
+	}
+	// The vanilla arm gets guidance for its own tool surface. Leaving it empty
+	// measured "which representation survives no instructions", not which
+	// architecture is better.
+	if (arm === "vanilla") {
+		const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
+			task.exposedServers.includes(s.server),
+		);
+		const { toolDefs } = generate(catalogue);
+		return buildVanillaPreamble(vanillaPromptName, { toolCount: toolDefs.length });
 	}
 	if (arm !== "codemode") return "";
 
@@ -176,7 +188,7 @@ const meta = {
 		droppedDistractors: task.droppedDistractors ?? [],
 	},
 	preambleChars: preamble.length,
-	promptVariant: arm === "codemode" ? promptName : undefined,
+	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
 	startedAt: new Date().toISOString(),
 };
 

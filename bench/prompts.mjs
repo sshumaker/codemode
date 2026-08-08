@@ -158,3 +158,65 @@ export function buildPreamble(variant, ctx) {
 }
 
 export const VARIANT_NAMES = Object.keys(VARIANTS);
+
+/**
+ * Vanilla preamble variants.
+ *
+ * The codemode arm was given a preamble from the start and the vanilla arm was
+ * given an empty string, which measured "which representation survives having no
+ * instructions" rather than which architecture is better. Each arm needs to be
+ * told how to use its own tool surface well; the comparison worth making is
+ * best-against-best, not stripped-against-stripped.
+ *
+ * Vanilla's efficiency lever is the mirror of codemode's `asyncio.gather`:
+ * several independent tool calls issued in a single assistant turn. Nothing had
+ * ever told it that.
+ */
+export const VANILLA_VARIANTS = {
+	/** w1 — no guidance. What the arm had until now; kept as the baseline. */
+	w1: {
+		note: "no guidance (original)",
+		build: () => "",
+	},
+
+	/**
+	 * w2 — the counterpart to codemode's v3: name the arm's efficiency lever and
+	 * show it once, rather than listing rules. v3's measured win came from
+	 * returning less into context per turn, so the same idea is applied here —
+	 * request narrowly, and batch independent calls into one turn.
+	 */
+	w2: {
+		note: "parallel calls + selective retrieval, shown once",
+		build: ({ toolCount }) =>
+			[
+				"## Tools",
+				"",
+				`You have ${toolCount} tools, named \`Service__operation\`. Their full parameter`,
+				"schemas are already in your context — you do not need to look anything up.",
+				"",
+				"Two things make a large difference here:",
+				"",
+				"1. Issue independent calls together in ONE turn. If you need a park's",
+				"   details and its weather, call both in the same turn rather than waiting",
+				"   for the first. Only chain calls when one genuinely needs the other's",
+				"   output.",
+				"2. Every result you request enters your context in full. Prefer the",
+				"   narrowest call that answers the question — pass limits and filters when",
+				"   the tool accepts them, and do not fetch a broad listing when you already",
+				"   know the specific id you need.",
+				"",
+				"Ground every claim in something a tool returned.",
+			].join("\n"),
+	},
+};
+
+export const VANILLA_VARIANT_NAMES = Object.keys(VANILLA_VARIANTS);
+
+/** Build a vanilla preamble. Throws on an unknown name. */
+export function buildVanillaPreamble(variant, ctx) {
+	const spec = VANILLA_VARIANTS[variant];
+	if (!spec) {
+		throw new Error(`unknown vanilla variant: ${variant} (have: ${VANILLA_VARIANT_NAMES.join(", ")})`);
+	}
+	return spec.build(ctx);
+}
