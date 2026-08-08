@@ -44,35 +44,6 @@ That is the composition advantage behaving as predicted, and it also shows why
 turn count and token count move in opposite directions here: codemode spends
 turns to save context.
 
-## Live: pilot sweep, Sonnet 5, 4 fully-paired tasks
-
-Codemode at L0 (discovery only), vanilla at L4 (all definitions resident).
-Paired-only: tasks where both arms completed without timing out.
-
-| | codemode/L0 | vanilla/L4 |
-|---|---|---|
-| avg turns | 45 | **17.8** |
-| avg MCP calls | **48** | 24.3 |
-| avg tokens | **947,607** | 1,083,475 |
-| avg cost | **$0.418** | $0.520 |
-| avg wall | 295s | **151s** |
-| judge overall | **4.83** | 4.17 |
-| task fulfillment | **4.50** | 3.25 |
-| grounding | **5.50** | 4.75 |
-
-Mean cost ratio **1.26x** in codemode's favour; mean turn ratio 0.37x in
-vanilla's. Codemode scored higher on 3 of 4 tasks.
-
-**Read this as directional, not conclusive.** n=4 paired tasks is far below the
-power needed to separate a half-point on a 10-point rubric, it is one model, and
-a single outlier drives much of the gap: on `openapi_explorer_paper_search_*`
-vanilla effectively gave up after 2 turns and 4 calls (score 2.33) while
-codemode worked 50 turns and 27 calls (score 4.33). Remove that task and the
-score difference is within noise.
-
-What does look robust across all four: **codemode does roughly 2x the MCP work
-for ~0.8x the cost, and pays for it in turns and wall-clock.**
-
 ## The mechanism, caught on a real task
 
 `openapi_explorer_paper_search_hugging_face_000` is the clearest single
@@ -140,6 +111,58 @@ no tools at all; after it, no sampled task is answerable without tools.
 
 It also gives every comparison a calibrated floor: an arm scoring near 1.0 on a
 task did not merely do badly, it effectively did not use the tools.
+
+## Result: Sonnet 5, 11 paired tasks
+
+Codemode at L0 (nothing resident but a pointer to `api/`), vanilla at L4 (all
+tool definitions resident). Paired-only: both arms completed without timing out
+or hitting the budget. `notools` is the validity floor.
+
+| | codemode/L0 | vanilla/L4 | notools |
+|---|---|---|---|
+| avg turns | 32.4 | **12.8** | 1 |
+| avg MCP calls | **49.7** | 22.7 | 0 |
+| avg tokens | **649,916** | 900,280 | 2,572 |
+| avg cost | **$0.330** | $0.484 | $0.020 |
+| avg wall | 323s | **147s** | 24s |
+| **judge overall** | **5.18** | 4.65 | 1.00 |
+| task fulfillment | **4.60** | 3.60 | 1.00 |
+| grounding | **6.60** | 5.60 | 1.00 |
+
+### Paired statistics (n=11)
+
+| measure | mean delta | paired t | sign test | codemode better |
+|---|---|---|---|---|
+| judge score | **+0.50** | +2.52 | p=0.18 | 7/11 (2 tied) |
+| cost saved | **+$0.144** | +2.36 | p=0.23 | 8/11 |
+| log cost ratio | **1.40x** (geo. mean) | +2.43 | p=0.23 | 8/11 |
+| tokens saved | +243,698 | +1.08 | p=0.55 | 7/11 |
+
+**Read carefully.** The paired t-tests on score and cost clear p<0.05 (|t|>2.23
+at df=10), but the sign test — which assumes far less — does not. At n=11 that
+is exactly what an underpowered real effect looks like, and it is equally what
+noise looks like. Token savings are not significant at all (t=1.08); the
+variance is enormous because turn counts differ so much between arms.
+
+### What is solid
+
+- **Codemode is cheaper**: 1.40x geometric mean, better on 8 of 11 tasks.
+- **Codemode does more work**: 2.2x the MCP calls for 0.65x the cost.
+- **Codemode scores higher on grounding** (6.6 vs 5.6) and **task fulfillment**
+  (4.6 vs 3.6) — the two dimensions that measure whether the task was actually
+  done, rather than how tidily.
+- **Codemode pays in turns and latency**: 2.5x the turns, 2.2x the wall-clock.
+- **The tasks discriminate**: every `notools` control scored exactly 1.0.
+
+### What is not established
+
+- Statistical significance by a conservative test. n=11 is too small.
+- Anything about other models. This is Sonnet 5 only, so the central prediction
+  — that the gap *widens* as the model gets weaker — is entirely untested.
+- Whether codemode still wins against a **deferred** vanilla baseline (L1). The
+  static analysis says vanilla L1 is 26x cheaper than vanilla L4 on resident
+  tokens, so most of codemode's cost advantage here may simply evaporate.
+  This is the single most important next run.
 
 ## Methodological problems found before spending real budget
 

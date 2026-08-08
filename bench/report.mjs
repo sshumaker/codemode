@@ -23,6 +23,9 @@ const flag = (name, fallback) => {
 };
 const modelFilter = flag("model", null);
 const pairedOnly = argv.includes("--paired");
+// Restrict to specific arms — the notools control has no place in a
+// head-to-head, but excluding it from pairing would lose its floor data.
+const armFilter = (flag("arms", "") || "").split(",").map((a) => a.trim()).filter(Boolean);
 
 const calls = existsSync(MCP_LOG)
 	? readFileSync(MCP_LOG, "utf8")
@@ -40,7 +43,8 @@ const runs = readdirSync(RUNS)
 	.map((n) => join(RUNS, n))
 	.filter((d) => existsSync(join(d, "result.json")))
 	.map((d) => JSON.parse(readFileSync(join(d, "result.json"), "utf8")))
-	.filter((r) => !modelFilter || r.model === modelFilter);
+	.filter((r) => !modelFilter || r.model === modelFilter)
+	.filter((r) => armFilter.length === 0 || armFilter.includes(r.arm));
 
 for (const r of runs) {
 	const mine = calls.filter((c) => c.meta?.runId === r.runId);
