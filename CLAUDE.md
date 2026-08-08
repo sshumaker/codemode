@@ -75,3 +75,10 @@ over; for any server with side effects it is simply wrong.
 
 Deduplication is the agent's judgement call, per tool, which is what the `q6`
 ledger prompt asks for. Do not move it into the transport.
+
+## Patch snippets live in scripts/patches/*.ts
+
+Injecting TypeScript into the vendored tree as an escaped string inside a
+heredoc-inside-python mangles every backslash — `\n` became a literal newline
+and `\w` became `w`, producing a file that would not compile. Write the snippet
+as a real `.ts` file and have `neutralize-prime.mjs` read it.
