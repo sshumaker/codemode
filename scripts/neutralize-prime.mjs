@@ -148,4 +148,39 @@ sub(
 	"clone initialActiveToolNames",
 );
 
+// --- optional: show the kernel namespace after every cell -------------------
+// Gated on HARNESS_SHOW_NAMESPACE=1 so it can be A/B'd against the prompt-only
+// fix (variant q7) rather than silently becoming part of the arm.
+//
+// The snippets live in scripts/patches/*.ts as real TypeScript. Embedding them
+// as escaped strings here mangled every backslash — `\n` became a literal
+// newline and `\w` became `w` — and produced a file that did not compile.
+log("\nnamespace injection:");
+
+const patch = (name) => readFileSync(join(ROOT, "scripts/patches", name), "utf8").trimEnd();
+
+sub(
+	"core/tools/ipython.ts",
+	'import { existsSync } from "node:fs";',
+	'import { existsSync, mkdirSync, writeFileSync } from "node:fs";\nimport { join as pathJoin } from "node:path";',
+	"fs/path imports for provenance",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"export function createIpythonToolDefinition(",
+	`${patch("namespace-provenance.ts")}\n\nexport function createIpythonToolDefinition(`,
+	"track assignment provenance",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\tconst imageBlocks = imageBlocksFromAttachments(r.attachments);",
+	`${patch("namespace-inject.ts")
+		.split("\n")
+		.map((l) => (l ? `\t\t\t\t${l}` : l))
+		.join("\n")}\n\n\t\t\t\tconst imageBlocks = imageBlocksFromAttachments(r.attachments);`,
+	"append live namespace to each cell result",
+);
+
 log("\ndone.");
