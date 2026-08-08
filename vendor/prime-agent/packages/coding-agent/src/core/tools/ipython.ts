@@ -632,6 +632,10 @@ export function imageBlocksFromAttachments(attachments: readonly KernelAttachmen
  * The right-hand side is more useful than a type name: `await api.reddit.hot(...)`
  * says both what the value is and that it came from a call already made, which is
  * the thing that stops it being fetched twice.
+ *
+ * Imports and loop/with targets are tracked so they can be excluded: `json`, `f`
+ * and `target` are noise, and the listing exists to remind the model what *data*
+ * it is already holding.
  */
 interface Provenance {
 	rhs: string;
@@ -640,6 +644,8 @@ interface Provenance {
 }
 
 const assignedAt = new Map<string, Provenance>();
+/** Names bound by import, `for` or `with` — excluded from the listing. */
+const nonData = new Set<string>();
 /** What has already been shown to the model, for delta mode. */
 const shownNames = new Map<string, string>();
 let cellTurn = 0;
@@ -658,14 +664,57 @@ function recordAssignments(code: string, cwd: string): void {
 
 	const lines = code.split("\n");
 	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+
+		// `import x`, `import x as y`, `from m import a, b as c`
+		const imp = /^\s*(?:from\s+[\w.]+\s+)?import\s+(.+)$/.exec(line);
+		if (imp) {
+			for (const part of imp[1].split(",")) {
+				const alias = /\s+as\s+([A-Za-z_]\w*)\s*$/.exec(part);
+				const name = alias ? alias[1] : part.trim().split(".")[0].trim();
+				if (name) nonData.add(name);
+			}
+			continue;
+		}
+
+		// Loop targets and context managers: `for x in …`, `with … as f:`
+		const loop = /^\s*(?:async\s+)?for\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+in\s/.exec(line);
+		if (loop) {
+			for (const n of loop[1].split(",")) nonData.add(n.trim());
+			continue;
+		}
+		for (const m of line.matchAll(/\bas\s+([A-Za-z_]\w*)/g)) nonData.add(m[1]);
+
 		// Top-level bindings only: no leading indentation, single or tuple target.
-		const m = /^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)/.exec(lines[i]);
+		const m = /^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)/.exec(line);
 		if (!m) continue;
-		const rhs = lines[i].slice(lines[i].indexOf("=") + 1).trim().slice(0, 72) || "…";
+		const rhs = line.slice(line.indexOf("=") + 1).trim().slice(0, 72) || "…";
 		for (const name of m[1].split(",").map((n) => n.trim())) {
 			assignedAt.set(name, { rhs, turn: cellTurn, line: i + 1 });
+			nonData.delete(name);
 		}
 	}
+}
+
+/**
+ * Render the listing, collapsing tuple unpacking.
+ *
+ * `a, b, c = await gather(...)` binds three names from one expression; repeating
+ * that expression once per name was accurate and unreadable. Names sharing a
+ * provenance are grouped onto a single line.
+ */
+function describeNamespace(names: string[]): string[] {
+	const groups = new Map<string, { names: string[]; p: Provenance | undefined }>();
+	for (const n of names) {
+		if (nonData.has(n)) continue;
+		const p = assignedAt.get(n);
+		const key = p ? `${p.turn}:${p.line}:${p.rhs}` : `bare:${n}`;
+		if (!groups.has(key)) groups.set(key, { names: [], p });
+		groups.get(key)!.names.push(n);
+	}
+	return [...groups.values()].map(({ names: ns, p }) =>
+		p ? `${ns.join(", ")}  # = ${p.rhs}, turn-${p.turn}.py:${p.line}` : ns.join(", "),
+	);
 }
 
 export function createIpythonToolDefinition(
@@ -733,34 +782,28 @@ export function createIpythonToolDefinition(
 				// run `%whos` costs a turn and relies on it remembering to look; appending the
 				// namespace to every cell result costs a few tokens and no turn.
 				//
-				// Two modes, because the full listing repeats near-identically every turn and
-				// that repetition is where its context cost lives:
-				//
 				//   HARNESS_SHOW_NAMESPACE=1      full namespace after every cell
 				//   HARNESS_SHOW_NAMESPACE=delta  only bindings that are new or changed
 				//
-				// Delta is the cheaper form: the model accumulates its own picture across turns
-				// rather than re-reading the same list. Full is more robust if the model has
-				// forgotten an early binding by the time it matters.
+				// Measured: full beats delta (0.702 vs 0.679) *and* uses fewer total tokens,
+				// because the repetition is what keeps the model from re-fetching, and each
+				// avoided call saves more context than the listing costs. Delta remains useful
+				// if a namespace ever grows large enough for the listing itself to dominate.
 				const nsMode = process.env.HARNESS_SHOW_NAMESPACE;
 				if (nsMode === "1" || nsMode === "delta") {
 					try {
 						recordAssignments(code, cwd);
 						const names = await provisioner.listNamespaceNames(signal);
 						if (names && names.length > 0) {
-							const describe = (n: string) => {
-								const p = assignedAt.get(n);
-								return p ? `${n}  # = ${p.rhs}, turn-${p.turn}.py:${p.line}` : n;
-							};
-
+							const lines = describeNamespace(names);
 							if (nsMode === "delta") {
-								const fresh = names.filter((n) => shownNames.get(n) !== describe(n));
-								for (const n of names) shownNames.set(n, describe(n));
+								const fresh = lines.filter((l) => !shownNames.has(l));
+								for (const l of lines) shownNames.set(l, l);
 								if (fresh.length > 0) {
-									text += `${text ? "\n\n" : ""}[now available in the kernel:\n  ${fresh.map(describe).join("\n  ")}\n]`;
+									text += `${text ? "\n\n" : ""}[now available in the kernel:\n  ${fresh.join("\n  ")}\n]`;
 								}
-							} else {
-								text += `${text ? "\n\n" : ""}[kernel — already available, do not re-fetch (cells in .cells/):\n  ${names.map(describe).join("\n  ")}\n]`;
+							} else if (lines.length > 0) {
+								text += `${text ? "\n\n" : ""}[kernel — already available, do not re-fetch (cells in .cells/):\n  ${lines.join("\n  ")}\n]`;
 							}
 						}
 					} catch {

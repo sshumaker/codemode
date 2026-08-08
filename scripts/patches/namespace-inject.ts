@@ -5,34 +5,28 @@
 // run `%whos` costs a turn and relies on it remembering to look; appending the
 // namespace to every cell result costs a few tokens and no turn.
 //
-// Two modes, because the full listing repeats near-identically every turn and
-// that repetition is where its context cost lives:
-//
 //   HARNESS_SHOW_NAMESPACE=1      full namespace after every cell
 //   HARNESS_SHOW_NAMESPACE=delta  only bindings that are new or changed
 //
-// Delta is the cheaper form: the model accumulates its own picture across turns
-// rather than re-reading the same list. Full is more robust if the model has
-// forgotten an early binding by the time it matters.
+// Measured: full beats delta (0.702 vs 0.679) *and* uses fewer total tokens,
+// because the repetition is what keeps the model from re-fetching, and each
+// avoided call saves more context than the listing costs. Delta remains useful
+// if a namespace ever grows large enough for the listing itself to dominate.
 const nsMode = process.env.HARNESS_SHOW_NAMESPACE;
 if (nsMode === "1" || nsMode === "delta") {
 	try {
 		recordAssignments(code, cwd);
 		const names = await provisioner.listNamespaceNames(signal);
 		if (names && names.length > 0) {
-			const describe = (n: string) => {
-				const p = assignedAt.get(n);
-				return p ? `${n}  # = ${p.rhs}, turn-${p.turn}.py:${p.line}` : n;
-			};
-
+			const lines = describeNamespace(names);
 			if (nsMode === "delta") {
-				const fresh = names.filter((n) => shownNames.get(n) !== describe(n));
-				for (const n of names) shownNames.set(n, describe(n));
+				const fresh = lines.filter((l) => !shownNames.has(l));
+				for (const l of lines) shownNames.set(l, l);
 				if (fresh.length > 0) {
-					text += `${text ? "\n\n" : ""}[now available in the kernel:\n  ${fresh.map(describe).join("\n  ")}\n]`;
+					text += `${text ? "\n\n" : ""}[now available in the kernel:\n  ${fresh.join("\n  ")}\n]`;
 				}
-			} else {
-				text += `${text ? "\n\n" : ""}[kernel — already available, do not re-fetch (cells in .cells/):\n  ${names.map(describe).join("\n  ")}\n]`;
+			} else if (lines.length > 0) {
+				text += `${text ? "\n\n" : ""}[kernel — already available, do not re-fetch (cells in .cells/):\n  ${lines.join("\n  ")}\n]`;
 			}
 		}
 	} catch {
