@@ -20,7 +20,16 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { findTask } from "./tasks.mjs";
+import { loadTasks } from "./tasks.mjs";
+
+// Look tasks up without the grounded/runnable filters: runs made before a task
+// was excluded still exist on disk and should still be scoreable.
+const ALL_TASKS = new Map(loadTasks({ runnable: false }).map((t) => [t.id, t]));
+const findTask = (id) => {
+	const task = ALL_TASKS.get(id);
+	if (!task) throw new Error(`no task definition for ${id}`);
+	return task;
+};
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS = join(ROOT, ".run/runs");
