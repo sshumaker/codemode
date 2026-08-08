@@ -53,8 +53,11 @@ if (!envFile) {
 	process.exit(2);
 }
 
-const model = flag("model", "anthropic/claude-sonnet-5");
-const variants = flag("variants", "v1").split(",").map((v) => v.trim());
+// Opus is the model under study. Sonnet was useful early for cheap iteration,
+// but the two disagree on configuration — Opus prefers delta namespace
+// injection, Sonnet prefers full — so tuning on Sonnet optimizes the wrong thing.
+const model = flag("model", "anthropic/claude-opus-5");
+const variants = flag("variants", "q7").split(",").map((v) => v.trim());
 const arms = flag("arms", "codemode").split(",").map((a) => a.trim());
 const repeat = Number(flag("repeat", 1));
 const concurrency = Number(flag("concurrency", 16));
@@ -63,7 +66,10 @@ const timeout = flag("timeout", "300");
 // redundancy gap, as opposed to the prompt-side fix in variant q7).
 // "full" repeats the whole namespace each cell; "delta" shows only what is new,
 // which is far cheaper in context because the repetition is where the cost is.
-const nsMode = argv.includes("--ns-delta") ? "delta" : argv.includes("--show-namespace") ? "1" : "0";
+// Delta is the default: it is the best measured configuration on Opus (0.809 vs
+// 0.799 full), because Opus retains a binding after being told once and the
+// repeated full listing is then pure context cost. Sonnet needs the repetition.
+const nsMode = argv.includes("--ns-full") ? "1" : argv.includes("--ns-off") ? "0" : "delta";
 // Score the runs. Turns and cost are cheap proxies, but the question MCP-Bench
 // actually asks is whether the task was completed with the right tools — a
 // variant can be cheaper because it gave up sooner.

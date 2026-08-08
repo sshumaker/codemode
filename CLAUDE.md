@@ -20,6 +20,16 @@ per run, and do not pick concurrency by hand. Every one of those has already cos
 
 `bench/quick.mjs` enforces the right shape and refuses obviously wrong settings.
 
+## Opus is the model under study
+
+`npm run iterate` defaults to `anthropic/claude-opus-5`, prompt `q7`, delta
+namespace injection — the best measured configuration (0.809 overall).
+
+Do not tune on Sonnet. The two models disagree about configuration: Opus scores
+higher with *delta* injection (0.809 vs 0.799 full) because it retains a binding
+after one mention, while Sonnet needs the full listing repeated (0.776 vs 0.760).
+Tuning on the cheap model optimizes for the wrong one.
+
 ## The objective is the score, not the cost
 
 MCP-Bench asks whether the task was completed with the right tools. Turns and
