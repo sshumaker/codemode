@@ -20,6 +20,7 @@ import { mkdirSync, writeFileSync, createWriteStream, readFileSync } from "node:
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generate } from "./generate.mjs";
+import { buildPreamble as buildCodemodePreamble } from "./prompts.mjs";
 import { findTask } from "./tasks.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -56,7 +57,10 @@ const maxCost = Number(flag("max-cost", 1.0));
 const maxTurns = Number(flag("max-turns", 0));
 const task = findTask(taskId);
 
-const runId = flag("run-id", `${taskId}__${arm}__${residency}__${model.replace(/[^a-z0-9]/gi, "-")}`);
+// Codemode preamble variant — see bench/prompts.mjs and bench/hillclimb.mjs.
+const promptName = flag("prompt", "v1");
+const promptSuffix = arm === "codemode" && promptName !== "v1" ? `__${promptName}` : "";
+const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
 const runDir = join(ROOT, ".run/runs", runId);
 mkdirSync(runDir, { recursive: true });
 
@@ -99,26 +103,10 @@ function buildPreamble() {
 		task.exposedServers.includes(s.server),
 	);
 	const { tocLines, names } = generate(catalogue);
-
-	const pointer = [
-		"## Tools",
-		"",
-		`The \`api/\` directory in your working directory contains ${tocLines.length} async tool functions`,
-		`across ${catalogue.length} services, generated from their live API schemas.`,
-		"",
-		"Discover them:",
-		"  cat api/INDEX.md              # services and their package names",
-		"  cat api/<package>/INDEX.md    # one service's tools",
-		"  grep -ril '<keyword>' api/    # search all tool documentation",
-		"  cat api/<package>/<tool>.py   # full parameter docs for one tool",
-		"",
-		"Call them from the ipython tool:",
-		"  import api.<package>",
-		"  result = await api.<package>.<tool>(...)",
-		"",
-		"They are coroutines — always await them. Results are strings.",
-		"Hold intermediate results in variables; only print what you need to reason about.",
-	].join("\n");
+	const pointer = buildCodemodePreamble(promptName, {
+		toolCount: tocLines.length,
+		serverCount: catalogue.length,
+	});
 
 	if (residency === "L0") return pointer;
 	if (residency === "L1") return `${pointer}\n\nAvailable tools:\n${names.join("\n")}`;
@@ -155,6 +143,7 @@ const meta = {
 		droppedDistractors: task.droppedDistractors ?? [],
 	},
 	preambleChars: preamble.length,
+	promptVariant: arm === "codemode" ? promptName : undefined,
 	startedAt: new Date().toISOString(),
 };
 
