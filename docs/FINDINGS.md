@@ -120,6 +120,27 @@ what the residency dial is for.
 It also shows why cost alone is the wrong single metric here: vanilla was
 cheaper on this task *and* failed it.
 
+## Validity control: the tasks genuinely require tools
+
+A third arm, `notools`, gives the model nothing and asks the same question. Any
+task it answers well cannot discriminate the arms, because success there does
+not depend on tool use.
+
+Across 9 sampled tasks, every `notools` run scored **exactly 1.0** — the floor
+on all six dimensions. Each terminated in a single turn, ~$0.01, with the model
+declining rather than fabricating:
+
+> I don't have access to live tools in this session (no web browsing, no API
+> calls, no real-time data feeds) ... To be direct: I can't fabricate specific
+> rank numbers.
+
+This confirms the `SUBSTITUTABLE_SERVERS` exclusion did its job. Before it, the
+Scientific Computing + Math MCP task was solvable by both arms with numpy and
+no tools at all; after it, no sampled task is answerable without tools.
+
+It also gives every comparison a calibrated floor: an arm scoring near 1.0 on a
+task did not merely do badly, it effectively did not use the tools.
+
 ## Methodological problems found before spending real budget
 
 ### 1. `--tools` is an allowlist, and it silently hid the vanilla arm's tools
