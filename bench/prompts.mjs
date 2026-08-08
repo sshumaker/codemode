@@ -94,9 +94,21 @@ export const VARIANTS = {
 	 * v3 — same diagnosis as v2, opposite technique. Rather than prohibiting the
 	 * failure mode, show the shape of a good cell once. Demonstration tends to
 	 * transfer better than a rule list, and it is far shorter.
+	 *
+	 * WINNER, and the first prompt change with a significant effect. Paired over
+	 * 24 (task, repeat) cells against v1:
+	 *
+	 *   cost            0.77x geometric mean   t = -3.11   better on 16/24
+	 *   turns           +1.0                   t = +0.58   (no effect)
+	 *   text printed    47% less back into context
+	 *
+	 * The win is entirely in payload size per turn, not in turn count — exactly
+	 * the mechanism the example demonstrates. An earlier 5-task comparison ranked
+	 * v3 *worse*; that sample was far below the noise floor. Verified with
+	 * `bench/quick.mjs --variants v1,v3 --repeat 4 --concurrency 48`.
 	 */
 	v3: {
-		note: "one worked example instead of a rule list",
+		note: "one worked example; 0.77x cost vs v1, t=-3.11, n=24 paired",
 		build: ({ toolCount, serverCount }) =>
 			[
 				...discovery(toolCount, serverCount),

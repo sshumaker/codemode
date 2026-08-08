@@ -437,3 +437,41 @@ of these confounds** and should be treated as void:
 
 The harness is now clean and 140 tests pin the invariants. Results are being
 re-collected from scratch.
+
+## Iteration speed, and the first real prompt win
+
+The full sweep takes ~2 hours because a few tasks run 10-12 minutes while the
+median finishes in 137s. `bench/quick.mjs` runs only the fast tasks, at high
+concurrency, with no judge:
+
+| loop | shape | wall |
+|---|---|---|
+| full sweep | 18 tasks x 3 arms, 1200s timeout, judged | ~2 hours |
+| quick | 6 fast tasks, high concurrency, unjudged | **~5 min** |
+
+Concurrency does not shorten the critical path (one slow task sets it), so the
+gain is *more runs in the same time*: **48 runs in 5.2 minutes, none truncated**.
+That is what makes the noise floor affordable.
+
+A bug found in the quick reporter itself: truncated runs were being averaged in,
+which makes a variant look cheaper for failing. Completed-only now, with a loud
+warning when anything is cut short.
+
+### v3 beats v1, significantly
+
+Paired over 24 (task, repeat) cells:
+
+| measure | mean delta | t | v3 better on |
+|---|---|---|---|
+| cost | -$0.069 | **-3.01** | 16/24 |
+| log cost ratio | **0.77x** | **-3.11** | — |
+| turns | +1.04 | +0.58 (ns) | 10/24 |
+
+**23% cheaper at identical turn counts**, and the mechanism checks out: v3 prints
+**47% less text back into its own context** (median 25,438 chars vs 47,856).
+That is precisely what the worked example demonstrates and what the trace
+analysis said was wrong with v1.
+
+Note the earlier 5-task comparison ranked v3 *worse*. That sample was an order of
+magnitude below the noise floor. The lesson is the one already recorded above:
+below ~20 paired cells, this benchmark cannot rank prompts at all.
