@@ -164,7 +164,20 @@ const prompt = task.fuzzy;
 // selection — anything absent is filtered out even if an extension registered
 // it. The vanilla arm therefore has to name every MCP tool explicitly, or its
 // 250 tool definitions silently never reach the model and it falls back to bash.
-const BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+// No `bash` for the vanilla arm.
+//
+// A shell is an escape hatch out of the tool surface under test: 78% of this
+// arm's bash calls were `curl` straight to the APIs its MCP tools wrap, so it
+// was not exercising tool-calling at all, and the judge scored the results as
+// ungrounded because they never appeared in the proxy log. Blocking egress by
+// proxy env vars helps but raw sockets still evade it — removing the shell is
+// the fix that actually holds.
+//
+// The remaining tools are local file operations, which MCP-Bench tasks do not
+// need but which keep the arm from being crippled in some unrelated way. The
+// codemode arm keeps `%%bash` because a shell nested inside the code action is
+// part of what "code as the action space" means; a separate bash *tool* is not.
+const BUILTINS = ["read", "edit", "write", "grep", "find", "ls"];
 let toolList;
 if (arm === "notools") {
 	toolList = [];
