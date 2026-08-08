@@ -112,6 +112,27 @@ separately from transport errors.
 104 total -> 94 runnable (Google Maps won't start) -> **56 grounded**
 (34 single, 14 two-server, 8 three-server).
 
+### 5. Wall-clock and turn caps are both biased controls
+
+Codemode uses 2-3x the turns for the same work — vanilla batches parallel tool
+calls into a single turn, codemode issues one cell per turn but can make many
+API calls inside it. So turns are not comparable units, and a turn cap penalizes
+codemode's style. A wall-clock cap does the same: in the pilot, codemode hit the
+400s limit on a task vanilla finished in 104s, with 67 turns against vanilla's 9.
+
+The control now is a **dollar budget** (`--max-cost`), applied identically to
+both arms. It asks the question the experiment actually cares about — given the
+same spend, which arm gets further — and it does not encode an assumption about
+which unit of work is the right one.
+
+### 6. Self-inflicted: a `pkill -f run-task.mjs` killed an in-flight sweep run
+
+Verifying a patch, a `pkill` matched the sweep's child process and destroyed one
+codemode run. The sweep is resumable (it skips any task/arm with an existing
+`result.json`), so re-running filled the gap without re-spending on the other 11.
+Recorded because the resumability is what made it cheap to recover, and because
+process-name matching is broad enough to catch unrelated work.
+
 ## Setup problems worth recording
 
 MCP-Bench's `mcp_servers/requirements.txt` pins `mcp[cli]>=1.9.0` with no upper
@@ -135,24 +156,3 @@ than stdio and needs a billing-enabled key.
   with no collisions.
 - **Seven real tools ship an empty description.** They render, but would be
   near-invisible in an L2 TOC.
-
-### 5. Wall-clock and turn caps are both biased controls
-
-Codemode uses 2-3x the turns for the same work — vanilla batches parallel tool
-calls into a single turn, codemode issues one cell per turn but can make many
-API calls inside it. So turns are not comparable units, and a turn cap penalizes
-codemode's style. A wall-clock cap does the same: in the pilot, codemode hit the
-400s limit on a task vanilla finished in 104s, with 67 turns against vanilla's 9.
-
-The control now is a **dollar budget** (`--max-cost`), applied identically to
-both arms. It asks the question the experiment actually cares about — given the
-same spend, which arm gets further — and it does not encode an assumption about
-which unit of work is the right one.
-
-### 6. Self-inflicted: a `pkill -f run-task.mjs` killed an in-flight sweep run
-
-Verifying a patch, a `pkill` matched the sweep's child process and destroyed one
-codemode run. The sweep is resumable (it skips any task/arm with an existing
-`result.json`), so re-running filled the gap without re-spending on the other 11.
-Recorded because the resumability is what made it cheap to recover, and because
-process-name matching is broad enough to catch unrelated work.
