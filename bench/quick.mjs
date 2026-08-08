@@ -137,26 +137,41 @@ for (const variant of variants) {
 			.filter(existsSync)
 			.map((p) => JSON.parse(readFileSync(p, "utf8")));
 		if (!results.length) continue;
+		// Average only completed runs. A truncated run has artificially low turns
+		// and cost, so including it makes a variant look better for failing —
+		// exactly backwards.
 		const ok = results.filter((r) => r.summary.stopReason === "completed");
+		const cut = results.length - ok.length;
 		rows.push({
 			variant,
 			arm,
 			runs: results.length,
-			completed: ok.length,
-			avgTurns: +mean(results.map((r) => r.summary.turns)).toFixed(1),
-			avgCost: +mean(results.map((r) => r.summary.cost)).toFixed(3),
-			avgSec: Math.round(mean(results.map((r) => r.summary.wallMs / 1000))),
-			noMcp: results.filter((r) => (r.judge?.mcpCalls ?? 1) === 0).length,
+			"cut short": cut > 0 ? `${cut} !!` : 0,
+			avgTurns: ok.length ? +mean(ok.map((r) => r.summary.turns)).toFixed(1) : "—",
+			avgCost: ok.length ? +mean(ok.map((r) => r.summary.cost)).toFixed(3) : "—",
+			p90Sec: ok.length
+				? Math.round([...ok.map((r) => r.summary.wallMs / 1000)].sort((a, b) => a - b)[Math.floor(ok.length * 0.9)])
+				: "—",
+			avgSec: ok.length ? Math.round(mean(ok.map((r) => r.summary.wallMs / 1000))) : "—",
 		});
 	}
 }
 
 const base = rows[0];
 for (const r of rows) {
-	r["turns vs first"] = base ? `${((r.avgTurns / base.avgTurns - 1) * 100).toFixed(0)}%` : "";
-	r["cost vs first"] = base ? `${((r.avgCost / base.avgCost - 1) * 100).toFixed(0)}%` : "";
+	const ok = base && typeof r.avgTurns === "number" && typeof base.avgTurns === "number";
+	r["turns vs first"] = ok ? `${((r.avgTurns / base.avgTurns - 1) * 100).toFixed(0)}%` : "";
+	r["cost vs first"] = ok ? `${((r.avgCost / base.avgCost - 1) * 100).toFixed(0)}%` : "";
 }
+
+const truncated = rows.reduce((n, r) => n + (typeof r["cut short"] === "string" ? 1 : 0), 0);
 
 console.log(`\nwall clock: ${((Date.now() - started) / 1000 / 60).toFixed(1)} min\n`);
 console.table(rows);
-console.log("Negative is better. Run-to-run noise is ~27%: treat anything smaller as nothing.\n");
+console.log("Negative is better. Run-to-run noise is ~27%: treat anything smaller as nothing.");
+if (truncated > 0) {
+	console.log("!! Some runs were cut short by the timeout and are excluded from the averages.");
+	console.log("   Raise --timeout or drop the offending task; a truncated cell is not a measurement.\n");
+} else {
+	console.log("");
+}
