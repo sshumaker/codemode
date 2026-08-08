@@ -148,7 +148,146 @@ export const VARIANTS = {
 				"having never held it in a variable at all.",
 			].join("\n"),
 	},
+
+	/**
+	 * v5 — v3 plus a concurrency push. v3 cut payload size but left turn count
+	 * untouched (t=+0.58). Turns are the remaining cost: 48% of cells make no
+	 * tool call, and the median cell is 4 lines. If the model fetched everything
+	 * independent up front it would collapse several turns into one.
+	 */
+	v5: {
+		note: "v3 + explicit concurrency push at turn count",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"Each cell costs a turn, and whatever you print re-enters your context.",
+				"So do a whole step per cell and print only the answer:",
+				"",
+				"  import asyncio, json",
+				"  raw_a, raw_b = await asyncio.gather(api.svc_one.search(q='x'), api.svc_two.list())",
+				"  a, b = json.loads(raw_a), json.loads(raw_b)",
+				"  merged = [r for r in a['items'] if r['id'] in {x['id'] for x in b['items']}]",
+				"  print(len(merged), [r['name'] for r in merged[:5]])",
+				"",
+				"The large payloads stay in `raw_a`/`raw_b`; only the small result is printed.",
+				"",
+				"Before your first call, list every piece of data the task needs. Fetch all",
+				"of it that does not depend on another result in a single `asyncio.gather`,",
+				"then work on what came back. Most tasks need two or three cells, not ten.",
+			].join("\n"),
+	},
+
+	/**
+	 * v6 — v3 plus a direct prohibition on the single largest category of wasted
+	 * turns. 39.8% of cells only re-print local variables: the model computes
+	 * something, prints it, and looks at it before continuing. v2 showed that a
+	 * list of rules backfires, so this adds exactly one rule to the winning
+	 * example rather than a list.
+	 */
+	v6: {
+		note: "v3 + one rule against verification prints",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"Each cell costs a turn, and whatever you print re-enters your context.",
+				"So do a whole step per cell and print only the answer:",
+				"",
+				"  import asyncio, json",
+				"  raw_a, raw_b = await asyncio.gather(api.svc_one.search(q='x'), api.svc_two.list())",
+				"  a, b = json.loads(raw_a), json.loads(raw_b)",
+				"  merged = [r for r in a['items'] if r['id'] in {x['id'] for x in b['items']}]",
+				"  print(len(merged), [r['name'] for r in merged[:5]])",
+				"",
+				"The large payloads stay in `raw_a`/`raw_b`; only the small result is printed.",
+				"",
+				"Never spend a cell checking what you just computed. Parse, filter and",
+				"format in the same cell that fetched the data.",
+			].join("\n"),
+	},
+
+	/**
+	 * v7 — v3 with the example doing the *whole* task shape rather than one step.
+	 * v2 (rules) lost and v3 (one example) won, which suggests the model imitates
+	 * the demonstrated shape closely. If that is right, demonstrating a complete
+	 * fetch-to-answer flow should compress the trajectory more than telling it to.
+	 */
+	v7: {
+		note: "v3 but the example spans the whole task, not one step",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"Each cell costs a turn, and whatever you print re-enters your context.",
+				"A whole task usually fits in two cells. First, find the tools and fetch",
+				"everything independent at once:",
+				"",
+				"  import asyncio, json",
+				"  import api.svc_one, api.svc_two",
+				"  raw_a, raw_b = await asyncio.gather(api.svc_one.search(q='x'), api.svc_two.list())",
+				"  a, b = json.loads(raw_a), json.loads(raw_b)",
+				"  print(len(a['items']), len(b['items']), list(a['items'][0]))",
+				"",
+				"Then derive the answer and print only that:",
+				"",
+				"  ids = {x['id'] for x in b['items']}",
+				"  merged = sorted((r for r in a['items'] if r['id'] in ids), key=lambda r: -r['score'])",
+				"  for r in merged[:10]:",
+				"      print(r['name'], r['score'])",
+				"",
+				"The large payloads never leave `raw_a`/`raw_b`.",
+			].join("\n"),
+	},
+
+	/**
+	 * v8 — teach the REPL's mental model rather than efficiency rules.
+	 *
+	 * v2/v4 (rules) lost; v3 (a worked example) won. But every variant so far has
+	 * been about *economy* — print less, batch more. None told the model what the
+	 * environment actually is: a kernel whose state survives between turns.
+	 *
+	 * The trace evidence says it does not know. It re-prints data it already
+	 * holds, re-parses payloads it already parsed, and takes 4-line steps as if
+	 * each cell were a fresh shell. A model that trusts its own state can hold a
+	 * 182k-character payload in a variable and slice it repeatedly for free, and
+	 * can recover from a failed cell without re-fetching anything.
+	 *
+	 * This is the hypothesis the project is actually about: the REPL is not a
+	 * faster bash, it is memory the context window does not have to pay for.
+	 */
+	v8: {
+		note: "teaches persistent kernel state, not economy rules",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"## The kernel",
+				"",
+				"This is one long-lived IPython kernel, not a fresh shell per cell.",
+				"Everything you bind stays alive for the whole task:",
+				"",
+				"  raw = await api.svc.get_everything()   # 200k characters, in a variable",
+				"  data = json.loads(raw)                  # parsed once, reusable",
+				"  print(len(data['items']))               # 1 line reaches your context",
+				"",
+				"`raw` and `data` are still there next turn. You never re-fetch and never",
+				"re-parse. Slice them as many times as you like — that costs nothing,",
+				"because only what you print enters your context.",
+				"",
+				"This is the whole advantage: large results live in the kernel, and your",
+				"context holds only the conclusions you drew from them. Fetching a big",
+				"payload and then printing it back defeats the point entirely.",
+				"",
+				"If a cell raises, everything from earlier cells is untouched — fix the",
+				"line and continue from the variables you already have.",
+				"",
+				"Define a helper once and reuse it. Fetch independent things together",
+				"with `asyncio.gather`. Print only what you need to decide the next step.",
+			].join("\n"),
+	},
 };
+
 
 /** Build a preamble for a named variant. Throws on an unknown name. */
 export function buildPreamble(variant, ctx) {
