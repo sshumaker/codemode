@@ -1,19 +1,21 @@
 {
   "name": "harness",
   "version": "1.0.0",
-  "description": "Experiment: does replacing a conventional tool registry with a single persistent code-execution tool improve agent performance — and does the effect grow as the model gets weaker?",
+  "description": "Code is all you need — agent harness experiment",
   "main": "index.js",
   "directories": {
     "doc": "docs"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test \"bench/test/*.test.mjs\"",
+    "report": "node bench/residency-report.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
   "dependencies": {
     "js-tiktoken": "^1.0.21"
-  }
+  },
+  "private": true
 }

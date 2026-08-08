@@ -201,6 +201,37 @@ the pilot subset, pick the level, lock it for the 2-arm x 3-model matrix. Costs
 one model's runs and pre-empts both symmetric objections: that `codemode` was
 handicapped by cold-start discovery, or that its preamble was hand-tuned.
 
+### Measured residency, before any model call
+
+`node bench/residency-report.mjs 250` — built-in costs measured from the real
+registry, MCP costs from a synthetic 250-tool catalogue:
+
+| config | builtin | mcp | resident | vs naive |
+|---|---|---|---|---|
+| vanilla L4 (naive baseline) | 1041 | 16503 | **17544** | 1.0x |
+| vanilla L1 (deferred — Claude Code) | 13 | 1249 | **1262** | 13.9x |
+| codemode L0 (pure discovery) | 156 | 0 | **156** | 112.5x |
+| codemode L1 (names resident) | 156 | 1249 | **1405** | 12.5x |
+| codemode L2 (TOC resident) | 156 | 5500 | **5656** | 3.1x |
+
+**Pre-registered finding: the 112x headline is against a strawman.** Measured
+against the deferred baseline a modern harness actually ships, codemode L2 is
+**4.5x more expensive**, and codemode L1 is roughly at parity (1405 vs 1262).
+Only codemode L0 wins on tokens, at 8x.
+
+Three consequences for the run plan:
+
+1. **Codemode must run at L0 to win the token argument at all.** L2's TOC, at
+   ~22 tokens per tool over 250 tools, costs more than simply listing names and
+   fetching schemas on demand.
+2. **L0 buys those tokens with turns.** Cold-start discovery on every task is
+   latency and turn count, which is precisely the cost the success-rate and
+   turn-count metrics must capture. The token column alone will mislead.
+3. **The quality claim has to carry the result.** If tokens are roughly a wash
+   against a deferred baseline, then Claim 2 — code as a better action
+   representation than JSON — is what the experiment is actually testing. Size
+   the pilot for statistical power on success rate, not on token deltas.
+
 ### Fairness: one source, two renderings
 
 The generator is the fairness mechanism. MCP schema -> one description ->
