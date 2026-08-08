@@ -493,7 +493,59 @@ export const VARIANTS = {
 				"say explicitly what you could not determine.",
 			].join("\n"),
 	},
+
+	/**
+	 * q5 — q1 plus a rule against silent substitution.
+	 *
+	 * Measured failure: 34% of codemode answers substitute a different resource
+	 * for the one asked about, and present it as equivalent. The worst run in the
+	 * whole set does exactly this — asked to compare pagination across openai,
+	 * github and cloudflare, it errored on cloudflare and silently swapped in
+	 * Hugging Face, NixOS and DEX Paprika as "the closest analog", scoring 2.7/10
+	 * on fulfilment.
+	 *
+	 * This is not a laziness failure; the agent works hard and writes a confident
+	 * answer. It is a failure to treat "I could not get X" as a reportable result
+	 * rather than a problem to route around. Grounding stays high because the
+	 * substitutes *are* backed by tool output — which is why the rubric catches it
+	 * only on fulfilment.
+	 */
+	q5: {
+		note: "q1 + report gaps instead of substituting",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"You are scored on avoiding redundant calls and on running independent",
+				"work concurrently. Both are easy here and both are usually missed.",
+				"",
+				"Plan the full set of calls before the first one. Group them into waves:",
+				"everything that does not depend on another result goes in one",
+				"`asyncio.gather`; only genuinely dependent calls wait for a later wave.",
+				"",
+				"  import asyncio, json",
+				"  a, b, c = await asyncio.gather(",
+				"      api.svc_one.search(q='x'),",
+				"      api.svc_two.list(),",
+				"      api.svc_three.details(id=7),",
+				"  )",
+				"  ids = [r['id'] for r in json.loads(a)['items'][:20]]",
+				"  details = await asyncio.gather(*[api.svc_one.get(id=i) for i in ids])",
+				"",
+				"Never call the same tool twice with the same arguments — results persist",
+				"in variables, so reuse them. Fan out over a list with `gather`, never in",
+				"a loop of separate cells.",
+				"",
+				"Answer the question that was asked. If a specific thing is requested and",
+				"you cannot retrieve it — the call errors, or nothing available covers it —",
+				"retry once, then say plainly that you could not get it. Do NOT quietly",
+				"analyse a different service, dataset or entity in its place and present",
+				"that as the answer. A partial answer with an explicit gap scores far",
+				"better than a complete-looking answer about the wrong thing.",
+			].join("\n"),
+	},
 };
+
 
 
 
