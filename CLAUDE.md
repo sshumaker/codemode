@@ -92,3 +92,13 @@ Injecting TypeScript into the vendored tree as an escaped string inside a
 heredoc-inside-python mangles every backslash — `\n` became a literal newline
 and `\w` became `w`, producing a file that would not compile. Write the snippet
 as a real `.ts` file and have `neutralize-prime.mjs` read it.
+
+## Do not hillclimb efficiency on the fast subset
+
+`bench/quick.mjs` selects tasks by speed, and tasks are fast partly because they
+need fewer tool calls — the same axis `parallelism_and_efficiency` scores. Prompt
+work that drove duplicate calls from 29% to 0% on the fast subset left codemode
+*behind* vanilla on that dimension over the full set (-0.069, t=-3.42).
+
+Use quick to iterate on fulfilment, grounding and cost. Confirm anything
+efficiency-shaped on the full grounded set before believing it.

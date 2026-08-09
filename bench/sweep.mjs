@@ -63,7 +63,19 @@ console.log(`model: ${model}  residency(codemode): ${residency}\n`);
 /** Residency label per arm; notools has none, vanilla is always L4. */
 const levelFor = (arm) => (arm === "codemode" ? residency : arm === "notools" ? "none" : vanillaResidency);
 
-const runId = (task, arm) => `${task.id}__${arm}__${levelFor(arm)}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+/**
+ * Must match run-task.mjs exactly, prompt suffix included. When it did not, the
+ * skip check never matched, sweep spawned anyway, and run-task's overwrite guard
+ * refused — 51 of 76 runs bounced with "run already exists" and the sweep
+ * reported success.
+ */
+const promptSuffix = (arm) =>
+	arm === "codemode" ? (codemodePrompt === "v1" ? "" : `__${codemodePrompt}`)
+	: arm === "vanilla" ? (vanillaPrompt === "w1" ? "" : `__${vanillaPrompt}`)
+	: "";
+
+const runId = (task, arm) =>
+	`${task.id}__${arm}__${levelFor(arm)}${promptSuffix(arm)}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 
 function runOne(task, arm) {
 	return new Promise((resolve) => {

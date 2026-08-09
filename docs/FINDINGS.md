@@ -476,6 +476,56 @@ Note the earlier 5-task comparison ranked v3 *worse*. That sample was an order o
 magnitude below the noise floor. The lesson is the one already recorded above:
 below ~20 paired cells, this benchmark cannot rank prompts at all.
 
+## HEADLINE — Opus 5, full grounded sample, 37 paired tasks
+
+Both arms on the best measured configuration: codemode with the `q7` prompt and
+delta namespace injection, vanilla with `w2`. Judge fixed, rule-based metrics
+measured from attempted calls, no shell in vanilla, egress blocked, matched base
+system prompts, uncapped budget.
+
+| dimension | vanilla | codemode | delta | t |
+|---|---|---|---|---|
+| **task_fulfillment** | 0.401 | 0.569 | **+0.168** | **+5.33** |
+| grounding | 0.710 | 0.778 | +0.068 | +1.81 |
+| **dependency_awareness** | 0.529 | 0.606 | **+0.078** | **+2.92** |
+| tool_appropriateness | 0.659 | 0.689 | +0.030 | +1.09 |
+| parameter_accuracy | 0.710 | 0.735 | +0.025 | +0.91 |
+| **parallelism_and_efficiency** | 0.474 | 0.405 | **-0.069** | **-3.42** |
+| LLM-6 | 0.580 | **0.630** | +0.050 | |
+| **OVERALL (8 metrics)** | 0.685 | **0.722** | +0.036 | |
+
+- **score**: +0.050, t=+2.14, codemode better on 21/37
+- **cost**: **0.55x**, t=-4.36 — vanilla $0.942/task, codemode $0.557
+- **$/score point**: vanilla 1.374, codemode **0.772** (1.8x more efficient)
+
+MCP-Bench leaderboard for scale: gpt-5 0.749, o3 0.715, gemini-2.5-pro 0.690,
+claude-sonnet-4 0.681. Both arms land between gemini-2.5-pro and o3. Not directly
+comparable — different judge model, rule-based metrics computed differently, and
+37 of their 104 tasks after exclusions.
+
+### The result is task fulfilment
+
++0.168 at t=+5.33 is the largest effect measured anywhere in this project, and it
+is the dimension that asks whether the job got done: vanilla completes ~40% of
+each task's requirements, codemode ~57%. Every other positive dimension is
+secondary, and two of them are not significant.
+
+### Parallelism inverts at scale — the fast subset was misleading
+
+On the six fast tasks codemode led parallelism by +0.15. On the full set it
+**trails by -0.069 (t=-3.42)**, the only dimension where it loses.
+
+Harder multi-server tasks push codemode back into exploratory, redundant calling
+that the fast subset never exposed. The `q7` prompt and namespace injection cut
+duplicate calls from 29% to ~0% *on fast tasks*; that gain does not survive
+contact with the full set.
+
+This is a self-inflicted methodological lesson. The fast subset was selected for
+speed, and tasks are fast partly *because* they need fewer calls — which is
+precisely the axis `parallelism_and_efficiency` measures. Hillclimbing on it
+optimised the metric on the sample least able to test it. Any further work on
+this dimension has to run against the full set.
+
 ## Optimizing cost selects for giving up
 
 Ranked by cost, v3 looked like a clear win: 0.77x against v1, t=-3.11, and the
