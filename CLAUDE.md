@@ -22,7 +22,7 @@ per run, and do not pick concurrency by hand. Every one of those has already cos
 
 ## Opus is the model under study
 
-`npm run iterate` defaults to `anthropic/claude-opus-5`, prompt `q7`, delta
+`npm run iterate` defaults to `anthropic/claude-opus-5`, prompt `q8`, delta
 namespace injection — the best measured configuration (0.809 overall).
 
 Do not tune on Sonnet. The two models disagree about configuration: Opus scores

@@ -58,7 +58,7 @@ const maxTurns = Number(flag("max-turns", 0));
 const task = findTask(taskId);
 
 // Codemode preamble variant — see bench/prompts.mjs and bench/hillclimb.mjs.
-const promptName = flag("prompt", "v3");
+const promptName = flag("prompt", "q8");
 const vanillaPromptName = flag("vanilla-prompt", "w2");
 const promptSuffix =
 	arm === "codemode" ? (promptName === "v1" ? "" : `__${promptName}`) : arm === "vanilla" ? (vanillaPromptName === "w1" ? "" : `__${vanillaPromptName}`) : "";

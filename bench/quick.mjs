@@ -57,7 +57,7 @@ if (!envFile) {
 // but the two disagree on configuration — Opus prefers delta namespace
 // injection, Sonnet prefers full — so tuning on Sonnet optimizes the wrong thing.
 const model = flag("model", "anthropic/claude-opus-5");
-const variants = flag("variants", "q7").split(",").map((v) => v.trim());
+const variants = flag("variants", "q8").split(",").map((v) => v.trim());
 const arms = flag("arms", "codemode").split(",").map((a) => a.trim());
 const repeat = Number(flag("repeat", 1));
 const concurrency = Number(flag("concurrency", 16));

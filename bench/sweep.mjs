@@ -45,7 +45,7 @@ const tier = flag("tier", null);
 // Runs are latency-bound, so wall-clock scales close to linearly with this.
 const concurrency = Number(flag("concurrency", 1));
 // Best measured configuration on Opus — see CLAUDE.md.
-const codemodePrompt = flag("prompt", "q7");
+const codemodePrompt = flag("prompt", "q8");
 const vanillaPrompt = flag("vanilla-prompt", "w2");
 const nsMode = flag("ns", "delta");
 // 0 disables the cap. It was never forwarded to run-task, so every run silently
