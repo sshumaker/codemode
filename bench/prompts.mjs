@@ -652,7 +652,63 @@ export const VARIANTS = {
 				"Bind every result to a name so a later cell can reuse it.",
 			].join("\n"),
 	},
+
+	/**
+	 * q8 — q7 with the fan-out bounded.
+	 *
+	 * On the full grounded set codemode *loses* parallelism_and_efficiency
+	 * (-0.069, t=-3.42), the only dimension where it trails. Cause: it makes 99.2
+	 * MCP calls per task against vanilla's 22.7, and on collection-shaped tasks
+	 * far worse — 429 calls where vanilla used 10, at a 52% duplicate rate.
+	 *
+	 * This is q7's own instruction misfiring. "Fan out over a list with gather,
+	 * never in a loop of separate cells" fixed serialization on small tasks and,
+	 * given a large collection, became unbounded enumeration. `gather` makes
+	 * breadth free to *write*, which is exactly why it needs a stated limit.
+	 *
+	 * Note this was invisible on the fast subset, where it measured +0.15 the
+	 * other way: fast tasks are fast partly because they need few calls.
+	 */
+	q8: {
+		note: "q7 + bounded fan-out; fixes the 99-calls-per-task regression",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"## The kernel is persistent",
+				"",
+				"Every cell runs in the SAME long-lived IPython session. Any top-level",
+				"variable you bind stays available in every later cell, for the whole task.",
+				"Data you have already fetched is still in memory — you never need to",
+				"fetch it twice.",
+				"",
+				"You will not remember across turns what you already have. So look:",
+				"",
+				"  %whos                        # every live variable, with its type and size",
+				"",
+				"## Fetching",
+				"",
+				"Plan the full set of calls before the first one. Everything that does not",
+				"depend on another result goes in ONE `asyncio.gather`; only genuinely",
+				"dependent calls wait for a later wave.",
+				"",
+				"  import asyncio, json",
+				"  a, b = await asyncio.gather(api.svc_one.search(q='x'), api.svc_two.list())",
+				"  ids = [r['id'] for r in json.loads(a)['items']][:15]",
+				"  details = await asyncio.gather(*[api.svc_one.get(id=i) for i in ids])",
+				"",
+				"Keep the fan-out bounded. `gather` makes breadth cheap to write and it is",
+				"not cheap to run: you are scored on making the FEWEST calls that answer the",
+				"question, not the most. Before expanding a list into calls, slice it —",
+				"ten to twenty items is almost always enough to support an answer, and",
+				"enumerating an entire collection is scored as redundancy.",
+				"",
+				"If a first sample turns out not to answer the question, fetch more then.",
+				"Do not fetch broadly in case you need it.",
+			].join("\n"),
+	},
 };
+
 
 
 
