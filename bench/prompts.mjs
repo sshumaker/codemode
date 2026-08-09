@@ -707,7 +707,63 @@ export const VARIANTS = {
 				"Do not fetch broadly in case you need it.",
 			].join("\n"),
 	},
+
+	/**
+	 * q9 — thoroughness-first, the opposite pressure to q8.
+	 *
+	 * Every variant so far has pushed toward economy: q8 says "bound the fan-out",
+	 * "ten to twenty items is enough", "do not fetch broadly in case you need it".
+	 * That produced parity with Claude Code (0.703 vs 0.711, t=-0.50) at a fifth
+	 * of the cost — $0.41 against $2.08, 14 turns against 77.
+	 *
+	 * Claude Code buys its score with exploration. Nothing has tested what codemode
+	 * does when told to spend rather than save, so the ceiling is unmeasured. The
+	 * fan-out bound stays (unbounded enumeration was a real failure, -0.069 on
+	 * parallelism); what changes is that verification and coverage are now
+	 * explicitly worth turns.
+	 *
+	 * Expected to cost more. The question is only whether it scores higher.
+	 */
+	q9: {
+		note: "thoroughness-first; tests the score ceiling rather than the cost floor",
+		build: ({ toolCount, serverCount }) =>
+			[
+				...discovery(toolCount, serverCount),
+				"",
+				"## The kernel is persistent",
+				"",
+				"Every cell runs in the SAME long-lived IPython session. Any top-level",
+				"variable you bind stays available in every later cell. You never need to",
+				"fetch the same thing twice — check `%whos` before re-fetching.",
+				"",
+				"## Getting it right",
+				"",
+				"You are scored on how much of the request you actually complete and on",
+				"whether every claim traces to a tool result. Completeness matters more",
+				"than brevity: an extra call that confirms something is worth making.",
+				"",
+				"Work like this:",
+				"",
+				"1. Write out every distinct requirement in the request, including the",
+				"   ones phrased as asides or conditionals. Note which depend on others.",
+				"2. Fetch. Everything independent goes in one `asyncio.gather`:",
+				"",
+				"     a, b = await asyncio.gather(api.svc_one.search(q='x'), api.svc_two.list())",
+				"     ids = [r['id'] for r in json.loads(a)['items']][:20]",
+				"     details = await asyncio.gather(*[api.svc_one.get(id=i) for i in ids])",
+				"",
+				"   Slice before expanding a list into calls — twenty items is usually",
+				"   plenty, and enumerating a whole collection is scored as redundancy.",
+				"3. Check your list item by item against what you actually retrieved.",
+				"   Anything unconfirmed, go back and confirm it. Anything you could not",
+				"   determine, say so explicitly rather than omitting or substituting.",
+				"",
+				"Do not stop at the first plausible answer. Stop when every requirement",
+				"is either satisfied by retrieved data or explicitly reported as unmet.",
+			].join("\n"),
+	},
 };
+
 
 
 
