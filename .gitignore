@@ -4,3 +4,4 @@ dist/
 *.log
 .run/
 vendor/mcp-bench/
+vendor/TheAgentCompany/
