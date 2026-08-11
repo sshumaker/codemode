@@ -172,18 +172,70 @@ already does; and `jobs.*`.
 
 ### Polling is `jobs.wait(wake_after=…)`, not a primitive
 
+**Check first, then wait — in one cell.** This is the whole idiom, and getting it wrong doubles
+the turn count (measured, below):
+
 ```python
-# turn N
-jobs.wait(wake_after=60)
-# ── turn N+1 ──
-print(hist2(rid))            # nothing yet? wait again.
+# turn N — one turn, one poll
+print(hist2(rid))            # what arrived while I was away?
+jobs.wait(wake_after=300)    # not yet → wait again. must be the last statement.
+# ── turn N+1 ── same shape again
 ```
 
-**This costs nothing relative to today.** The 176 sleep cells in the TAC traces
-(§10) were *already* 176 turns — each cell is one tool call. The agent is already
-paying turn-granularity polling; the only change is that it stops holding a kernel
-and stops burning 11,257 s of in-process wall-clock. Turn-cost parity, wall-clock
-and RAM strictly better.
+The anti-pattern, which an earlier draft of this section showed as the example, is a cell that
+does nothing but `jobs.wait(...)` and a *second* cell that checks. Same poll, two turns.
+
+**This costs nothing relative to today — for the waits TAC contains.** The 194 waiting
+constructs in the TAC traces (§10) were *already* 194 turns — each cell is one tool call.
+The agent is already paying turn-granularity polling; the only change is that it stops
+holding a kernel and stops burning ~9,700 s of in-process wall-clock, which is **72% of the
+arm's entire tool wall-clock**. Turn-cost parity, wall-clock and RAM strictly better.
+
+**But parity is approximate, and the first live run shows the gap.** With the v1 surface in
+place (`bench/tac/jobs_runtime.py` plus a kernel prelude that blocks `threading.Thread` and
+`time.sleep(>30s)`, erroring with the correct pattern), `pm-schedule-meeting-2` codemode
+re-run measured:
+
+| | before | after |
+|---|---|---|
+| in-cell sleep | 3,050 s | **70 s** |
+| `threading.Thread` | 4 | **0** |
+| `jobs.wait` | 0 | **14** |
+| turns | 32 | **42** |
+| cost | $0.62 | $0.67 |
+| score | 2/5 | 2/5 |
+
+The agent adopts the primitive immediately and unprompted (it wrote `jobs.wait(wake_after=40)`
+in the cell *after* the guard first fired), blocking collapses **98%**, thread leakage goes to
+zero — and **turns rise 30%**.
+
+**The turn rise is a cell-split artefact, not the cost of polling, and it is fixable by idiom.**
+Measured: the agent asked for durations statistically indistinguishable from the sleeps it
+replaced (`wake_after` median **195 s** vs a per-wait-cell median of 205 s before; 14 wait
+statements vs 12), so it is not polling more often. What changed is that **11 of its 14 waits
+were bare `jobs.wait(...)` cells with the check in the following cell**, where before *every*
+wait was fused with its check. Those 11 cells are the entire increase (+11 turns, −1 elsewhere).
+Under the check-then-wait idiom above the same run is 32 turns — parity with the before-run's 33.
+Full analysis: `docs/sketches/wait-taxonomy.md` §1.
+
+Nor is +30% a trend. Across the three paired validation runs turns went **88 → 83** in aggregate
+(pm-schedule +10, admin-ask −16, hr-collect +1).
+
+Two caveats on that table, both from `wait-taxonomy.md`:
+
+- **The waits were not actually waited.** All 17 wait cells returned in 2–12 s with the raw
+  `__HARNESS_WAIT_SECONDS__` sentinel still in the output: the host-side consumer
+  (`vendor/prime-agent/…/tools/ipython.ts:1004`) was not active in that build. 2,950 s requested,
+  ~0 s waited. In-cell sleep, threads, turns and cost are unaffected; **"wall-clock strictly
+  better" is not yet demonstrated**, and the honest claim is narrower anyway — waiting does not
+  shrink, it stops being *held*. Had the waits been honoured this run would have taken ~2,900 s
+  against 1,890 s before, because the agent requested more total wait than it used to sleep.
+- **Score is not measurable on these tasks** (§10) — full marks come from reading the grader's
+  scenario file, not from waiting well.
+
+For the **category-5** waits in §10 the turn-parity claim is strictly false rather than
+approximate: those are sub-30 s pauses *inside* a cell, costing zero extra turns today, and
+re-expressing them as wakes would create turns. They must not go through `wait` at all — §9.
 
 Earlier drafts had a `watch()` verb and an `until="changed"` parameter on `submit`,
 where the control plane re-issued a request and diffed the result. Both are cut
@@ -195,11 +247,15 @@ where the control plane re-issued a request and diffed the result. Both are cut
 | control-plane request re-issuer | to poll on the agent's behalf |
 | `readOnlyHint` enforcement | otherwise it re-sends a message 60× |
 | baseline capture + diffing | to detect "changed" |
-| delta computation on the handle | the 88% redundancy is fixed by reading **once instead of 12 times**, not by pre-diffing the payload — and the agent already wrote the filter |
+| delta computation on the handle | the ~88% redundancy is fixed by reading **once instead of 13 times**, not by pre-diffing the payload — and the agent already wrote the filter |
 
 A repeat-until criterion remains a legitimate *optimisation* — it collapses N poll
 turns into one wake — but it is not needed for correctness, and it is not free
-(see the proxy requirement below). Measure the surviving poll turns first.
+(see the proxy requirement below). The surviving poll turns are now measured, and they are
+what it would buy: the v1 re-run of `pm-schedule-meeting-2` issued **14 `jobs.wait` calls**
+and grew from 32 turns to 42. Worth revisiting once more than one task has been run — at
+~$0.012/turn the whole prize is a few cents per task, against a control-plane re-issuer and
+its credential dependency.
 
 ### Conditions: a shell string, and why that's the good answer
 
@@ -295,9 +351,13 @@ This corrects a claim made earlier in this design: dropping `until="changed"` do
 re-issuer into the shell. The requirement is a property of *watching an
 authenticated service*, not of the mechanism. The split is unchanged either way:
 
-- **9% (process/local)** — files, ports, exit codes, log tails. No network, no
-  credentials, no proxy. Free.
-- **83% (service/chat)** — needs the proxy, whichever poller you pick.
+- **21% (process/local)** — files, ports, exit codes, log tails. No network, no
+  credentials, no proxy. Free. (§10; was reported as 9%.)
+- **78% (service/chat)** — needs the proxy, whichever poller you pick.
+
+Note which side the *observed* conditions fall on: every shell-string condition actually
+written in the traces targets localhost or a local file, i.e. the free 21%. The credential
+requirement is real but currently unexercised — see §10's category-3 note.
 
 Worth writing down as a chain, because all three links are already-observed bugs:
 unproxied poll loop → trips the rate limit → 429s (which this project already saw
@@ -479,52 +539,81 @@ with work-lifetime, which is what the split exists to prevent. And the verb is
 Enforce a **floor** on `wake_after`. Re-arm is polling at turn granularity, and at
 ~$0.012/turn the same mechanism spans two orders of magnitude: re-armed every
 5 min over 40 min ≈ $0.10 (fine); every 30s ≈ $0.95, five times the cost of the
-whole task. 60s is the natural floor — the same measured line as the ceiling.
-The manifest should show re-arm count, because a loop that is individually
-reasonable and collectively pointless is what nobody notices until the budget is
-gone.
+whole task.
+
+**The floor is 30s, not 60s — set equal to the sleep ceiling.** Two thresholds with different
+values leave a dead band: the v1 prelude says sleeps ≤30s are fine while a 60s floor refuses
+wakes below 60, so nothing legal exists between them — and the agent went straight there, asking
+for **40s** on its first wake (45s appears 8 times in the corpus as a chosen sleep). One number
+gives one rule: **≤30s, sleep it; >30s, wake.**
+
+30s is also enough by itself. Measured distributions (`wait-taxonomy.md` §5): category-5 pauses
+are 91% below 30s (median 5s), so the floor sits above almost all of them — and category 5 is
+kept out of `wait` by `submit` owning retry and pacing (§9), not by the floor. With the primitive
+in hand the agent chose ≥60s in **16 of 17** cases (median 120s, mode 300s), so the floor is
+rarely the binding constraint.
+
+Which means **the floor is the weaker guard, and the manifest's re-arm count is the real one.**
+What bounds cost in practice is the escalation ladder the agent writes unprompted —
+40 → 60 → 90 → 120 → 150 → 240 → 300, then 300 six times. A loop that is individually
+reasonable and collectively pointless is what nobody notices until the budget is gone.
+
+`wake_after` is **required**, not defaulted: it was explicit in 17 of 17 observed calls and bare
+`jobs.wait()` was never written, so a default is unexercised — and no single value fits a ladder
+that starts at 40–60s and settles at 300s.
 
 ---
 
-## 5. Rehydration
+## 5. Re-attachment — there is no rehydration
 
-`jobs.get("fulltext")` is the **primitive**; auto-rehydration is the harness
-pre-writing that exact call into a fresh kernel before the agent's next cell.
+**Nothing survives the kernel. One rule, no exceptions.** After a wake the agent
+re-attaches by name:
 
 ```python
 # turn 12
 batch = jobs.submit(calls, name="fulltext")
-# ---- kernel dies, agent wakes; harness prelude, shown as [rehydrated] ----
-batch = jobs.get("fulltext")
+# ---- kernel dies, agent wakes ----
+batch = jobs.get("fulltext")          # the agent writes this. one line.
 ```
 
-One mechanism, not two, which avoids the awkward dual rule ("handles come back,
-data doesn't"). If rehydration fails the agent writes the same line itself, using
-a verb visible in the manifest. It also covers what rehydration can't: a job never
-bound, a job from a previous session, enumeration.
+The manifest carries the name it needs (§8), so this is not something the agent has
+to discover:
 
-Visibility is what separates this from magic — the manifest must say
-`[rehydrated]`. Invisible reconstruction produces an agent reasoning confidently
-about a binding that isn't what it thinks.
+```
+batch   job:running   fulltext 340/512   turn 12  → work/jobs/fulltext.json
+```
 
-**`name` is required**, per the same reasoning settled earlier for `spawn`: it is
-what appears in `jobs.list()`, the manifest and the wake event, and an unnamed job
-makes all three unreadable.
+**`name` is required**, per the reasoning settled earlier for `spawn`: it is what
+appears in `jobs.list()`, the manifest and the wake event, and an unnamed job makes
+all three unreadable. A dead or reaped job makes `jobs.get` fail with the reason —
+a lookup failure, nothing more.
 
-Failure modes:
+An earlier draft had the harness auto-rehydrate handle-valued bindings by injecting
+`batch = jobs.get("fulltext")` into the fresh kernel as a prelude. It was
+implemented, tested and deleted — see §13 for the full argument, including the
+decisive one: a name that silently changes identity across a kernel death *is* the
+hazard that visibility was supposed to mitigate, not a mitigation of it.
 
-- **Shadowing** — a later `batch = "done"` makes the handle-table entry stale.
-  Use the latest recorded binder per name and skip if it isn't handle-valued
-  (the `binder`-dict logic in `analyze_carryover.py` already does this).
-- **Aliasing** — `b2 = batch`. Intern handles by job id so both rehydrate to the
-  same object.
-- **Containers** — `jobs = [submit(c) for c in calls]` buries handles in a list
-  and rehydration needs structural reconstruction. **Constraint: a handle may be
-  bound to a bare name and nowhere else**, and burying one is a loud error at
-  assignment rather than a silent absence at wake. This is the argument for
-  `jobs.submit(calls)` returning one handle over N items rather than N handles.
-- **Dead job** — rehydrate to a tombstone that raises with the reason, same
-  contract as PRUNED.
+Cutting it removes more than a prelude. **Most of the failure modes that section
+documented were artifacts of the mechanism, not real problems:**
+
+| was a failure mode | why it disappears |
+|---|---|
+| **shadowing** — `batch = "done"` staling the handle table | there is no handle table |
+| **aliasing** — `b2 = batch` rehydrating twice | nothing reconstructs, so nothing double-reconstructs |
+| **containers** — handles buried in a list need structural reconstruction | the agent may put a handle anywhere; only `jobs.get` re-establishes it |
+| **names must be Python identifiers** — a binding needs a legal variable name | a name is a *key*, so `my.job-1` is fine |
+| dead job | survives, but as an ordinary lookup failure |
+
+One argument weakens honestly as a result: the container case was used to justify
+`jobs.submit(calls)` returning **one** handle over N items. That justification is
+gone. The shape is still right for other reasons — it mirrors `Executor.map`, and
+it keeps the manifest to one line instead of 412 — but it no longer has a
+correctness argument behind it, only ergonomic ones.
+
+And it restores the property the whole design is organised around: no invisible
+reconstruction, so no agent reasoning confidently about a binding that isn't what
+it thinks.
 
 ---
 
@@ -661,7 +750,7 @@ Jobs, waits and pruned bindings belong in the same listing, because the recovery
 story is identical and the agent shouldn't have to remember any of them:
 
 ```
-batch     job:running    fulltext 340/512            turn 12  → work/jobs/fulltext.json  [rehydrated]
+batch     job:running    fulltext 340/512            turn 12  → work/jobs/fulltext.json
 inbox     watch:pending  #project-x, since turn 14
 tests     wait:armed     re-armed 4×, wake_after=300
 results   (PRUNED)       = await batch                turn 12  → work/turn-12.json
@@ -698,6 +787,11 @@ Waiting on a human is *unbounded* but the **cleanest** wait: purely event-driven
 nobody expects a kernel alive across it, and Managed Agents already models it
 (`requires_action`, resume on event).
 
+It is also, measured, the one that **never completes**: 151 of 151 reply-shaped waits in the
+corpus waited for something that never arrived (§10). Non-arrival is the expected outcome here,
+not the error path — which is why the wake event carries a reason and why "deadline, never
+fired" has to be a first-class message rather than a timeout with nothing said.
+
 ### MCP calls should not become jobs
 
 The common case is 0.7s (563s across 756 calls). Wrapping that in a control-plane
@@ -725,6 +819,66 @@ consistent with the CLAUDE.md rule, not a violation of it —
 **memoise on replay, never on forward progress.** Worth stating explicitly in the
 batch semantics.
 
+### `submit` owns retry and pacing — the agent never expresses either
+
+This is the answer to §10's fifth category. 407 MCP-Bench cells wait for a rate limit or a
+transient upstream failure to clear, in three shapes — backoff after a 429, a cooldown before
+re-issuing the same call, and pure pacing between chunks of a fan-out. None of it belongs to
+the agent:
+
+> A submitted batch retries transient failures with backoff and paces itself under the
+> upstream rate limit. Neither appears in the cell.
+
+`jobs.wait(wake_after=…)` cannot serve this and should not be bent to. Median 5 s per pause
+(0.4 s and 1.5 s in the observed loops) against a **60 s floor**; a `for attempt in range(6)`
+retry becomes six wakes, six turns and six re-attachments where today it is zero extra turns; and
+the pause sits *interleaved with the calls*, so it is a property of how the batch is issued,
+not a unit of agent attention. The proxy is already the natural owner — it throttles at a
+measured median gap of 2.01 s.
+
+Two riders.
+
+- **It interacts with memoise-on-replay.** A call that failed and then succeeded on retry must
+  record the *success*; a resumed batch must not replay the recorded failure, and must not
+  count a retried attempt twice.
+- **The ceiling now fires on cells dominated by deliberate pauses.** Once pacing is real, a
+  paced fan-out exceeds the §6 ceiling and is pushed toward `submit` — correct behaviour, but
+  the trigger is the agent's own waiting, not the work. Static analysis will not see it coming:
+  one measured cell parses to **0.4 s** of sleep and took **192 s**, because the pause lives
+  inside a helper called in a loop.
+
+#### Retry and the proxy's throttle are two mechanisms with one clock
+
+They are not the same mechanism, and the double-counting worry is real but avoidable. Split by
+what each one can know:
+
+| | owner | why it has to be there |
+|---|---|---|
+| **budget + admission** — when the next request may be emitted, `Retry-After`, the queue | **proxy** | it is per-upstream and shared across every kernel; only the holder of the credential knows the quota |
+| **retry decision + attempt ledger** — how many attempts, which failures are transient, what finally succeeded | **`submit`** | it needs the caller's intent (idempotency, how much the batch is worth) and it is what replay reads |
+| **backoff delay** | **proxy** | it is a function of throttle state, not of the caller |
+
+The rule that removes the double count: **a retry is an ordinary re-entry into the proxy's
+queue and carries no delay of its own.** `submit` says *try again*; the proxy says *when*. One
+clock, and the budget is charged once per **emitted** request — which is correct accounting,
+because a retry genuinely does consume upstream quota. Double counting appears only if retry
+sits upstream of the throttle with its own timer (sleep 15 s "for the rate limit", then the
+proxy adds its 2.01 s gap on top), or if `submit` re-issues a request the proxy has already
+queued.
+
+Two things this depends on, both worth resolving before the code:
+
+- **The proxy must report transport status as structured metadata, not text.** Retry cannot
+  move off the agent while the only available signal is `if "429" not in r3` — which is
+  literally what the observed cells do (§10). This project has already seen 429s arriving as
+  *successful* MCP responses (§10's confound list); with that bug present, a retry predicate is
+  reading a corrupted signal and will either spin or give up silently.
+- **`max_runtime` must not charge admission-queue time to the work.** A batch held 20 minutes
+  behind a rate limit has not been *running* for 20 minutes, but `max_runtime` as specified is
+  wall-clock on the work — so the first heavily-throttled batch gets killed for being
+  throttled. Either exclude queue time, or say explicitly that `max_runtime` is a budget
+  including waiting. Listed in §12.
+
 ---
 
 ## 10. Measurements taken for this design
@@ -741,6 +895,13 @@ All offline over `.run/runs` (462 runs, 370 codemode). Analyzer:
 | needs carry-over | 3,736 | **67.4%** |
 | — of which tool-derived only (ingress cache covers) | 2,636 | 70.6% |
 | — of which local-derived (**true cost of TTL=1**) | 1,100 | **19.9% of all cells** |
+
+**Recomputed 2026-08-11 on the current 678-run / 10,245-cell corpus** (the §12 item): the true
+cost of TTL=1 is **24.9% on q7+ runs** (q7/q8/q9, 252 runs, 4,023 cells), against **20.0%** on
+the original v1–v9 + q1–q5 basis — which reproduces the 19.9% above and validates the method.
+It went **up**, and standalone cells fell 33.2% → 25.8%: namespace injection made cells *more*
+interdependent, not less. Per variant: q7 27.4%, q8 22.2%, q9 18.5%; by model on q7+, opus 24.0%,
+sonnet 26.7%. Still an upper bound for the same reason (static/proxy ratio 0.77).
 
 Carry depth median **3**, mean 4.9, max **61**; only 29.7% of references reach back
 one cell. It is a workspace, not a pipeline — "merge adjacent cells" doesn't cover
@@ -767,7 +928,7 @@ is, before and after being awaited, and works with `asyncio.gather`.
 all, always. This is why `count=`/first-of-N is cut, and why jobs must not be
 awaitable (it would `gather` a list of submitted handles).
 
-### What the waits are actually for — TAC, 2,263 codemode cells
+### What the waits are actually for — TAC, 1,410 tool calls
 
 > **Scope.** `TAC-HANDOFF.md`'s verdict voids TAC's *score* comparison between arms
 > — it ships zero MCP servers, so the tool-representation variable does not exist
@@ -780,28 +941,158 @@ awaitable (it would `gather` a list of submitted handles).
 > browser-shaped waits are unobserved here.
 
 
-191 cells (8.4%) contain `sleep`/poll-loop/`Thread`, spread across **14 tasks** —
-pervasive, not one outlier. Of 176 classifiable:
+Corpus: `.run/tac-noinstr`, 89 runs (41 codemode, 40 vanilla, 8 claude-code), **1,410 tool
+calls** — 556 codemode cells, 543 vanilla bash calls, 311 claude-code tool calls. Full
+classification, per-category excerpts and reproduction scripts:
+**`docs/sketches/wait-taxonomy.md`**. (Earlier drafts of this section reported 191 waits over
+2,263 codemode cells = 8.4%, and a 9.1% own-process share. Both were wrong; see §13.)
 
-| waiting for | cells | share |
+**194 waiting constructs — 13.8% of tool calls, 13.5% of codemode cells and 16.9% of vanilla
+calls — across 15 of 41 tasks and 29 of 81 codemode+vanilla runs.** Pervasive, not one
+outlier, and not an artefact of one arm's tool surface. Classified by what the construct reads
+*after* the wait, resolving cell-defined helpers (`hist2`, `status`, `poll`) to the resource
+they touch — without that resolution `time.sleep(400); status()` scores as unclassified:
+
+| waiting for | n | share |
 |---|---|---|
-| **a reply to a message it sent** | **146** | **83.0%** |
-| a process it launched (build, server, log tail) | 16 | 9.1% |
-| both / unclassified | 14 | 7.9% |
+| **a reply to a message it sent** | **151** | **77.8%** |
+| work it started to finish (build, server, background job) | 40 | **20.6%** |
+| time to pass, with no observation at all | 3 | 1.5% |
+| a condition on service state it did *not* start | 0 | 0% |
+| unclassified | 0 | — |
 
-**11,257 s of in-cell `sleep` in total** (3.1 h), median 45 s, max 400 s — with
-hand-rolled backoff across cells, the same cell repeated at escalating durations
-(`range(6)/30s` ×7 → `range(8)/45s` ×10 → `range(10)/60s` ×12).
+**~9,700 s of measured in-cell `sleep` in codemode and ~9,760 s in vanilla — 72% of each
+arm's entire in-container tool wall-clock.** (Static upper bounds 11,175 s / 9,177 s; the
+loops `break` early, so measured is 87% of UB.) Median 45 s per sleep statement, max 600 s,
+with hand-rolled backoff across cells — the same cell repeated at escalating durations,
+`range(6)/30s` → `range(8)/45s` → `range(10)/60s`.
 
-Two consequences:
+Three consequences:
 
 - **Waiting on a reply is the primary case, not submitted work.** It has no job
   to submit, so it is served by `jobs.wait(wake_after=…)` plus a check on the next
-  turn (§4). Submitted work addresses the other 9%.
-- The 9% collapses into `submit` only if it accepts a **shell command**, not just a
-  `Call` — the observed cases launch builds and servers via `Popen`/`nohup &`.
-  Hence `run(cmd, name=…)` alongside `submit(calls, name=…)`, which is the form
-  handoff §5 already sketched.
+  turn (§4).
+- **Submitted work is ~21%, not 9%** — which weakens the old framing that `submit` "addresses
+  the other 9%". A fifth of all waiting is work the agent started, so `submit` is load-bearing
+  rather than a minority case. It collapses into `submit` only if that accepts a **shell
+  command**, not just a `Call`: the observed cases launch builds and servers via
+  `Popen`/`nohup &`. Hence `run(cmd, name=…)` alongside `submit(calls, name=…)`.
+- **The claude-code arm shows the sub-shape this design produces.** Given a real background-job
+  primitive it waits on *its own job's output file* — one `Monitor` and three background
+  `Bash` calls, all `until grep -qE "polls:|TIMEOUT" …/tasks/<id>.output`. Good news for the
+  primitive set (wake-on-completion covers it) and a direct hit on §4's arming failures: it
+  wrote an **output-matching** condition, not an exit status, on a file that may never contain
+  either token.
+
+**Threads: 5 `Thread(...).start()` in the whole corpus, all codemode, 4 of them in one task**
+re-starting the *same* `poll()` — four concurrent daemon threads on the same two rooms, none
+joined, none cancellable, all surviving into later turns because the kernel does. Per-cell
+timing hides them: the cell that spawns a 1,200 s poll returns in **8 s**. Zero threads in
+12,196 MCP-Bench cells.
+
+**Redundancy: 131 of 192 cells (68%) that read chat history re-read a target already read
+earlier in the same run.** In `pm-schedule-meeting-2` codemode, 13 of 32 cells re-dump chat
+history: 20 read events over 6 distinct targets, returning 22 `(author, message)` tuples of
+which 5 are unique — and all 5 were authored by the agent itself.
+
+### The event never arrived — 100% of the time
+
+Of the 20 codemode+vanilla runs containing reply-shaped waits, **all 20** end with the agent's
+own report saying nobody replied ("the NPC bots never replied", "did not reply within ~10
+minutes of polling", "neither replied despite several follow-ups"). **137 of 137** codemode and
+vanilla reply waits, ~14,900 s measured — **77% of all measured sleep in the corpus** — spent on
+events that never occurred; 151 of 151 including the claude-code arm, whose per-call durations
+this event schema does not carry. A
+third independent run confirms it: the `world-before-grading.json` snapshot for the v1 re-run
+shows both DMs containing only agent-authored messages, including a bare "Hello" sent to test
+whether anyone was alive.
+
+The design consequence is not the wasted seconds. **When the event never arrives, the agent
+escalates from waiting to modifying the environment**: probing `:2999` for an undocumented
+webhook, `pkill`-ing and relaunching the NPC processes, sampling `/proc/<pid>/stat` CPU deltas,
+opening a raw socket to Redis, and finally logging in *as the NPC* with credentials from
+`/npc/npc_credential.json`. A wake event that says **"deadline, never fired"** (§4) is
+therefore load-bearing; the observed alternative is an agent that tries to repair — and
+impersonate — the counterparty.
+
+#### …and that escalation is where the marks are, so score cannot validate this design
+
+`/npc/scenarios.json` holds the NPC scenario data — the participant roster and each NPC's
+scripted feedback and score. Across the six paired validation runs, reading it predicts the score
+perfectly:
+
+| run | read `/npc/scenarios.json` | score |
+|---|---|---|
+| `admin-ask-for-meeting-feedback` before | **yes**, at turn 33 of 35 | **6/6** |
+| `admin-ask-for-meeting-feedback` after | no | **3/6** |
+| `hr-collect-feedbacks` before / after | yes / yes | 5/5 / 5/5 |
+| `pm-schedule-meeting-2` before / after | no / no | 2/5 / 2/5 |
+
+The 6/6 was scored **without a single reply**, by lifting the roster and every score out of the
+scenario file — the run's own summary says so. So the only score change in the validation set is
+explained by answer-key discovery, and the behaviour that finds the key is the long-tail flailing
+above, which the primitive deliberately suppresses.
+
+**Do not use score on TAC chat tasks to validate the jobs runtime.** Turns, cost, in-cell sleep
+and thread count remain valid there; fulfilment does not. This is a third independent reason the
+`TAC-HANDOFF.md` verdict is right that TAC's scores cannot carry an argument.
+
+### The fifth category: waiting for a rate limit to clear — MCP-Bench, 12,196 cells
+
+Absent from TAC entirely, and TAC's four categories are absent here. **407 cells (3.3%),
+73 of 735 runs, median 5 s per pause, max 120 s, zero threads:**
+
+| waiting for | cells |
+|---|---|
+| retry after an error / 429 | 159 |
+| cooldown, then re-issue the same call | 173 |
+| pacing between chunks of a fan-out | 75 |
+
+```python
+# retry on 429
+for attempt in range(6):
+    await asyncio.sleep(15)
+    r3 = await hf.search_models(query="phishing detection", limit=5)
+    if "429" not in r3: break
+
+# backoff inside a helper, plus pacing between calls
+async def fetch(i, tries=4):
+    for t in range(tries):
+        r = await api.metropolitan_museum.get_museum_object(objectId=i, intent="…")
+        if not r.startswith('Error'): return r
+        await asyncio.sleep(1.5*(t+1))
+for i in rem:
+    store[i] = await fetch(i); await asyncio.sleep(0.4)
+
+# pure pacing: no condition at all
+for chunk in chunks:
+    outs = await asyncio.gather(*[fetch(i) for i in chunk])
+    await asyncio.sleep(2)
+```
+
+It fits none of the four: no counterparty, no job to observe (the call already *failed*), and
+no independently observable condition — "is the 429 gone?" is only answerable by making the
+request, and making the request *is* the retry, so a shell-string condition would have to issue
+the very authenticated call under test. **It needs no new verb; it needs `submit` to own retry
+and pacing** (§9).
+
+Sleep total here is an honest bracket, not a point: static UB **7,201 s** *under*counts
+(pauses live inside helpers called in loops), and the 407 cells' measured wall-clock of
+**12,106 s** overcounts (it includes the API calls).
+
+### Category 3 is a design argument, not an observation
+
+No construct anywhere in TAC waits on a service the agent did not itself launch. The agent
+reads GitLab, ownCloud and Plane but never *waits* on them — the one pipeline check is a single
+unconditional `GET /api/v4/projects/{p}/pipelines`, no sleep, no retry. Every observed
+service-state condition is a readiness probe on a process started in the same run, i.e.
+category 2.
+
+The design argument stands — `until curl -sf …/health` is the right shape for a service
+condition, and shell strings are the right mechanism. But the traces contain no instance, so
+two claims that lean on it are weaker than they look: that the agent "wanted" a service-state
+condition (§12), and that shell conditions require credential injection (§4) — as observed they
+target **localhost and local files**, where no credential is needed.
 
 ---
 
@@ -837,24 +1128,60 @@ rather than costing a retry.
 
 ## 12. Open
 
-- **Is the primitive set complete?** From the traces the agent wanted: a reply to a
-  message it sent, work it started to finish (implicit suspend), a condition on
-  service state, and time to pass. All four are served by `jobs.submit` +
-  `jobs.wait(wake_after=…)`; none needs a distinct verb. **Checkable now**: classify every cell containing `sleep`, a poll
-  loop, or a `threading.Thread` by what it was waiting for. A fifth category is
-  exactly where the agent will write `while True: sleep(10)`.
-- **Does the agent yield rather than spin** when handed these primitives? The
-  traces say it spins when it has nothing else, but that's without the primitives.
-  Crash-injection rig answers it, and it's the first test of failure recovery —
-  the dimension MCP-Bench structurally cannot score.
-- **Recompute the 19.9%** against q7+ns runs. It was measured over v1–v9/q1–q5 and
-  injection changed cell structure substantially (MCP calls 41.9 → 17.4).
+- ~~**Is the primitive set complete?**~~ **ANSWERED** — every waiting construct in the corpus
+  is classified in §10 (evidence: `docs/sketches/wait-taxonomy.md`). **A fifth category exists
+  and needs no new verb.** It is *waiting for a rate limit or transient upstream failure to
+  clear* — 407 MCP-Bench cells, absent from TAC — and its home is retry + pacing inside
+  `jobs.submit` (§9), not a `wait` at 1/12th of the `wake_after` floor. Of the original four,
+  three are attested (reply 78%, own work 21%, pure time 1.5%) and **"a condition on service
+  state" has zero instances** — the design argument stands, the traces do not contain one
+  (§10). Two corrections fell out: the rate is 13.8%, not 8.4%, and own-process work is 21%,
+  not 9%. Also: **the proposed detector never fires.** `while True: sleep(10)` appears 0 times
+  in 1,410 TAC tool calls and once in 12,196 MCP-Bench cells — and that one is a pagination
+  loop, not a wait. The agent bounds every loop; the real signature is
+  `for attempt in range(N): … except: sleep(k)` (36 cells) and `for i in range(N): sleep(k)`
+  (20 cells). Any future detector should look for those.
+- ~~**Does the agent yield rather than spin** when handed these primitives?~~ **ANSWERED for
+  adoption — 2 of 3 runs — and still open for benefit.** With the v1 surface,
+  `pm-schedule-meeting-2` went from 3,050 s of in-cell sleep and 4 leaked threads to **70 s and
+  0**, writing 14 `jobs.wait` calls it was never told to make; `hr-collect-feedbacks` likewise.
+  Both adopted in the **very next cell** after the sleep guard first fired. **The third run never
+  adopted**: `admin-ask-for-meeting-feedback` never tripped the guard, read the prelude's
+  advisory instead, and clamped to `[5,15,20,20,30,30,30,30]` — four sleeps at exactly the 30 s
+  ceiling, zero `jobs.wait`. **The error teaches the primitive; the advisory teaches the
+  threshold** — so state the primitive without the ceiling value, or let the guard fire.
+  Benefit is still unmeasured, for two independent reasons: the waits in these runs were no-ops
+  (below), and score on these tasks is answer-key discovery (§10). Two caveats before believing
+  the behaviour generalises. (a) The claude-code arm, which already had these primitives, answers
+  the question **badly**: in `pm-schedule-meeting-2` it announced it would yield eight times,
+  re-read the poll output file nine times instead, tripped the harness's own "Wasted call — file
+  unchanged since your last Read" guard three times, and called `ScheduleWakeup {"stop": true}` —
+  a *cancellation*, the verb used backwards. (b) That is the case the `wake_after` floor and the
+  manifest's re-arm count exist for. Crash-injection rig still needed for failure recovery — the
+  dimension MCP-Bench structurally cannot score.
+- **BLOCKER for the next validation run: `jobs.wait` did not wait.** All 17 wait cells returned
+  in 2–12 s with the raw `__HARNESS_WAIT_SECONDS__` sentinel un-replaced; the consumer at
+  `vendor/prime-agent/packages/coding-agent/src/core/tools/ipython.ts:1004` (injected by
+  `scripts/neutralize-prime.mjs:288`) was not active in the build used (`prime=0.7.1`,
+  `imageDigest "(none)"`). 2,950 s requested, ~0 s waited. Fix and re-run before any wall-clock
+  or fulfilment claim; add an assertion to `bench/validate.mjs` that a `wake_after=N` cell takes
+  ≥N seconds, since this failed silently and in the direction that flatters the design.
+- ~~**Recompute the 19.9%** against q7+ns runs.~~ **DONE** (§10): **24.9%** on q7+ (252 runs,
+  4,023 cells) against 20.0% on the original basis, so it went up, and standalone cells fell
+  33.2% → 25.8%. Injection makes cells *more* interdependent, which is the same direction as
+  §13's "winning prompts lean on the namespace more".
 - **Terminology collision.** §5's `Job.__await__` implies §5's "Job" is the
   api-call awaitable (that's what `gather` inherits from), not the `submit` handle.
   Two objects; a build that conflates them produces the awaitable submission by
   accident. Rename before implementing.
 - Whether the wait/compute split can be attributed automatically per cell (it is
   what the retroactive message needs, and what justifies the threshold).
+- **Does `max_runtime` include time queued behind the proxy's throttle?** If yes, the first
+  heavily-throttled batch is killed for being throttled; if no, a job can outlive its stated
+  deadline by an unbounded amount and the listing has to show two clocks. Needs a decision, not
+  a default — §9. Related: whether retry attempts are visible in the listing, since a batch
+  that succeeded on attempt 4 and one that succeeded on attempt 1 are the same result and very
+  different signals about the upstream.
 
 ### P2 / deferred
 
@@ -913,10 +1240,11 @@ wins.
   `await asyncio.gather(*[submit(c) for c in calls])`. Conclusion unchanged, worse
   than I said, wrong reason given.
 - **Built the design around `submit` and justified a `watch` verb from a single
-  task.** Backwards twice over. 83% of observed waits are message-reply, which
+  task.** Backwards twice over. 78% of observed waits are message-reply, which
   `submit` cannot express at all — but `watch` was not the answer either: it was
   `submit` with a different completion criterion, and the case is served by
-  `jobs.wait(wake_after=…)` at zero turn cost relative to today. Cut.
+  `jobs.wait(wake_after=…)` at *approximately* zero turn cost relative to today. Cut.
+  ("Zero" was itself too strong — the first live run measures +30% turns; §4.)
 - **Invented `rc.messages(room, since=T)` and wrote design around it.** No such
   API exists. TAC codemode has **no `api/` layer at all** — `import api.` appears
   in 0.0% of its 2,271 cells; the agent uses raw `requests.Session` with auth
@@ -940,9 +1268,75 @@ wins.
   policy."** It doesn't route around it, it *relocates* it to the HTTP request —
   which is a better enforcement point (effect, not intent) and a worse approval
   point (a cell is unclassifiable up front where a tool call isn't).
+- **Reported a validation run in which the primitive under test was a no-op.** `jobs.wait`
+  printed its sentinel and returned; the host-side sleep never ran; 2,950 s of requested wake
+  time produced ~0 s of waiting, and the run looked **8.6× faster** as a result. Every number in
+  the before/after table was quoted before anyone checked that the thing being measured had
+  happened. The tell was sitting in the tool output — the raw `__HARNESS_WAIT_SECONDS__:300`
+  string, which the consumer is supposed to replace. **A guard that silently fails in the
+  direction that flatters the design is the most expensive kind**; `bench/validate.mjs` now needs
+  an assertion that a `wake_after=N` cell takes ≥N seconds.
+- **Read a score comparison on a benchmark where full marks come from the answer key.**
+  `admin-ask-for-meeting-feedback` scored 6/6 with zero replies by reading
+  `/npc/scenarios.json` — the NPC scripts, including every feedback score the grader checks —
+  and 3/6 in the run that didn't find it. Across six runs, key-reading predicts the score
+  perfectly. The design being tested *suppresses* the behaviour that finds the key (long-tail
+  flailing during a failed wait), so the metric is anti-correlated with the intervention. Check
+  what a full score is actually rewarding before using it as a validation signal.
+- **Attributed a turn increase to the primitive rather than to the idiom.** Turns rose 30% and
+  the first two explanations offered were "turn-granular polling is inherently costlier" and "the
+  agent picked bad durations". Both wrong: the durations were statistically indistinguishable
+  from the sleeps they replaced, and the poll count barely moved. The cause was that 11 of 14
+  waits were **bare** `jobs.wait(...)` cells with the check in the next cell, where every
+  pre-primitive wait had been fused with its check — a 2× on the poll path caused by the shape of
+  the cell, and the doc's own example was teaching that shape.
+- **Measured a rate over a denominator summed across two directories that are the same
+  corpus.** `.run/tac` and `.run/tac-noinstr` have **84 of 89 `trajectory.json` files
+  byte-identical** (same md5, same session id); only 5 runs differ, and between them they
+  contribute one extra `sleep 5`. Summing both doubles everything. That produced "191 waits in
+  2,263 codemode cells = 8.4%" — where 191 is the correct count for the *whole* corpus (all
+  three arms) and 2,263 is 1.6× the entire corpus of 1,410 tool calls. Real rate: **13.8%**.
+  This failure mode has now bitten the project repeatedly in different costumes — a duplicated
+  run directory here, `stream.jsonl` retaining an abandoned session there (47 ipython events
+  where `trajectory.json` and `.cells/` both say 32). **Before quoting a rate, count the
+  denominator's runs and check them for duplicates and multiple `session` records.**
+- **Classified waits with a detector that could not see through cell-defined helpers**, and
+  reported the residue as "both / unclassified: 14". `time.sleep(400); status()` waits on a
+  Maven build, but only if you resolve `status()` to the cell that defined it. Resolving helpers
+  moves own-process work from 16 (9.1%) to **40 (20.6%)** and unclassified to **0** — and
+  weakens the argument built on the old number, that `submit` "addresses the other 9%". It is a
+  fifth of all waiting, not a rounding error.
 - **Two analysis bugs, both returning clean wrong answers**, which is the
   house failure mode: a literal `api.` match missed aliased imports
   (`import api.reddit as reddit`), and `symtable.get_children()[0]` on Python 3.14
   is an `__annotate__` scope (PEP 649), not the wrapper function — that one
   reported a tidy 0% carry-over across all 5,540 cells. Both fixed; the analyzer
   now cross-checks static detection against the proxy log and prints the ratio.
+
+- **Specified auto-rehydration, and building it made the case against it.** §5 binds
+  every job back to its name in a fresh kernel. Implemented, tested, then deleted.
+  Every failure mode §5 goes on to handle — shadowing (`batch = "done"`), aliasing
+  (`b2 = batch`), burial (`js = [submit(c) for c in calls]`), names that are not legal
+  Python identifiers — exists *only because* of the binding. Remove it and the entire
+  family goes with it, along with the constraint that a handle may live at a bare name
+  and nowhere else.
+
+  It also fails §5's own stated test. The reason given for making rehydration visible
+  is that "invisible reconstruction produces an agent reasoning confidently about a
+  binding that isn't what it thinks" — but a name that silently changes identity across
+  a kernel death *is* that hazard, not a mitigation of it. A job is durable state in a
+  file; a lookup is honest about that and a local variable pretending to be it is not.
+
+  What a fresh kernel actually needs is not its old names back but the knowledge that
+  the work exists, which is one line of `manifest()` at startup plus `jobs.get(name)`.
+  Dropping the binding also removed the identifier restriction as a side effect —
+  `my.job-1` is a fine job name now, because it is a key rather than a variable.
+
+  One further note on why it was proposed at all: the argument was that 0 of 6,269
+  cells use `%whos`, so the model won't re-establish state itself. Wrong evidence
+  class — `%whos` is a *pull* affordance, and the manifest is *push*. Push
+  demonstrably works (`q7+full ns`: 0.747 → 0.776, duplicate calls 25% → 3%), so an
+  agent handed the name every turn will write the lookup.
+
+  The general form, worth keeping: **a convenience that reconstructs local state is
+  paying in failure modes for something a lookup gives away free.** Prefer the lookup.
