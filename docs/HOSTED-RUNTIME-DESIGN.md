@@ -284,10 +284,11 @@ command string), **log** (a wait that made 600 requests must not be invisible), 
 **throttle** (a `sleep 2` loop against a rate-limited service is exactly the DEX
 Paprika shape).
 
-And the enforcement level changes. `HTTP_PROXY` env vars were adequate for a
-*fairness* control and were already noted as soft — raw sockets evade them. A
-hosted runtime needs network-namespace level redirect, because the premise is that
-credentials never enter the sandbox and the agent *cannot* route around.
+On enforcement level: `HTTP_PROXY` env vars are a *cooperative* control — raw
+sockets evade them — which was adequate for the fairness use. For a hosted runtime
+the answer is **not** primarily network-namespace redirect; it is credential
+injection. See "The permission boundary moves" below: if the agent holds no token,
+bypassing the proxy yields a 401 rather than freedom.
 
 This corrects a claim made earlier in this design: dropping `until="changed"` does
 **not** remove the credential dependency, it moves it from a control-plane
@@ -302,6 +303,107 @@ Worth writing down as a chain, because all three links are already-observed bugs
 unproxied poll loop → trips the rate limit → 429s (which this project already saw
 arriving as *successful* MCP responses) → the condition never becomes true →
 **silence**, which reads as "still waiting."
+
+One design note for whatever proxy is used: **every poll-condition URL must be
+covered by a static rule.** A policy engine that falls back to an LLM judge on
+unmatched requests turns `until curl -sf …; do sleep 2; done` into one judge call
+per iteration, and the "polling is turn-cost-free" property above quietly acquires
+a per-poll model bill.
+
+### The permission boundary moves — it isn't bypassed
+
+The early prediction was that code-mode would *route around* guardrails encoded at
+tool boundaries. That framing is wrong. The guardrail **relocates**, from the tool
+call to the HTTP request, and the consequences run both ways.
+
+In tool-calling the permission unit is a named, schema'd event. In codemode there
+is one tool whose argument is a program, so there is nothing to approve at that
+layer.
+
+**Better than expected:** a tool schema is a *claim* about what a tool does; the
+request is what it did. Approving `send_message(channel, text)` requires trusting
+the implementation; approving `POST /api/v1/chat.postMessage` with the real body
+inspects the effect. Enforcement moves from the point of intent to the point of
+effect.
+
+**Worse, and structurally so:** a cell makes tens of requests, so per-request
+prompting is unusable — and the cell cannot be classified up front either.
+`for u in urls: post(u, payload)` is unclassifiable without knowing `urls`. So
+**cell-level static classification is undecidable in a way tool-call
+classification is not**, which is a genuine regression against a bash-command
+auto-mode classifier. The consequence: pre-execution approval does not work for
+codemode, and the check has to be **in-flight, at the proxy, on concrete values.**
+The proxy is where the check *can* live, not merely where it is convenient.
+
+Two properties of that arrangement are unexpectedly good:
+
+- **Denial-as-403 is in-distribution.** `403 {"error": "policy: no external hosts"}`
+  is something the model has seen endlessly and already handles. A tool-call denial
+  is a bespoke harness message it has to be taught. The mid-cell partial-execution
+  problem is real (request 23 of 40 blocked, earlier side effects committed), but
+  the *handling* is well-trodden.
+- **Human approval inverts usefully.** You cannot hold an in-flight request while
+  someone deliberates. So: deny with "requires approval" → the agent surfaces it →
+  the human approves the **policy** → the agent retries. Approval mutates a rule
+  rather than authorising one call.
+
+#### Credential injection is what makes the proxy non-optional
+
+Bypass the proxy with a raw socket and you get an *unauthenticated* request. The
+agent can still reach the network; it just cannot reach anything useful, because it
+holds no tokens. Enforcement comes from **not possessing the credential**, not from
+fencing the network — which is stronger than a fence, and corrects the
+netns-redirect claim made earlier in this section.
+
+Two threats, two mechanisms, not to be conflated:
+
+| threat | mechanism | bypass yields |
+|---|---|---|
+| unauthorised **action** (post as me, delete the repo) | credential injection | 401 |
+| **exfiltration** of data already in hand | egress control / host allowlist | nothing — no credential needed to POST to attacker.com |
+
+Credential injection closes the first completely. The second still needs the fence,
+which is what SSRF blocking and host allowlisting are for.
+
+Prime already had the right pattern for MCP: tokens in a host-side `auth.json`,
+refresh via `rlm.host_request`, interactive login host-side, the model never sees a
+secret. The proxy generalises it from MCP to arbitrary HTTP. **TAC does the
+opposite and it is a live gap** — the agent logs in itself and holds
+`X-Auth-Token` in a cell-local `requests.Session` (2.2% of its cells set auth
+headers), so the credential is in the kernel, dies with the kernel, and no policy
+can be enforced on it.
+
+#### Reference point: CrabTrap (brexhq/CrabTrap)
+
+An HTTP/HTTPS MITM proxy in Go that evaluates outbound agent requests against
+policy — static YAML rules (prefix/exact/glob + method) first, an LLM judge only on
+no-match, every decision logged to Postgres, plus SSRF blocking and a policy-builder
+loop that drafts rules from observed traffic. Worth reading as the shape; not
+adoptable as-is.
+
+| our requirement | CrabTrap |
+|---|---|
+| intercept | ✅ MITM, per-host cert from a custom CA |
+| log | ✅ Postgres audit + UI |
+| **inject credentials** | ❌ not addressed — it *sees* `Authorization` in cleartext |
+| throttle | ⚠️ per-IP token bucket (50 rps) — DoS protection, **not** per-upstream |
+| authorisation policy | ✅ and more than we had specified |
+| enforcement | ⚠️ `HTTP_PROXY` env vars only, no transparent/iptables mode |
+
+It also states explicitly that it does not sandbox or execute code — it is the
+network half of the boundary rule (§1), not the boundary.
+
+For the **benchmark** it is probably the wrong tool: the existing proxy already
+logs MCP calls and throttles per-upstream (the thing that mattered for DEX
+Paprika), which CrabTrap doesn't do, and an LLM judge in the request path adds
+variance exactly where a measurement rig doesn't want it.
+
+#### This sharpens the τ-bench experiment
+
+The vague form was "codemode loses on policy compliance." The specific form is a
+two-arm hypothesis: **codemode loses when policy lives only at the tool layer, and
+does not lose when the proxy carries it.** That tells you whether the thesis
+*requires* the proxy to be viable, rather than merely benefiting from it.
 
 ### Jobs are NOT awaitable
 
@@ -800,6 +902,14 @@ wins.
 - **Claimed dropping `until="changed"` removed the credential/proxy dependency.**
   It moves it from a control-plane re-issuer into the shell. Watching an
   authenticated service needs credentials outside the kernel under every design.
+- **Claimed a hosted runtime needs network-namespace redirect** because env-var
+  proxying is evadable. The real enforcement is credential injection: if the agent
+  holds no token, bypassing the proxy yields a 401. The fence is still needed, but
+  for exfiltration, not for authorisation — two threats, two mechanisms (§4).
+- **Framed the guardrail risk as "code-mode routes around tool-boundary
+  policy."** It doesn't route around it, it *relocates* it to the HTTP request —
+  which is a better enforcement point (effect, not intent) and a worse approval
+  point (a cell is unclassifiable up front where a tool call isn't).
 - **Two analysis bugs, both returning clean wrong answers**, which is the
   house failure mode: a literal `api.` match missed aliased imports
   (`import api.reddit as reddit`), and `symtable.get_children()[0]` on Python 3.14
