@@ -182,6 +182,124 @@ sub(
 	"const assignedAt = new Map<string, Provenance>()",
 );
 
+// TheAgentCompany runs the agent against a task container: the workspace, the
+// seeded services and the grader all live inside it, so cells must execute
+// there. prime's own kernel cannot — it speaks ZMQ on ports that do not cross
+// the colima VM boundary — so HARNESS_EXEC_CONTAINER swaps the backend for one
+// driven over `docker exec`. Name, schema and description are untouched, so the
+// model sees the same tool it saw on MCP-Bench.
+// A cell that blocks ends the run. prime's `ipython` tool has no per-cell
+// timeout — grep it for `timeoutMs` and there is nothing — while `bash` exposes
+// one that kills the process tree. That asymmetry decided three runs on
+// TheAgentCompany: every codemode timeout was one wedged cell eating the whole
+// 40-minute budget with ~5% of it spent executing. The causes were an
+// `asyncio.run_until_complete` deadlock inside IPython's own event loop, a binary
+// run under nested emulation, and a slow pip install.
+//
+// The kernel already knows how to interrupt (interrupt_request on the control
+// channel, wired to abort with a force-kill grace period) and an interrupt keeps
+// the namespace. Nothing was triggering it. HARNESS_CELL_TIMEOUT_MS does.
+log("\nper-cell timeout:");
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\ttry {\n\t\t\t\tconst code = applyShellSettingsToBashMagicCell(params.code, options);",
+	"\t\t\t// Bound each cell so one hang cannot consume the run. Abort drives the\n" +
+		"\t\t\t// kernel's own interrupt, so variables and imports survive.\n" +
+		"\t\t\tconst cellTimeoutMs = Number(process.env.HARNESS_CELL_TIMEOUT_MS ?? 0);\n" +
+		"\t\t\tconst cellAbort = new AbortController();\n" +
+		"\t\t\tlet cellTimedOut = false;\n" +
+		"\t\t\tconst forwardAbort = () => cellAbort.abort();\n" +
+		"\t\t\tsignal?.addEventListener(\"abort\", forwardAbort, { once: true });\n" +
+		"\t\t\tconst cellTimer =\n" +
+		"\t\t\t\tcellTimeoutMs > 0\n" +
+		"\t\t\t\t\t? setTimeout(() => {\n" +
+		"\t\t\t\t\t\t\tcellTimedOut = true;\n" +
+		"\t\t\t\t\t\t\tcellAbort.abort();\n" +
+		"\t\t\t\t\t\t}, cellTimeoutMs)\n" +
+		"\t\t\t\t\t: undefined;\n" +
+		"\t\t\ttry {\n\t\t\t\tconst code = applyShellSettingsToBashMagicCell(params.code, options);",
+	"bound each cell with a timeout",
+	"HARNESS_CELL_TIMEOUT_MS",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\t\tsignal,\n\t\t\t\t\t(chunk) => {",
+	"\t\t\t\t\tcellAbort.signal,\n\t\t\t\t\t(chunk) => {",
+	"pass the bounded signal to the kernel",
+	"cellAbort.signal,",
+);
+
+// Telling the model is the whole point. Interrupting a cell silently is worse
+// than letting it hang: in testing the agent reported a `time.sleep(600)` cut off
+// at 45s as having "completed with no output and no errors" and moved on. An
+// agent that believes a truncated computation finished will build on a result it
+// never got.
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\tlet text = r.stdout;",
+	"\t\t\t\tlet text = r.stdout;\n" +
+		"\t\t\t\tif (cellTimedOut) {\n" +
+		"\t\t\t\t\ttext =\n" +
+		"\t\t\t\t\t\t`[this cell was INTERRUPTED after ${Math.round(cellTimeoutMs / 1000)}s and did not finish. ` +\n" +
+		"\t\t\t\t\t\t`Any output below is partial, and whatever it was computing did NOT complete. ` +\n" +
+		"\t\t\t\t\t\t`Variables bound before this cell are still available. Do not assume this ` +\n" +
+		"\t\t\t\t\t\t`worked — either make it faster, bound it yourself, or run it in the ` +\n" +
+		"\t\t\t\t\t\t`background and poll.]\\n\\n${text}`;\n" +
+		"\t\t\t\t}",
+	"tell the model when a cell was interrupted",
+	"this cell was INTERRUPTED after",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t} finally {\n\t\t\t\tif (hasWorkingMessage) {",
+	"\t\t\t\t// Say so explicitly: an interrupted cell otherwise looks like an\n" +
+		"\t\t\t\t// inscrutable empty failure, and the model needs to know the work was\n" +
+		"\t\t\t\t// cut off rather than wrong so it can bound the next attempt.\n" +
+		"\t\t\t} finally {\n" +
+		"\t\t\t\tclearTimeout(cellTimer);\n" +
+		"\t\t\t\tsignal?.removeEventListener(\"abort\", forwardAbort);\n" +
+		"\t\t\t\tif (hasWorkingMessage) {",
+	"clear the cell timer",
+	"clearTimeout(cellTimer);",
+);
+
+log("\ncontainer kernel:");
+
+// Appended *after* the provenance import pair, never between its two lines:
+// that pair is the guard for the patch above, and splitting it makes the guard
+// miss and the whole script fail on the second run.
+sub(
+	"core/tools/ipython.ts",
+	'import { join as pathJoin } from "node:path";',
+	'import { join as pathJoin } from "node:path";\nimport { spawn as nodeSpawn } from "node:child_process";',
+	"spawn import for container kernel",
+	"spawn as nodeSpawn",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"export function createIpythonToolDefinition(",
+	`${patch("container-kernel.ts")}\n\nexport function createIpythonToolDefinition(`,
+	"container-backed ipython tool",
+	"createContainerIpythonToolDefinition",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"\tconst provisioner = options?.provisioner ?? new IpythonKernelProvisioner(cwd, options);",
+	'\tconst execContainer = process.env.HARNESS_EXEC_CONTAINER;\n' +
+		"\tif (execContainer) return createContainerIpythonToolDefinition(execContainer, cwd);\n\n" +
+		"\tconst provisioner = options?.provisioner ?? new IpythonKernelProvisioner(cwd, options);",
+	"route to container kernel when configured",
+	// Deliberately the call site, not the env var name: the env var also appears
+	// in the injected file's doc comment, so guarding on it would report this
+	// patch as already applied and silently skip it.
+	"if (execContainer) return createContainerIpythonToolDefinition",
+);
+
 sub(
 	"core/tools/ipython.ts",
 	"\t\t\t\tconst imageBlocks = imageBlocksFromAttachments(r.attachments);",
