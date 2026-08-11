@@ -367,11 +367,23 @@ which is what SSRF blocking and host allowlisting are for.
 
 Prime already had the right pattern for MCP: tokens in a host-side `auth.json`,
 refresh via `rlm.host_request`, interactive login host-side, the model never sees a
-secret. The proxy generalises it from MCP to arbitrary HTTP. **TAC does the
-opposite and it is a live gap** — the agent logs in itself and holds
-`X-Auth-Token` in a cell-local `requests.Session` (2.2% of its cells set auth
-headers), so the credential is in the kernel, dies with the kernel, and no policy
-can be enforced on it.
+secret. The proxy generalises it from MCP to arbitrary HTTP.
+
+**TAC does the opposite, and it is the strongest empirical case in this document.**
+Per the handoff verdict, measured over its codemode cells:
+
+| | share of cells |
+|---|---|
+| raw `requests` (no api layer at all) | 17.7% |
+| hardcode the service URL | 15.5% |
+| **hardcode credentials in plaintext** | **14.4%** |
+| `import api` / `api.*` | **0.2%** (1 of 555) |
+
+So one cell in seven writes a credential into the code it executes. That is a
+credential in the kernel, in the transcript, in the event log, and in any snapshot
+— dying with the kernel (forcing re-login after restart) and enforceable by
+nothing. It is not a design preference that credentials belong at the proxy; it is
+the observed default failing.
 
 #### Reference point: CrabTrap (brexhq/CrabTrap)
 
@@ -757,6 +769,17 @@ awaitable (it would `gather` a list of submitted handles).
 
 ### What the waits are actually for — TAC, 2,263 codemode cells
 
+> **Scope.** `TAC-HANDOFF.md`'s verdict voids TAC's *score* comparison between arms
+> — it ships zero MCP servers, so the tool-representation variable does not exist
+> there, and both arms are code execution (upstream's own CodeActAgent already has
+> IPython; `bash` is code execution with worse ergonomics). That does **not** touch
+> anything below. These are observations of what the agent *did while waiting* in a
+> multi-service, long-horizon environment — behaviour, not representation — which
+> is exactly what the verdict says TAC remains good for. One caveat to carry: both
+> arms substituted REST APIs where upstream gives the agent a browser, so
+> browser-shaped waits are unobserved here.
+
+
 191 cells (8.4%) contain `sleep`/poll-loop/`Thread`, spread across **14 tasks** —
 pervasive, not one outlier. Of 176 classifiable:
 
@@ -902,6 +925,13 @@ wins.
 - **Claimed dropping `until="changed"` removed the credential/proxy dependency.**
   It moves it from a control-plane re-issuer into the shell. Watching an
   authenticated service needs credentials outside the kernel under every design.
+- **Read TAC's 33/40 ties as "the MCP-Bench effect does not transfer to office
+  work."** Wrong shape of conclusion, and repeated in commit `20abaf7` and in
+  summary. TAC never tested the thesis: zero MCP servers, so the independent
+  variable was absent, and both arms were code execution. A null result on a
+  variable that was not varied is not a transfer failure — it is not evidence
+  either way. The remaining paths to testing representation are τ-bench, or
+  building an MCP layer over TAC's services (a new benchmark on TAC's graders).
 - **Claimed a hosted runtime needs network-namespace redirect** because env-var
   proxying is evadable. The real enforcement is credential injection: if the agent
   holds no token, bypassing the proxy yields a 401. The fence is still needed, but
