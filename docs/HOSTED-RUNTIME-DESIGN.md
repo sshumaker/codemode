@@ -150,29 +150,60 @@ Caveats, each of which should error loudly at the point of the mistake:
 ## 4. Surface
 
 ```python
-c     = arxiv.fetch_fulltext(url)                       # Call — inert
-texts = await c                                          # in-kernel; ceiling applies
+# WATCH — the primary wait. 83% of observed waits (§10). Nothing to submit:
+#   the agent sent a message and needs the reply.
+inbox = watch(rc.messages("#project-x", since="now"))    # declarative, no user code
+rc.send_message("#project-x", "confirm Friday 2pm?")
+#   ...then STOP → woken on arrival → inbox.new is a DELTA
 
-batch = submit(calls, name="fulltext", max_runtime="1h") # durable handle
-                                                         # then just STOP → wake at quiescence
+# SUBMIT — work that outlives the kernel. 9% of observed waits: builds, servers.
+batch = submit(calls, name="fulltext", max_runtime="1h") # one handle over N items
+run("gradle build", name="build")                        # shell form — see §10
 
-wait(batch, wake_after=1800)                             # non-default: attention deadline
-wait([build, tests], count=1)                            # non-default: first of N
+# CALL — in-kernel, unchanged
+texts = await arxiv.fetch_fulltext(url)                  # ceiling applies
+rows  = await asyncio.gather(*calls)
 
+wait(batch, wake_after=1800)                             # the only thing quiescence can't say
 job("fulltext"); jobs(); kill(batch)
 ```
 
-Three new verbs — `submit`, `wait`, `job`/`jobs` — plus `kill`. Everything else is
+Verbs: `watch`, `submit`/`run`, `wait`, `job`/`jobs`, `kill`. Everything else is
 `await`, which the cells already use, and stopping, which the agent already does.
+
+**`watch` must be declarative — it cannot take a user-supplied predicate.** The
+traces show why: the polling the agent actually wrote closes over cell-local state
+*and* a cell-defined helper —
+
+```python
+def poll():
+    for i in range(60):
+        time.sleep(20)
+        state['e'] = hist2('CZYW...')      # captures state AND hist2
+threading.Thread(target=poll, daemon=True).start()
+```
+
+`hist2` is defined in a cell, so the file-path escape hatch ("write the handler to
+`work/poll.py`") doesn't rescue this case — the agent would have to relocate its
+helper too, and it won't. A predicate parameter would reconstruct exactly this.
+So the condition has to be something the control plane can evaluate on its own:
+message-arrival, job status, file existence, an HTTP probe. Small set, and it
+covers every wait observed.
 
 ### Jobs are NOT awaitable
 
-`await submit(...)` must raise. `task = create_task(...)` then `await task` is the
-most attested async idiom in Python, so given an awaitable handle the model will
-write it **every time** — and then durable out-of-process jobs are being consumed
-synchronously. Same class as `threading.Thread` in the traces: an in-distribution
-construct that silently imports in-process liveness. Same treatment (§5): block it
-and error with the correct pattern.
+`await submit(...)` must raise. The measured reason is that this agent awaits in
+**bulk**: `asyncio.gather` appears in 1,934 of 10,245 cells (18.9%), and
+`create_task` in zero. Hand it awaitable handles and the natural thing to write is
+
+```python
+results = await asyncio.gather(*[submit(c) for c in calls])
+```
+
+— durable out-of-process jobs, consumed synchronously, in one blocking cell. Same
+class as `threading.Thread` in the traces: an in-distribution construct that
+silently imports in-process liveness. Same treatment (§5): block it and error with
+the correct pattern.
 
 ```
 TypeError: jobs are not awaitable — they outlive this kernel.
@@ -191,9 +222,14 @@ which would give N wakes, N turns and fragmentary state for N jobs.
 > **Stopping means you're blocked. Being woken means you're unblocked.**
 
 That's a behaviour the model already has rather than an API it must learn, and it
-means the common case needs no verb. `wait()` exists only for the three things
-quiescence can't express: *first of N*, *this or that*, and *a deadline on the
-agent's attention rather than on the work*.
+means the common case needs no verb. `wait()` exists for exactly one thing
+quiescence can't express: **a deadline on the agent's attention rather than on the
+work.**
+
+*First of N* and *this or that* were in an earlier draft and are cut — see §13.
+Nothing in the corpus asks for them: across 10,245 cells, `asyncio.wait(` /
+`FIRST_COMPLETED` / `as_completed` / `.cancel()` are each used **zero** times,
+against 1,934 uses of `gather`. They also convert one wake into N.
 
 Edge: the agent may stop because it is **finished** and doesn't care about a job
 it left running. Suspend only when its final message isn't a terminal answer;
@@ -498,6 +534,36 @@ to be *pushed*, never offered; and `cache_size = 0` in the kernel config is free
 **Serialisability:** coroutines and generators are not picklable; a `Call` object
 is, before and after being awaited, and works with `asyncio.gather`.
 
+**No partial-completion primitives are ever used** (10,245 cells): `asyncio.wait(`
+0, `FIRST_COMPLETED` 0, `FIRST_EXCEPTION` 0, `as_completed` 0, `create_task` 0,
+`.cancel()` 0 — against `gather` in 1,934 (18.9%). The agent fans out and waits for
+all, always. This is why `count=`/first-of-N is cut, and why jobs must not be
+awaitable (it would `gather` a list of submitted handles).
+
+### What the waits are actually for — TAC, 2,263 codemode cells
+
+191 cells (8.4%) contain `sleep`/poll-loop/`Thread`, spread across **14 tasks** —
+pervasive, not one outlier. Of 176 classifiable:
+
+| waiting for | cells | share |
+|---|---|---|
+| **a reply to a message it sent** | **146** | **83.0%** |
+| a process it launched (build, server, log tail) | 16 | 9.1% |
+| both / unclassified | 14 | 7.9% |
+
+**11,257 s of in-cell `sleep` in total** (3.1 h), median 45 s, max 400 s — with
+hand-rolled backoff across cells, the same cell repeated at escalating durations
+(`range(6)/30s` ×7 → `range(8)/45s` ×10 → `range(10)/60s` ×12).
+
+Two consequences:
+
+- `watch` is the **primary** primitive, not the secondary one. `submit` addresses
+  9%.
+- The 9% collapses into `submit` only if it accepts a **shell command**, not just a
+  `Call` — the observed cases launch builds and servers via `Popen`/`nohup &`.
+  Hence `run(cmd, name=…)` alongside `submit(calls, name=…)`, which is the form
+  handoff §5 already sketched.
+
 ---
 
 ## 11. File tools — product, not benchmark
@@ -597,6 +663,19 @@ wins.
   burned by.
 - **Proposed a "soft notice at 60s".** Undeliverable — the model only exists at
   turn boundaries, so any notice about an in-flight cell requires ending the cell.
+- **Added `count=1` / first-of-N to `wait` because it mirrored
+  `asyncio.wait(return_when=FIRST_COMPLETED)`.** Nothing asked for it: zero uses of
+  any partial-completion primitive across 10,245 cells, and zero `.cancel()`, so
+  even the race-then-cancel pattern it exists for never appears. It also converts
+  one wake into N. Cut. *Symmetry with an existing stdlib API is not evidence.*
+- **Justified "jobs must not be awaitable" with the `create_task` + `await task`
+  idiom.** `create_task` appears **zero** times. The real risk is bulk: 1,934
+  `gather` calls, so the agent would write
+  `await asyncio.gather(*[submit(c) for c in calls])`. Conclusion unchanged, worse
+  than I said, wrong reason given.
+- **Built the design around `submit` and justified `watch` from a single task.**
+  Backwards: 83% of observed waits are message-reply, which `submit` cannot express
+  at all; `submit`-shaped waits are 9%.
 - **Two analysis bugs, both returning clean wrong answers**, which is the
   house failure mode: a literal `api.` match missed aliased imports
   (`import api.reddit as reddit`), and `symtable.get_children()[0]` on Python 3.14
