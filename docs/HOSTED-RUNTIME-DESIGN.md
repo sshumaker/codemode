@@ -20,7 +20,7 @@ Everything else is opaque to it, permanently, by construction.
 |---|---|
 | api `Call` (through the MCP proxy) | agent-defined coroutines |
 | `submit`ted work (control plane) | local compute |
-| `watch` on service state | `asyncio.sleep` in the agent's own loop |
+| a shell condition (`until curl -sf …`) | `asyncio.sleep` in the agent's own loop |
 | service HTTP (via the §4.1 egress proxy) | threads, held frames |
 | subagent sessions | anything the harness isn't in the path of |
 
@@ -149,31 +149,67 @@ Caveats, each of which should error loudly at the point of the mistake:
 
 ## 4. Surface
 
+One namespace, four functions.
+
 ```python
-# WATCH — the primary wait. 83% of observed waits (§10). Nothing to submit:
-#   the agent sent a message and needs the reply.
-inbox = watch(rc.messages("#project-x", since="now"))    # declarative, no user code
-rc.send_message("#project-x", "confirm Friday 2pm?")
-#   ...then STOP → woken on arrival → inbox.new is a DELTA
-
-# SUBMIT — work that outlives the kernel. 9% of observed waits: builds, servers.
-batch = submit(calls, name="fulltext", max_runtime="1h") # one handle over N items
-run("gradle build", name="build")                        # shell form — see §10
-
-# CALL — in-kernel, unchanged
-texts = await arxiv.fetch_fulltext(url)                  # ceiling applies
+# in-kernel, unchanged — the 0.7s common case
+texts = await arxiv.fetch_fulltext(url)          # ceiling applies (§6)
 rows  = await asyncio.gather(*calls)
 
-wait(batch, wake_after=1800)                             # the only thing quiescence can't say
-job("fulltext"); jobs(); kill(batch)
+# work that outlives the kernel. payload is any serialisable description:
+batch = jobs.submit(calls,          name="fulltext", max_runtime="1h")   # Call(s)
+build = jobs.submit("gradle build", name="build")                        # shell command
+                                                 # ...then STOP → suspend → wake at quiescence
+
+# a deadline on the agent's attention — and this is also how you poll
+jobs.wait(wake_after=1000)                       # wake me in 1000s, then check
+
+jobs.get("fulltext"); jobs.list(); jobs.kill("fulltext")
 ```
 
-Verbs: `watch`, `submit`/`run`, `wait`, `job`/`jobs`, `kill`. Everything else is
-`await`, which the cells already use, and stopping, which the agent already does.
+That's it. `await`, which the cells already use; **stopping**, which the agent
+already does; and `jobs.*`.
 
-**`watch` must be declarative — it cannot take a user-supplied predicate.** The
-traces show why: the polling the agent actually wrote closes over cell-local state
-*and* a cell-defined helper —
+### Polling is `jobs.wait(wake_after=…)`, not a primitive
+
+```python
+# turn N
+jobs.wait(wake_after=60)
+# ── turn N+1 ──
+print(hist2(rid))            # nothing yet? wait again.
+```
+
+**This costs nothing relative to today.** The 176 sleep cells in the TAC traces
+(§10) were *already* 176 turns — each cell is one tool call. The agent is already
+paying turn-granularity polling; the only change is that it stops holding a kernel
+and stops burning 11,257 s of in-process wall-clock. Turn-cost parity, wall-clock
+and RAM strictly better.
+
+Earlier drafts had a `watch()` verb and an `until="changed"` parameter on `submit`,
+where the control plane re-issued a request and diffed the result. Both are cut
+(§13). What that removes:
+
+| no longer needed | why it existed |
+|---|---|
+| `watch` as a verb | it was `submit` with a different completion criterion |
+| control-plane request re-issuer | to poll on the agent's behalf |
+| `readOnlyHint` enforcement | otherwise it re-sends a message 60× |
+| baseline capture + diffing | to detect "changed" |
+| delta computation on the handle | the 88% redundancy is fixed by reading **once instead of 12 times**, not by pre-diffing the payload — and the agent already wrote the filter |
+
+A repeat-until criterion remains a legitimate *optimisation* — it collapses N poll
+turns into one wake — but it is not needed for correctness, and it is not free
+(see the proxy requirement below). Measure the surviving poll turns first.
+
+### Conditions: a shell string, and why that's the good answer
+
+Claude Code's `Monitor` solves the closure problem in a way neither earlier draft
+reached: **the condition is a shell command string.** A string cannot close over
+the kernel namespace, so the agent gets arbitrary expressiveness with zero capture
+risk — no DSL, no declarative predicate language.
+
+That matters here because the polling the agent actually wrote captures *two*
+cell-local things:
 
 ```python
 def poll():
@@ -183,12 +219,89 @@ def poll():
 threading.Thread(target=poll, daemon=True).start()
 ```
 
-`hist2` is defined in a cell, so the file-path escape hatch ("write the handler to
-`work/poll.py`") doesn't rescue this case — the agent would have to relocate its
-helper too, and it won't. A predicate parameter would reconstruct exactly this.
-So the condition has to be something the control plane can evaluate on its own:
-message-arrival, job status, file existence, an HTTP probe. Small set, and it
-covers every wait observed.
+`hist2` is cell-defined, so the file-path escape hatch ("write the handler to
+`work/poll.py`") doesn't rescue this — the agent would have to relocate its helper
+too. A Python predicate parameter would rebuild exactly this. A shell string
+can't.
+
+So a condition is just a `jobs.submit` payload:
+
+```python
+jobs.submit("until curl -sf localhost:5000/health; do sleep 2; done", name="ready")
+```
+
+**Prefer exit status over output matching.** This is the ordering Monitor's docs
+imply but don't state, and it's the difference between two and five failure modes:
+
+```bash
+until curl -sf localhost:5000/health; do sleep 2; done   # exits or hits the deadline. that's all.
+tail -f run.log | grep --line-buffered "Ready"           # can silently never fire, three ways
+```
+
+### Arming failures, and the two guards worth having
+
+Reported anecdotally (not yet measured): Claude gets Monitor wrong **both
+directions**. The schema itself spends most of its length on two of these, which
+is usually a tell.
+
+| failure | cause |
+|---|---|
+| **armed, never fires** | success-only filter, or a non-flushing stage (`grep` without `--line-buffered`, `awk` without `fflush`, `head` which cannot flush at all) |
+| **fires, stays armed** | unbounded command for a one-shot need — `tail -f` / `while true` never exit, so it lingers to timeout. `grep -m 1` does *not* fix it: if the log goes quiet, `tail` never gets SIGPIPE |
+| **exits immediately** | bounded command when a stream was wanted — one check, no watch, and it looks like it worked |
+
+The structural cause: **notification count is an emergent property of the script's
+control flow, not a declared intent.** Three independent things must be right —
+does it exit, does every stage flush, does the filter cover failure — and nothing
+checks any of them. That is the price of the shell-string choice: full
+expressiveness bought with total unverifiability, failing *silently*.
+
+Two guards, both cheap, both applications of the rule that the model gets intent
+right and mechanics wrong:
+
+1. **Declare intent, lint the mechanism.** `expect="once" | "stream"` lets arming
+   statically reject the mismatch — `expect="once"` with `tail -f` and no exit path
+   is an error at arm time, not five minutes of silence.
+2. **Turn silence into a line.** You cannot prove a filter will fire, but you can
+   flag a job that has emitted nothing by a fraction of its deadline, in the
+   listing the agent already reads:
+   `ready  job:running  0 events in 240s of 600s  ⚠ never fired`
+
+One advantage this design already has: our wake event carries a **reason**, so
+`max_runtime` elapsing without completion arrives as an explicit *"deadline, never
+fired"*. Monitor's timeout just kills it, and nothing is said.
+
+### The proxy requirement that comes with shell conditions
+
+`until curl -sf …` needs a network-level proxy, and this is not optional — it
+reopens a hole this project already closed. Confound #1 from the clean-up: **78% of
+vanilla's bash calls were `curl` straight to the same APIs the MCP servers
+wrapped**, bypassing the tools under test.
+
+The proxy has four jobs, not one: **intercept** (or the condition bypasses the tool
+surface), **inject credentials** (the token must never be in the cell or in the
+command string), **log** (a wait that made 600 requests must not be invisible), and
+**throttle** (a `sleep 2` loop against a rate-limited service is exactly the DEX
+Paprika shape).
+
+And the enforcement level changes. `HTTP_PROXY` env vars were adequate for a
+*fairness* control and were already noted as soft — raw sockets evade them. A
+hosted runtime needs network-namespace level redirect, because the premise is that
+credentials never enter the sandbox and the agent *cannot* route around.
+
+This corrects a claim made earlier in this design: dropping `until="changed"` does
+**not** remove the credential dependency, it moves it from a control-plane
+re-issuer into the shell. The requirement is a property of *watching an
+authenticated service*, not of the mechanism. The split is unchanged either way:
+
+- **9% (process/local)** — files, ports, exit codes, log tails. No network, no
+  credentials, no proxy. Free.
+- **83% (service/chat)** — needs the proxy, whichever poller you pick.
+
+Worth writing down as a chain, because all three links are already-observed bugs:
+unproxied poll loop → trips the rate limit → 429s (which this project already saw
+arriving as *successful* MCP responses) → the condition never becomes true →
+**silence**, which reads as "still waiting."
 
 ### Jobs are NOT awaitable
 
@@ -207,11 +320,11 @@ the correct pattern.
 
 ```
 TypeError: jobs are not awaitable — they outlive this kernel.
-           End your turn and you'll be woken, or wait(batch, wake_after=1800).
+           End your turn and you'll be woken, or jobs.wait(wake_after=1800).
 ```
 
 Promotion therefore goes **one way only**: a long `await call` can be refused
-upward toward `submit`; a `submit` can never be awaited downward into a block.
+upward toward `jobs.submit`; a `submit` can never be awaited downward into a block.
 
 ### Implicit suspend at quiescence
 
@@ -222,7 +335,7 @@ which would give N wakes, N turns and fragmentary state for N jobs.
 > **Stopping means you're blocked. Being woken means you're unblocked.**
 
 That's a behaviour the model already has rather than an API it must learn, and it
-means the common case needs no verb. `wait()` exists for exactly one thing
+means the common case needs no verb. `jobs.wait()` exists for exactly one thing
 quiescence can't express: **a deadline on the agent's attention rather than on the
 work.**
 
@@ -241,13 +354,13 @@ otherwise terminate and reap the tree.
 
 | | where | about |
 |---|---|---|
-| `max_runtime=` | `submit` | the **work** — exceed it and the work is killed |
-| `wake_after=` | `wait` | the **agent's attention** — work continues |
-| `kill()` | explicit | ending the work deliberately |
+| `max_runtime=` | `jobs.submit` | the **work** — exceed it and the work is killed |
+| `wake_after=` | `jobs.wait` | the **agent's attention** — work continues |
+| `jobs.kill()` | explicit | ending the work deliberately |
 
-`wake_after` does **not** belong on `submit`; putting it there re-fuses attention
+`wake_after` does **not** belong on `jobs.submit`; putting it there re-fuses attention
 with work-lifetime, which is what the split exists to prevent. And the verb is
-`wait`, not `wait_for` — `asyncio.wait_for` cancels on timeout and this doesn't.
+`jobs.wait`, not `wait_for` — `asyncio.wait_for` cancels on timeout and this doesn't.
 
 Enforce a **floor** on `wake_after`. Re-arm is polling at turn granularity, and at
 ~$0.012/turn the same mechanism spans two orders of magnitude: re-armed every
@@ -261,14 +374,14 @@ gone.
 
 ## 5. Rehydration
 
-`job("fulltext")` is the **primitive**; auto-rehydration is the harness
+`jobs.get("fulltext")` is the **primitive**; auto-rehydration is the harness
 pre-writing that exact call into a fresh kernel before the agent's next cell.
 
 ```python
 # turn 12
-batch = submit(calls, name="fulltext")
+batch = jobs.submit(calls, name="fulltext")
 # ---- kernel dies, agent wakes; harness prelude, shown as [rehydrated] ----
-batch = job("fulltext")
+batch = jobs.get("fulltext")
 ```
 
 One mechanism, not two, which avoids the awkward dual rule ("handles come back,
@@ -281,7 +394,7 @@ Visibility is what separates this from magic — the manifest must say
 about a binding that isn't what it thinks.
 
 **`name` is required**, per the same reasoning settled earlier for `spawn`: it is
-what appears in `jobs()`, the manifest and the wake event, and an unnamed job
+what appears in `jobs.list()`, the manifest and the wake event, and an unnamed job
 makes all three unreadable.
 
 Failure modes:
@@ -295,7 +408,7 @@ Failure modes:
   and rehydration needs structural reconstruction. **Constraint: a handle may be
   bound to a bare name and nowhere else**, and burying one is a loud error at
   assignment rather than a silent absence at wake. This is the argument for
-  `submit(calls)` returning one handle over N items rather than N handles.
+  `jobs.submit(calls)` returning one handle over N items rather than N handles.
 - **Dead job** — rehydrate to a tombstone that raises with the reason, same
   contract as PRUNED.
 
@@ -557,8 +670,9 @@ hand-rolled backoff across cells, the same cell repeated at escalating durations
 
 Two consequences:
 
-- `watch` is the **primary** primitive, not the secondary one. `submit` addresses
-  9%.
+- **Waiting on a reply is the primary case, not submitted work.** It has no job
+  to submit, so it is served by `jobs.wait(wake_after=…)` plus a check on the next
+  turn (§4). Submitted work addresses the other 9%.
 - The 9% collapses into `submit` only if it accepts a **shell command**, not just a
   `Call` — the observed cases launch builds and servers via `Popen`/`nohup &`.
   Hence `run(cmd, name=…)` alongside `submit(calls, name=…)`, which is the form
@@ -599,9 +713,9 @@ rather than costing a retry.
 ## 12. Open
 
 - **Is the primitive set complete?** From the traces the agent wanted: a reply to a
-  message it sent (`watch(messages)`), work it started to finish (implicit
-  suspend), a condition on service state (`watch(predicate)`), and time to pass
-  (`wake_after`). **Checkable now**: classify every cell containing `sleep`, a poll
+  message it sent, work it started to finish (implicit suspend), a condition on
+  service state, and time to pass. All four are served by `jobs.submit` +
+  `jobs.wait(wake_after=…)`; none needs a distinct verb. **Checkable now**: classify every cell containing `sleep`, a poll
   loop, or a `threading.Thread` by what it was waiting for. A fifth category is
   exactly where the agent will write `while True: sleep(10)`.
 - **Does the agent yield rather than spin** when handed these primitives? The
@@ -673,9 +787,19 @@ wins.
   `gather` calls, so the agent would write
   `await asyncio.gather(*[submit(c) for c in calls])`. Conclusion unchanged, worse
   than I said, wrong reason given.
-- **Built the design around `submit` and justified `watch` from a single task.**
-  Backwards: 83% of observed waits are message-reply, which `submit` cannot express
-  at all; `submit`-shaped waits are 9%.
+- **Built the design around `submit` and justified a `watch` verb from a single
+  task.** Backwards twice over. 83% of observed waits are message-reply, which
+  `submit` cannot express at all — but `watch` was not the answer either: it was
+  `submit` with a different completion criterion, and the case is served by
+  `jobs.wait(wake_after=…)` at zero turn cost relative to today. Cut.
+- **Invented `rc.messages(room, since=T)` and wrote design around it.** No such
+  API exists. TAC codemode has **no `api/` layer at all** — `import api.` appears
+  in 0.0% of its 2,271 cells; the agent uses raw `requests.Session` with auth
+  headers it fetched itself. The watchable unit has to be a serialisable *request
+  description*, and for TAC that layer would have to be built.
+- **Claimed dropping `until="changed"` removed the credential/proxy dependency.**
+  It moves it from a control-plane re-issuer into the shell. Watching an
+  authenticated service needs credentials outside the kernel under every design.
 - **Two analysis bugs, both returning clean wrong answers**, which is the
   house failure mode: a literal `api.` match missed aliased imports
   (`import api.reddit as reddit`), and `symtable.get_children()[0]` on Python 3.14
