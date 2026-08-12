@@ -207,6 +207,13 @@ class PrimeAgent(BaseAgent):
             env["HARNESS_RUNTIME_DIR"] = RUNTIME_DIR
             env["HARNESS_JOB_DIR"] = f"{RUNTIME_DIR}/jobs"
             env["HARNESS_JOBS_RUNTIME"] = "1"
+            # The prelude's cell watchdog fires just under this ceiling, turning
+            # the harness's silent kill into a message that names jobs.submit —
+            # the mailman wedge (`daemon start | tail`) blocks past every other
+            # guard and only this backstop catches it. Derived from the same cell
+            # timeout so the two can never drift out of sync.
+            env["HARNESS_CELL_CEILING"] = str(
+                int(env["HARNESS_CELL_TIMEOUT_MS"]) // 1000)
         return env
 
     @staticmethod

@@ -79,6 +79,16 @@ class FakeMagicsManager:
         self.magics = {"cell": {}, "line": {}}
 
 
+class FakeEvents:
+    """`ip.events.register(name, fn)`, enough for the cell watchdog to hook."""
+
+    def __init__(self):
+        self.callbacks = {}
+
+    def register(self, name, fn):
+        self.callbacks.setdefault(name, []).append(fn)
+
+
 class FakeIPython:
     """
     Shaped enough to exercise the real prelude paths.
@@ -93,6 +103,7 @@ class FakeIPython:
         self.magics_manager = FakeMagicsManager()
         self.registered = {}
         self.system = lambda cmd: ("ran", cmd)
+        self.events = FakeEvents()
 
     def register_magic_function(self, fn, magic_kind="cell", magic_name=None):
         self.magics_manager.magics[magic_kind][magic_name] = fn
@@ -503,3 +514,84 @@ class TestGuardTable(GuardBase):
         load_prelude(as_agent_code=False)  # the runtime keeps its own exemption
         job = self.store.submit("echo hi", name="selfspawn")
         self.assertEqual(job.state, "running")
+
+
+class TestCellWatchdog(PreludeBase):
+    """
+    The backstop that teaches.
+
+    `mailman start 2>&1 | tail -5` daemonises, the daemon holds the pipe open, `tail`
+    never sees EOF, and the cell hangs to the ceiling — past every guard in the
+    table, because there is no sleep, thread, or import to catch. Measured: ON and
+    OFF both wedged on exactly this line. The watchdog fires just under the ceiling
+    and raises the same jobs.submit message the other guards do, so the agent is
+    taught instead of silently killed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import signal
+        self._orig_alarm = signal.getsignal(signal.SIGALRM)
+        self._saved_env = {k: os.environ.get(k) for k in
+                           ("HARNESS_CELL_CEILING", "HARNESS_CELL_CEILING_MARGIN")}
+
+    def tearDown(self):
+        import signal
+        signal.setitimer(signal.ITIMER_REAL, 0)  # never leave a real timer armed
+        try:
+            signal.signal(signal.SIGALRM, self._orig_alarm)
+        except Exception:
+            pass
+        for k, v in self._saved_env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def test_dormant_without_a_declared_ceiling(self):
+        # No harness ceiling → nothing to backstop against → no hook, no SIGALRM.
+        os.environ.pop("HARNESS_CELL_CEILING", None)
+        ip = FakeIPython()
+        load_prelude(namespace_holder=ip)
+        self.assertNotIn("pre_run_cell", ip.events.callbacks)
+
+    def test_registers_arm_and_disarm_when_a_ceiling_is_declared(self):
+        os.environ["HARNESS_CELL_CEILING"] = "600"
+        ip = FakeIPython()
+        load_prelude(namespace_holder=ip)
+        self.assertIn("pre_run_cell", ip.events.callbacks)
+        self.assertIn("post_run_cell", ip.events.callbacks)
+
+    def test_the_alarm_names_jobs_submit_and_quotes_the_wedged_command(self):
+        os.environ["HARNESS_CELL_CEILING"] = "600"
+        os.environ["HARNESS_CELL_CEILING_MARGIN"] = "15"
+        ip = FakeIPython()
+        mod = load_prelude(namespace_holder=ip)
+        mod._current_cell["src"] = "mailman --run-as-root start 2>&1 | tail -5"
+        import signal
+        handler = signal.getsignal(signal.SIGALRM)
+        self.assertTrue(callable(handler))
+        with self.assertRaises(RuntimeError) as ctx:
+            handler(signal.SIGALRM, None)
+        msg = str(ctx.exception)
+        self.assertIn("jobs.submit", msg)
+        self.assertIn("jobs.help()", msg)
+        self.assertIn("585s", msg)                        # 600 - 15
+        self.assertIn("mailman --run-as-root start", msg)  # the agent's own line
+
+    def test_it_interrupts_a_genuinely_blocked_cell(self):
+        # End to end: arm the real timer, block in select, and confirm the interrupt
+        # lands as a RuntimeError instead of the cell hanging to the ceiling.
+        os.environ["HARNESS_CELL_CEILING"] = "1"
+        os.environ["HARNESS_CELL_CEILING_MARGIN"] = "0"  # fire_at = 1s
+        ip = FakeIPython()
+        mod = load_prelude(namespace_holder=ip)
+        arm = ip.events.callbacks["pre_run_cell"][0]
+
+        class Info:
+            raw_cell = "start_daemon | tail -f"
+
+        import select
+        arm(Info())
+        t0 = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            select.select([], [], [], 5)  # would block 5s; the 1s alarm cuts in
+        self.assertLess(time.monotonic() - t0, 4.5)

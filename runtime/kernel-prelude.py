@@ -678,6 +678,101 @@ def _render_wait_signal_cleanly():
 _render_wait_signal_cleanly()
 
 
+# --------------------------------------------------------------------------------
+# the backstop that teaches
+# --------------------------------------------------------------------------------
+#
+# The tables above cover every *idiomatic* route to holding the kernel — sleep,
+# thread, subprocess, the shell magics. They cannot see a command that blocks for a
+# reason visible only at run time. The measured case is the mailman wedge:
+#
+#     mailman --run-as-root start 2>&1 | tail -5
+#
+# `mailman start` daemonises; the daemon inherits the pipe's write end; `tail` never
+# reaches EOF and the cell hangs until the harness kills it at the cell ceiling.
+# `jobs.blocking_sleep` finds no sleep, it is not a thread or an import, so nothing
+# in the enumeration fires — verified: ON and OFF both wedged on exactly this line.
+#
+# The design has always named the cell wall-clock ceiling as the universal backstop
+# for this residue (§6). The gap was never that the backstop is missing — it is that
+# the harness kills the cell with a *bare* interrupt, which teaches nothing, so the
+# agent writes the same line again. This makes the backstop behave like every other
+# guard: fire just under the ceiling, interrupt the held cell, and name jobs.submit.
+# It is strictly better than today — the cell was already going to die at the ceiling
+# — so it adds no false positives, only a teaching moment where there was a silent
+# kill.
+#
+# SIGALRM, not a watchdog thread: the interrupt must land in the main thread where
+# the cell is blocked, and a thread cannot raise there. Armed only for the span of a
+# cell (pre_run_cell -> arm, post_run_cell -> disarm) so it can never fire inside
+# kernel machinery — the Event.wait mistake that once took the kernel down. Disabled
+# unless the harness declares its ceiling, and on any platform without setitimer.
+CELL_CEILING = int(os.environ.get("HARNESS_CELL_CEILING", "0"))  # 0 = disabled
+CELL_CEILING_MARGIN = int(os.environ.get("HARNESS_CELL_CEILING_MARGIN", "15"))
+_current_cell = {"src": ""}
+
+
+def _install_cell_watchdog():
+    import signal
+
+    if CELL_CEILING <= 0:
+        return  # no harness ceiling declared; nothing to backstop against
+    if threading.current_thread() is not threading.main_thread():
+        return  # SIGALRM/setitimer only work from the main thread
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        return  # Windows: the harness ceiling stays the only backstop there
+
+    ip = _shell()
+    if ip is None or not hasattr(ip, "events"):
+        return
+
+    fire_at = max(1, CELL_CEILING - CELL_CEILING_MARGIN)
+
+    def on_alarm(signum, frame):
+        signal.setitimer(signal.ITIMER_REAL, 0)  # disarm first: no re-entry
+        lines = [
+            ln for ln in _current_cell["src"].strip().splitlines()
+            if ln.strip() and not ln.strip().startswith("%%")
+        ]
+        suggestion = lines[0][:80] if lines else "your command"
+        raise RuntimeError(_redirect(
+            f"this cell held the kernel for {fire_at}s without returning, so it was stopped "
+            f"just before the {CELL_CEILING}s ceiling. Something in it blocks the kernel — a "
+            f"server or daemon started in the foreground, a `| tail`/`| cat` reading a process "
+            f"that never closes its output, or a blocking read waiting on work that has not finished",
+            suggestion,
+        ))
+
+    try:
+        signal.signal(signal.SIGALRM, on_alarm)
+    except Exception as exc:
+        print(f"[jobs] cell watchdog not installed ({exc}); the harness ceiling is the only backstop")
+        return
+
+    def arm(info):
+        _current_cell["src"] = getattr(info, "raw_cell", "") or ""
+        try:
+            signal.setitimer(signal.ITIMER_REAL, fire_at)
+        except Exception:
+            pass  # non-main execution thread; fall back to the harness ceiling
+
+    def disarm(result):
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        except Exception:
+            pass
+
+    try:
+        ip.events.register("pre_run_cell", arm)
+        ip.events.register("post_run_cell", disarm)
+    except Exception as exc:
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        print(f"[jobs] cell watchdog not installed ({exc}); the harness ceiling is the only backstop")
+
+
+_install_cell_watchdog()
+
+
 def _announce_existing_jobs():
     """
     Tell a fresh kernel what is already running. Deliberately does NOT bind anything.
