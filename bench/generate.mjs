@@ -159,6 +159,40 @@ export function renderTocLines(tools, { server, style = "python" } = {}) {
 	});
 }
 
+/**
+ * L4 for the *codemode* arm: the whole `api/` tree's documentation, inline.
+ *
+ * This is the fourth cell of the 2x2 that separates representation from residency.
+ * Every measurement this project has taken confounds the two — and so does
+ * upstream's: AppWorld's own full-code agent interpolates `api_documentation_string`
+ * into its prompt and therefore has to run the same <=20-API predictor as their
+ * function-calling agent (`full_code_agent.py:119-123`). If documentation residency
+ * is the mechanism and code is merely what makes non-resident documentation usable,
+ * a codemode arm with its docs resident should lose most of its advantage. This
+ * renderer is what makes that falsifiable.
+ *
+ * Deliberately built from the same fields `renderToolModule` puts in the module
+ * docstring — signature, description, per-parameter notes — so the resident text
+ * and the on-disk text cannot drift. It is the same container, relocated into the
+ * prompt, which is exactly the contrast wanted.
+ */
+export function renderFullDocs(tools, { server }) {
+	const pkg = pyPackage(server);
+	const lines = [`### api.${pkg}  (${server})`, ""];
+	for (const tool of tools) {
+		const args = tool.params.map((p) => (p.required ? `${p.pyName}: ${p.type}` : `${p.pyName}: ${p.type} = None`));
+		lines.push(`async def api.${pkg}.${tool.pyName}(${args.join(", ")})`);
+		const description = (tool.description ?? "").trim();
+		if (description) for (const line of description.split("\n")) lines.push(`    ${line}`);
+		for (const p of tool.params) {
+			if (!p.description) continue;
+			lines.push(`      ${p.pyName}: ${p.description}${p.required ? "" : " (optional)"}`);
+		}
+		lines.push("");
+	}
+	return lines.join("\n");
+}
+
 /** L1: names only. */
 export function renderNames(tools, { server, style = "python" } = {}) {
 	return tools.map((t) =>

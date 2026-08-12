@@ -998,14 +998,36 @@ export function createIpythonToolDefinition(
 					ctx,
 				);
 
+				// The cell has returned, so stop the cell clock HERE rather than in the
+				// finally below. Everything after this point is host-side time — the
+				// jobs.wait sleep — and letting the timer run through it marked a cell
+				// that finished in milliseconds as "INTERRUPTED after 60s" whenever the
+				// requested wait exceeded the cell timeout. The agent was told its work
+				// had been cut off when it had completed, which is precisely the wrong
+				// lesson about the primitive it had just used correctly.
+				clearTimeout(cellTimer);
+				const cellTimedOutWhileExecuting = cellTimedOut;
+
 				let text = r.stdout;
-				if (cellTimedOut) {
+				// jobs.wait(wake_after=N) — the cell has already returned, so this
+				// sleep holds nothing. See runtime/jobs.py.
+				const waitMatch = /__HARNESS_WAIT_SECONDS__:(\d+)/.exec(text);
+				if (waitMatch) {
+					const secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));
+					setToolWorkingMessage(`waiting ${secs}s (kernel released)`);
+					await new Promise((resolve) => setTimeout(resolve, secs * 1000));
+					text = text.replace(waitMatch[0], `[waited ${secs}s outside the kernel]`);
+				}
+				if (cellTimedOutWhileExecuting) {
 					text =
 						`[this cell was INTERRUPTED after ${Math.round(cellTimeoutMs / 1000)}s and did not finish. ` +
 						`Any output below is partial, and whatever it was computing did NOT complete. ` +
 						`Variables bound before this cell are still available. Do not assume this ` +
-						`worked — either make it faster, bound it yourself, or run it in the ` +
-						`background and poll.]\n\n${text}`;
+						`worked. For work that legitimately takes this long, hand it to a job so it ` +
+						`outlives the cell:\n` +
+						`    jobs.submit('your command', name='pick-a-name')\n` +
+						`    jobs.wait(wake_after=120)   # last line of the cell\n` +
+						`then jobs.get('pick-a-name') to collect it.]\n\n${text}`;
 				}
 				if (r.stderr) text += (text ? "\n" : "") + r.stderr;
 				if (r.result) text += (text ? "\n" : "") + r.result;

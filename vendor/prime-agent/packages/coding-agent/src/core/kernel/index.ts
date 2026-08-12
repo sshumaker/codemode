@@ -644,7 +644,14 @@ export class KernelManager {
 		}
 
 		if (!forked) {
-			const kernel = spawn(python, ["-m", "ipykernel_launcher", "-f", connection.path], {
+			// Sandbox the REPL (hands), never the agent (brain). See
+			// scripts/neutralize-prime.mjs and runtime/eval/run.mjs.
+			const sandboxSettings = process.env.HARNESS_KERNEL_SANDBOX_SETTINGS;
+			const sandboxBin = process.env.HARNESS_KERNEL_SANDBOX_BIN ?? "srt";
+			const kernelArgv: [string, string[]] = sandboxSettings
+				? [sandboxBin, ["--settings", sandboxSettings, python, "-m", "ipykernel_launcher", "-f", connection.path]]
+				: [python, ["-m", "ipykernel_launcher", "-f", connection.path]];
+			const kernel = spawn(kernelArgv[0], kernelArgv[1], {
 				cwd: this.options.cwd,
 				env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
 				stdio: ["ignore", "pipe", "pipe"],

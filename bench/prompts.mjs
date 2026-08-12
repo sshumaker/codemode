@@ -795,6 +795,28 @@ export const VARIANT_NAMES = Object.keys(VARIANTS);
  * several independent tool calls issued in a single assistant turn. Nothing had
  * ever told it that.
  */
+/**
+ * The two efficiency levers, shared by every vanilla variant that gets guidance.
+ *
+ * Shared as one constant rather than copied into each variant so that a change to
+ * the guidance cannot land in one cell of the 2x2 and not the other — which is
+ * precisely the confound w3 exists to remove.
+ */
+const VANILLA_EFFICIENCY_GUIDANCE = [
+	"Two things make a large difference here:",
+	"",
+	"1. Issue independent calls together in ONE turn. If you need a park's",
+	"   details and its weather, call both in the same turn rather than waiting",
+	"   for the first. Only chain calls when one genuinely needs the other's",
+	"   output.",
+	"2. Every result you request enters your context in full. Prefer the",
+	"   narrowest call that answers the question — pass limits and filters when",
+	"   the tool accepts them, and do not fetch a broad listing when you already",
+	"   know the specific id you need.",
+	"",
+	"Ground every claim in something a tool returned.",
+];
+
 export const VANILLA_VARIANTS = {
 	/** w1 — no guidance. What the arm had until now; kept as the baseline. */
 	w1: {
@@ -817,18 +839,42 @@ export const VANILLA_VARIANTS = {
 				`You have ${toolCount} tools, named \`Service__operation\`. Their full parameter`,
 				"schemas are already in your context — you do not need to look anything up.",
 				"",
-				"Two things make a large difference here:",
+				...VANILLA_EFFICIENCY_GUIDANCE,
+			].join("\n"),
+	},
+
+	/**
+	 * w3 — w2's counterpart for deferred schemas (vanilla L1).
+	 *
+	 * Added 2026-08-11 for the MCP-Bench 2x2. Without it the tools row was
+	 * confounded: the L1 cell returned its own preamble early and so never received
+	 * w2's efficiency guidance, while the L4 cell did. That difference sits on the
+	 * same axis the 2x2 varies, so any gap between the two cells would have been
+	 * part residency and part missing instructions, with no way to separate them.
+	 *
+	 * The two levers are shared verbatim with w2 via VANILLA_EFFICIENCY_GUIDANCE;
+	 * only the retrieval paragraph differs, because it must describe a different
+	 * mechanism — w2's "already in your context" is simply false here.
+	 */
+	w3: {
+		note: "w2's guidance, for deferred schemas (L1)",
+		build: ({ toolCount }) =>
+			[
+				"## Tools",
 				"",
-				"1. Issue independent calls together in ONE turn. If you need a park's",
-				"   details and its weather, call both in the same turn rather than waiting",
-				"   for the first. Only chain calls when one genuinely needs the other's",
-				"   output.",
-				"2. Every result you request enters your context in full. Prefer the",
-				"   narrowest call that answers the question — pass limits and filters when",
-				"   the tool accepts them, and do not fetch a broad listing when you already",
-				"   know the specific id you need.",
+				`${toolCount} tools are available, named \`Service__operation\`. Their names are`,
+				"listed below; their parameter schemas are not, to keep this prompt small.",
 				"",
-				"Ground every claim in something a tool returned.",
+				"Two steps. Get a schema, then call through the dispatcher:",
+				"",
+				'  describe_tool(names=["Some_Server__some_tool"])',
+				'  call_tool(name="Some_Server__some_tool", arguments={...})',
+				"",
+				"`describe_tool` returns the exact JSON Schema — ask for several at once.",
+				"`search_tools(query=...)` matches names and one-line summaries. You only",
+				"need to describe a tool once; after that call it directly.",
+				"",
+				...VANILLA_EFFICIENCY_GUIDANCE,
 			].join("\n"),
 	},
 };

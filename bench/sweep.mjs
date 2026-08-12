@@ -53,9 +53,37 @@ const nsMode = flag("ns", "delta");
 // worse than no cap, because the runs look complete.
 const maxCost = flag("max-cost", "0");
 
-const tasks = tier
+/**
+ * Restrict the sweep to a named subset of the sampled tasks.
+ *
+ * Used to repair budget censoring: a capped run's cost is truncated, so the fix is
+ * to re-run the affected tasks at a higher cap — but only those tasks, and in every
+ * cell, since a cap that is never reached has no effect on the run while a cap that
+ * differs *between* cells of one contrast changes the treatment.
+ *
+ * Declared here, above the task selection that uses it. It was first written next
+ * to `tag` further down, which put it in a temporal dead zone: `node --check`
+ * passes, the file only throws at run time, and because the edit landed while a
+ * sweep was in flight the two cells that had not yet started spawned into it and
+ * died on load. Nothing in the log said "cells 3 and 4 never ran" — the wrapper
+ * printed ALL CELLS COMPLETE over two exit-1 cells.
+ */
+const onlyTasks = flag("only-tasks", "").split(",").map((s) => s.trim()).filter(Boolean);
+
+const sampled = tier
 	? loadTasks({ tier }).sort((a, b) => a.id.localeCompare(b.id)).slice(0, perTier)
 	: sampleTasks(perTier);
+// Filter, never substitute: --only-tasks names a subset of the same deterministic
+// sample, so the tasks it selects are the identical ones the full sweep would run.
+const tasks = onlyTasks.length > 0 ? sampled.filter((t) => onlyTasks.includes(t.id)) : sampled;
+if (onlyTasks.length > 0) {
+	const missing = onlyTasks.filter((n) => !sampled.some((t) => t.id === n));
+	if (missing.length > 0) {
+		console.error(`--only-tasks names tasks outside this sample: ${missing.join(",")}`);
+		process.exit(2);
+	}
+	console.log(`--only-tasks: ${tasks.length} of ${sampled.length} sampled tasks`);
+}
 
 console.log(`sweep: ${tasks.length} tasks x ${arms.length} arms = ${tasks.length * arms.length} runs`);
 console.log(`model: ${model}  residency(codemode): ${residency}\n`);
@@ -74,8 +102,22 @@ const promptSuffix = (arm) =>
 	: arm === "vanilla" ? (vanillaPrompt === "w1" ? "" : `__${vanillaPrompt}`)
 	: "";
 
+/**
+ * Optional namespace suffix for one experiment's runs.
+ *
+ * MCP-Bench talks to live servers, so a result.json from three days ago is not
+ * interchangeable with one from today: payload sizes move as the upstream data
+ * moves, and cost follows payload size. The resume-on-existing behaviour is
+ * therefore a hazard for a *factorial* — the cells that happened to have been run
+ * before get old API state and the new cells get today's, which puts a confound on
+ * exactly the axis being varied. Tagging gives one experiment its own namespace so
+ * every cell is fresh and contemporaneous, without deleting any history.
+ */
+const tag = flag("tag", "");
+
+
 const runId = (task, arm) =>
-	`${task.id}__${arm}__${levelFor(arm)}${promptSuffix(arm)}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+	`${task.id}__${arm}__${levelFor(arm)}${promptSuffix(arm)}__${model.replace(/[^a-z0-9]/gi, "-")}${tag ? `__${tag}` : ""}`;
 
 function runOne(task, arm) {
 	return new Promise((resolve) => {
@@ -92,6 +134,13 @@ function runOne(task, arm) {
 			arm,
 			"--residency",
 			levelFor(arm),
+			// Pass the id rather than letting run-task.mjs re-derive it. Two copies of
+			// one naming scheme is the bug that silently overwrote already-reported v1
+			// runs; here it meant --tag changed sweep's existence check but not the
+			// directory actually written, so every tagged run was refused by run-task's
+			// own overwrite guard as "already exists" and the sweep did nothing.
+			"--run-id",
+			id,
 			"--timeout",
 			timeout,
 			"--max-cost",

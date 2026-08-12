@@ -5,3 +5,9 @@ dist/
 .run/
 vendor/mcp-bench/
 vendor/TheAgentCompany/
+vendor/appworld/
+
+# session housekeeping
+.claude/
+__pycache__/
+*.pyc

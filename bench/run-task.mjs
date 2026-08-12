@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, createWriteStream, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { generate } from "./generate.mjs";
+import { generate, renderFullDocs } from "./generate.mjs";
 import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./prompts.mjs";
 import { findTask } from "./tasks.mjs";
 
@@ -59,7 +59,9 @@ const task = findTask(taskId);
 
 // Codemode preamble variant — see bench/prompts.mjs and bench/hillclimb.mjs.
 const promptName = flag("prompt", "q8");
-const vanillaPromptName = flag("vanilla-prompt", "w2");
+// w3 is w2's counterpart for deferred schemas; defaulting by residency keeps the
+// two cells of the tools row on the same guidance without the caller remembering.
+const vanillaPromptName = flag("vanilla-prompt", residency === "L1" ? "w3" : "w2");
 const promptSuffix =
 	arm === "codemode" ? (promptName === "v1" ? "" : `__${promptName}`) : arm === "vanilla" ? (vanillaPromptName === "w1" ? "" : `__${vanillaPromptName}`) : "";
 const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
@@ -91,18 +93,11 @@ function buildPreamble() {
 			task.exposedServers.includes(s.server),
 		);
 		const { toolDefs } = generate(catalogue);
+		// w3, not an inline copy. This block used to build its own preamble and so
+		// silently skipped the efficiency guidance the L4 cell receives from w2 —
+		// a difference inside the tools row, on the axis the 2x2 varies.
 		return [
-			"## Tools",
-			"",
-			`${toolDefs.length} tools are available. Their names are listed below; their parameter`,
-			"schemas are not, to keep this prompt small.",
-			"",
-			"Load a tool before calling it:",
-			"",
-			"  load_tool(names=[\"Some_Server__some_tool\"])",
-			"",
-			"That returns its parameter schema and makes it directly callable for the",
-			"rest of the session. You can load several at once.",
+			buildVanillaPreamble(vanillaPromptName, { toolCount: toolDefs.length }),
 			"",
 			"Available tool names:",
 			...toolDefs.map((d) => d.name),
@@ -123,7 +118,7 @@ function buildPreamble() {
 	const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
 		task.exposedServers.includes(s.server),
 	);
-	const { tocLines, names } = generate(catalogue);
+	const { tocLines, names, normalized } = generate(catalogue);
 	const pointer = buildCodemodePreamble(promptName, {
 		toolCount: tocLines.length,
 		serverCount: catalogue.length,
@@ -132,6 +127,15 @@ function buildPreamble() {
 	if (residency === "L0") return pointer;
 	if (residency === "L1") return `${pointer}\n\nAvailable tools:\n${names.join("\n")}`;
 	if (residency === "L2") return `${pointer}\n\nAvailable tools:\n${tocLines.join("\n")}`;
+	if (residency === "L4") {
+		// The docs-resident code cell, added 2026-08-11 so MCP-Bench can run the
+		// same 2x2 as AppWorld. Deliberately the *same* renderFullDocs the AppWorld
+		// cell uses: if the two benchmarks rendered documentation differently, a
+		// difference between them would be unattributable — benchmark, or wording.
+		// Same container as the api/ tree, relocated into the prompt.
+		const docs = normalized.map(({ server, tools }) => renderFullDocs(tools, { server })).join("\n");
+		return `${pointer}\n\n## Full API documentation\n\nEvery tool is documented below, so you do not need to read \`api/\` at all.\n\n${docs}`;
+	}
 	throw new Error(`unsupported residency for codemode: ${residency}`);
 }
 
@@ -230,7 +234,10 @@ if (arm === "notools") {
 	// active set. L1 additionally narrows the *active* set at session start via
 	// pi.setActiveTools, so the schemas stay out of context until loaded.
 	toolList = [...BUILTINS, ...toolDefs.map((d) => d.name)];
-	if (residency === "L1") toolList.push("search_tools", "load_tool");
+	// Must match what bench/arms/mcp-tools-extension.ts registers in L1 mode.
+	// `--tools` filters extension-registered tools too, so a name missing here is a
+	// tool the model can see and cannot call.
+	if (residency === "L1") toolList.push("search_tools", "describe_tool", "call_tool");
 } else {
 	toolList = ["ipython"];
 }
@@ -245,12 +252,10 @@ const cliArgs = [
 	"--model",
 	model,
 	...(arm === "notools" ? ["--no-tools"] : ["--tools", tools]),
-	// L1 allowlists all 250 but activates only the base set; load_tool activates
-	// the rest on demand. Requires the --active-tools flag added by
-	// scripts/neutralize-prime.mjs.
-	...(arm === "vanilla" && residency === "L1"
-		? ["--active-tools", [...BUILTINS, "search_tools", "load_tool"].join(",")]
-		: []),
+	// No --active-tools. It never reached print mode's session worker (which
+	// rebuilds argv), so it silently produced L4 runs wearing an L1 label. L1 now
+	// defers by dispatching through call_tool instead of by narrowing the active
+	// set — see the three-attempt note in bench/arms/mcp-tools-extension.ts.
 	"--cwd",
 	runDir,
 	"--no-skills",
@@ -285,8 +290,8 @@ const child = spawn(
 			HARNESS_MCP_SERVERS: task.exposedServers.join(","),
 			HARNESS_RUN_ID: runId,
 			// Selects the vanilla extension's registration strategy: L4 registers
-			// all 250 tools up front, L1 registers only search_tools/load_tool and
-			// adds real tools on demand.
+			// all 250 tools up front, L1 registers only the three meta-tools and
+			// dispatches real calls through call_tool.
 			HARNESS_RESIDENCY: residency,
 			// Force all outbound API access through the MCP proxy.
 			//
@@ -386,6 +391,16 @@ child.stdout.on("data", (chunk) => {
 			summary.errorMessages.push(text.slice(0, 300));
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
 			const message = event.message;
+			// A provider-side refusal is not a result. osint_intelligence_000 asks for
+			// typo-squat and exposed-service enumeration against a domain, which trips
+			// the refusal classifier: three retries, all refused, zero tool calls, and
+			// the run was recorded as `completed` at $0.02. Averaged in, a refusal pulls
+			// its cell's mean cost toward zero in whichever cells happen to refuse — the
+			// same shape as the rate-limited server whose 429s were counted as
+			// successful MCP responses.
+			if (message.stopReasonRaw === "refusal" || /\brefus/i.test(message.errorMessage ?? "")) {
+				summary.refusals = (summary.refusals ?? 0) + 1;
+			}
 			const texts = (message.content ?? []).filter((c) => c.type === "text" && c.text);
 			if (texts.length > 0) summary.finalText = texts.map((c) => c.text).join("");
 			const id = message.responseId;
@@ -417,8 +432,12 @@ child.on("close", (code) => {
 	// tool catalogue is silently an L4 run under a different name, which would
 	// corrupt every comparison it appears in. Fail it loudly instead.
 	//
-	// Known broken: --active-tools (added by scripts/neutralize-prime.mjs) does
-	// not reach the print-mode path, so vanilla L1 currently does NOT defer.
+	// Fixed 2026-08-11: vanilla L1 now really does defer. Two earlier mechanisms
+	// did not — --active-tools never reached print mode (silently L4), and lazily
+	// registered/activated tools were advertised but answered "Tool <name> not
+	// found" at execution, so 0 calls reached the transport. Any L1 number quoted
+	// from MCP-Bench before this date is not an L1 number. See
+	// bench/arms/mcp-tools-extension.ts.
 	if (summary.firstTurnPromptTokens !== undefined) {
 		const budget = { L0: 6_000, L1: 8_000, L2: 20_000, L4: Infinity, none: 6_000 }[residency] ?? Infinity;
 		if (summary.firstTurnPromptTokens > budget) {
@@ -426,17 +445,43 @@ child.on("close", (code) => {
 				`${residency} first turn carried ${summary.firstTurnPromptTokens} prompt tokens ` +
 				`(budget ${budget}) — the catalogue was resident, so this is not a ${residency} run`;
 		}
+		// The mirror of the bug above, and the one that would be easy to miss: a
+		// cell whose documentation never made it into the prompt looks like a *win*
+		// for residency rather than an error. An empty renderFullDocs, a filter that
+		// matched no servers, a preamble dropped by a CLI flag — all silently
+		// produce an L0 run wearing an L4 label, which reads as "docs-in costs
+		// nothing": the opposite of the true answer, in the direction that flatters
+		// the headline.
+		//
+		// Derived from the preamble this run actually built, not a constant. A fixed
+		// floor was written first and was wrong: MCP-Bench's catalogue is per-task
+		// (8k-24k tokens here, against AppWorld's uniform ~62k), so any constant
+		// large enough to catch a dropped catalogue also fails the small tasks
+		// legitimately. A check that cries wolf gets disabled, which is how you end
+		// up with no check at all.
+		const preambleTokens = meta.preambleChars / 4;
+		if (preambleTokens > 1_000 && summary.firstTurnPromptTokens < preambleTokens * 0.6) {
+			summary.residencyViolation =
+				`${residency} first turn carried only ${summary.firstTurnPromptTokens} prompt tokens ` +
+				`against a preamble of ~${Math.round(preambleTokens)} — the preamble did not reach the model`;
+		}
 	}
 	summary.maxCost = maxCost;
 	// A run stopped by the budget is not a failed run — it is a run that spent
 	// its allowance. Reported separately from timeouts so the two never merge.
+	// A run that produced no tool call and ended in refusal never exercised the
+	// tool surface, so it measures nothing about representation or residency.
+	// Ranked ahead of "completed" but behind the caps, which are real spend.
+	const refused = (summary.refusals ?? 0) > 0 && summary.toolCalls === 0;
 	summary.stopReason = summary.budgetExceeded
 		? "budget"
 		: summary.turnCapReached
 			? "turn-cap"
 			: summary.timedOut
 				? "timeout"
-				: "completed";
+				: refused
+					? "refused"
+					: "completed";
 	writeFileSync(join(runDir, "result.json"), `${JSON.stringify({ ...meta, summary }, null, 2)}\n`);
 
 	const tally = [...new Set(summary.toolNames)].join(",") || "none";

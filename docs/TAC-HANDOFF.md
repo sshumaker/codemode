@@ -1,5 +1,34 @@
 # TheAgentCompany — status, findings, and the logging plan
 
+> **VERDICT (read first): TheAgentCompany cannot test the code-vs-tool-calling
+> thesis.** It ships **zero MCP servers** — grep the repo, there is no `mcp`
+> anywhere — so there is no tool catalogue to render either as JSON schemas or as
+> importable `api/` modules. The independent variable does not exist here.
+> Measured: `import api`/`api.*` appears in **1 of 555** codemode cells (0.2%);
+> instead 17.7% use raw `requests`, 15.5% hardcode the service URL and **14.4%
+> hardcode credentials in plaintext**.
+>
+> Worse for the comparison: upstream's own agent (OpenHands CodeActAgent) already
+> has an IPython tool, so "codemode" is approximately upstream's *baseline*, and
+> vanilla's `bash` is code execution with worse ergonomics. The two arms barely
+> differ, which explains **33/40 exact ties** without any story about office work.
+> Upstream also gives the agent a **browser** (`BrowseInteractiveAction`,
+> GOTO/FILL/CLICK, used by `pre_login`); both our arms substituted REST APIs.
+>
+> So the +0.035 / t=0.99 result below is a valid measurement of *code execution vs
+> shell-and-file tools*, and **not** of tool representation. Do not cite it as
+> evidence about the thesis either way. Checking for MCP support was a five-minute
+> question that should have preceded a day of work.
+>
+> **What TAC is still good for:** a long-horizon, checkpoint-graded, multi-service
+> substrate for the *durability/affordance* work — waiting, wake-on-condition,
+> jobs, subagents, credential injection. The traces here produced real evidence on
+> all of those (see §5). To make it test representation you would have to build the
+> MCP layer yourself (wrap the four services), which is constructing a new
+> benchmark on TAC's tasks and graders — legitimate, but a different project.
+
+
+
 Written before a context compaction. Everything a fresh session needs to pick
 this up, plus the design discussion that was in flight.
 
@@ -314,3 +343,151 @@ what the agent sees on wake (must be a delta, or we rebuild the 88% redundancy).
   subsequent failure lived in the `sde-*`/GitLab tasks the validation set did not
   contain. **Validate on a stratified set, and read the trajectories.**
 - Sat idle ~6h waiting on a scope question that was already answered.
+
+---
+
+## Jobs-runtime validation on TAC — five runs, and what they actually established
+
+Run with `HARNESS_JOBS_RUNTIME=1` on `pm-schedule-meeting-2` (the worst recorded
+offender: 302 raw sleep mentions, 48 thread mentions).
+
+| run | condition | turns | cost | blocking-sleep cells | jobs cells |
+|---|---|---|---|---|---|
+| baseline (recorded) | partial jobs, weak guards | 43 | $0.67 | 24 | 14 |
+| 1 | flag unset — **invalid** | 18 | $0.43 | 9 | 0 |
+| 2 | staged, no guidance | 198 | $3.32 | 1 | 0 |
+| 3 | staged + guidance | 265 | $4.56 | 0 | 0 |
+| 4 | `IPYTHONDIR` set | 147 | $1.55 | 0 | 0 |
+| 5 | + status recording | 87 | $0.70 | 0 | 1 |
+
+### The runtime was present the whole time
+
+Run 5 records `87 STARTED / 87 COMPLETED / jobs bound in builtins`. So the earlier
+conclusion "jobs was never available" was **wrong about availability** — the agent had
+it and used it in 1 of 87 cells.
+
+Three verifications certified the wrong thing before this was known:
+
+1. `import jobs` under a manual `sys.path` insert — proves the file imports.
+2. a manual `runpy` of the startup file, printing `PRELUDE-OK` — proves it *can* run.
+3. grepping `stream.jsonl` for the prelude banner — the banner never reaches the
+   agent's cell output at all, so its absence proves nothing.
+
+All three are the `find_spec` mistake in new clothes. What settled it was the prelude
+writing `STARTED`/`FAILED <traceback>`/`COMPLETED` to a file that the runner copies out
+**before the container is destroyed** — because container state cannot be re-derived
+tomorrow, which is the actual test for sufficient logging.
+
+Separately established: `ipykernel_launcher` *does* execute startup files when
+`IPYTHONDIR` is set (tested with a marker file — prints go to iopub, not stdout).
+
+### Two findings worth acting on
+
+**1. Suppressing the bad wait without adoption is a regression, not a partial win.**
+Blocking sleeps went 24 → 0 and threads 5 → 0, and turns went 43 → 87–265 at 1–7× the
+cost. With no usable wait, the agent burns *turns* as its wait mechanism: whole cells
+that are `print(38)` and `print("r21")`, labelled polling rounds. Zero seconds of
+kernel held, so no guard fires. An error channel only teaches when an error fires, and
+the cheapest escape route fires nothing.
+
+**2. The 87 prelude starts were a false alarm, and chasing it found the real cause.**
+87 starts for 87 cells with distinct pids looked like a non-persistent kernel, which
+would have invalidated the whole codemode arm. It is not: the baseline reuses a
+`requests.Session` bound in an early cell across **27 later cells with zero
+NameErrors**, so state does carry. The extra starts are non-kernel Python processes
+inheriting the `IPYTHONDIR` set on the whole `docker exec` — harmless but noisy, and
+worth narrowing so the prelude only loads where it is needed.
+
+**3. The real cause: one uninformative reply cost the entire adoption.** The agent
+probed the API exactly once, with `jobs.manifest()`. There was no NameError — `jobs`
+was bound — but the store was empty, `manifest()` returned the bare string `"no jobs"`,
+and IPython rendered that as an effectively empty cell result. The agent never touched
+the API again and spent the following 87 turns polling with cells that were literally
+`print(38)`.
+
+An empty state is the agent's likely *first* contact with an API, which makes it the
+worst possible place to say nothing. `manifest()` now names the next step
+(`submit` / `wait` / `get` / `help`) when there is nothing to list, pinned by a test
+asserting the empty case is not bare — and by a second test asserting the advice does
+**not** appear once there are real jobs to list, so it cannot crowd out the listing.
+
+This was invisible in aggregate — 87 turns and 0/5 look like a weak agent — and took
+reading one cell and its result. It is the clearest example in this file of why the
+first few trajectories must be read end to end.
+
+---
+
+## The kernel-wedge bug, and the first valid run (tacval8, 2026-08-12)
+
+Seven TAC runs produced no valid measurement. Root cause, found by starting the
+kernel by hand in the container and reading its stderr (not inferring from the
+trajectory):
+
+```
+File .../ipykernel/iostream.py, line 690, in flush
+    if not evt.wait(self.flush_timeout):        # kernel stdout flush
+File .../00-jobs.py, line 139, in _called_from_agent_code
+    if name == __file__:
+NameError: name '__file__' is not defined
+```
+
+Two compounding bugs:
+
+1. `__file__` is undefined when IPython runs a startup file. The frame classifier
+   referenced it, the NameError killed kernel init, and every cell returned "Kernel
+   did not respond within 5000ms". It never reproduced locally because the eval
+   harness loads the prelude via runpy.run_path, which SETS `__file__` — so the
+   startup-file path TAC uses was never exercised.
+2. `threading.Event.wait` was guarded, which put the classifier on ipykernel's
+   stdout-flush path. Removed — the third instance of "do not instrument
+   infrastructure" after %%bash and Popen.communicate.
+
+Both pinned as tests. Verified in-container: cells execute, `jobs` binds, `x=99`
+then `x+1` returns 100 (the kernel IS persistent — the earlier "not persistent"
+alarm was wrong twice over: persistent, and never starting).
+
+### First valid trajectory
+
+5 cells before a harness-timeout cut it short (graded:false), but the behaviour is
+exactly the target:
+
+| | baseline | tacval8 |
+|---|---|---|
+| blocking-sleep cells | 24 | **0** |
+| thread cells | 5 | **0** |
+| jobs cells | 14 | 1 (of 5 before cutoff) |
+
+Cell 5, unprompted and correct:
+
+```python
+jobs.submit("sleep 45", name="w1", max_runtime="2m")
+jobs.wait(wake_after=50)
+```
+
+The agent messaged both colleagues, then reached for the primitive to wait for
+replies — instead of the 24 in-cell sleeps and 48 threads of the recorded baseline.
+This is the first real evidence the runtime does what it was built for on a genuine
+long task. A completed, graded run (tacval9, 3000s cap) is needed before claiming a
+score effect — but the wait-behaviour result does not depend on the score.
+
+### tacval9 — completed and graded (n=1)
+
+| | baseline | tacval9 |
+|---|---|---|
+| cells | 89 | 24 |
+| blocking-sleep cells | 24 | 0 |
+| thread cells | 5 | 0 |
+| jobs cells | 14 | 8 |
+| turns | 43 | 25 |
+| cost | $0.67 | $0.57 |
+| score | 2/5 | 2/5 |
+| prelude starts | — | 2 |
+
+`prelude starts: 2` (not one-per-cell) confirms the kernel-wedge fix holds end to
+end. The runtime eliminates every anti-pattern (24→0 sleeps, 5→0 threads), runs ~40%
+cheaper and shorter, and does not move the score. The "3–7x turn explosion" reported
+from the broken runs is now confirmed as an artefact of the wedged kernel, not the
+runtime — a working kernel with the runtime is FASTER than the baseline, not slower.
+
+n=1, score unchanged rather than improved. But it is the first end-to-end valid
+measurement and it is positive on the axis the runtime targets.

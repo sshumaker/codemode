@@ -251,3 +251,182 @@ from mutable service state, the answer is no unless you captured it.
 Full status, the twelve harness bugs found (each of which produced a plausible
 number rather than an error), the benchmark's own defects, the outstanding
 logging plan, and the wait/wake design notes.
+
+## Deferred tool registration never worked — every "L1" number is an L4 number
+
+`--active-tools` never reaches print mode's session worker (rebuilt argv), and the
+lazy-registration path in `bench/arms/mcp-tools-extension.ts` is worse: it looks
+like it works. `load_tool` → `pi.registerTool` returns the schema, the model calls
+the tool, and prime answers **"Tool `<name>` not found"** — `prepareToolCall`
+resolves against `currentContext.tools`, a per-turn snapshot of
+`agent.state.tools`. Advertisement and executability share that snapshot, so an
+extension cannot add a callable tool mid-loop. Measured signature: **70 turns, 78
+tool calls, 0 reaching the transport, 32 errors, $1.71, failed.**
+
+Consequence: **any L1 result quoted from MCP-Bench is an L4 result under an L1
+label.** The residency dial's most interesting condition was never measured. Re-run
+before citing it.
+
+What does work: a fixed tool set whose *arguments* carry the tool identity —
+`search_tools` / `describe_tool` / `call_tool`, all registered at load time. That
+is also what several real MCP harnesses ship. It pays one real cost worth
+reporting rather than neutralising: the provider validates `call_tool`'s schema,
+not the inner tool's, so argument validation is lost — a genuine benefit of
+residency.
+
+A residency guard catches "schemas are still resident". Nothing was catching
+"narrowing worked and execution broke". Assert that a narrowed arm **reaches the
+transport at all**.
+
+## Sample on the axis you are measuring, deliberately
+
+Adding n buys a tighter interval around zero when the arms score the same. If the
+live signal is a cost decomposition driven by API-call volume, stratify the sample
+by call volume — low and high — rather than sampling more of whatever is
+convenient. Same trap as hillclimbing on the fast subset: a convenience sample
+selects on the axis under test.
+
+## The advantage is two independent factors, roughly equal and additive
+
+Measured on AppWorld as a 2×2 (`docs/BENCHMARK-SELECTION.md` §10), 8 tasks, Opus 5:
+
+| cell | ctx0 | actions | cost |
+|---|---|---|---|
+| code / docs non-resident | 4,630 | 8.9 | **$0.16** |
+| code / docs resident | 68,015 | 6.0 | $0.68 |
+| tools / docs non-resident (L1) | 8,992 | 41.6 | $0.73 |
+| tools / docs resident (L4) | 101,137 | 38.1 | $1.21 |
+| tools / upstream's API predictor | **6,490** | 36.9 | $0.64 |
+
+Two savings of about half a dollar each at a *median-call* task — but that
+apparent symmetry is an averaging artefact. Stratified by ground-truth call count
+(n=10 per stratum, one variant per generator, train+dev):
+
+| | low (11.5 calls) | high (101.8 calls) |
+|---|---|---|
+| residency saving | $0.524 | $0.504 |
+| representation saving | **$0.070** | **$0.764** |
+| tools/code cost ratio | **1.6x** | **6.6x** |
+
+**Residency is a fixed per-task tax, independent of task size. Composition is
+proportional to the work done.** They only look equal at a median task.
+
+Paired over tasks (`bench/stats.mjs`, paired t + exact sign test):
+
+| | low (n=10) | high (n=10) |
+|---|---|---|
+| residency, code row | $0.521 ± 0.066, t=25.0, sign 10/10 | $0.506 ± 0.023, t=69.3, sign 10/10 |
+| representation, docs-out | $0.067 ± 0.029, t=7.41, sign 10/10 | $0.766 ± 0.352, t=6.88, sign 10/10 |
+
+**The small-task representation effect is small but not absent** — an earlier draft
+of this note said "essentially zero" and that was wrong; code is *always* cheaper,
+by an eleven-fold smaller margin on small tasks. The actionable form is a ratio:
+
+> **On small tasks residency is worth about eight times more than representation;
+> on large tasks representation overtakes it.** Both are real everywhere — the
+> question is only which dominates. Small workloads: fix residency first. Large
+> workloads: the REPL is the thing, and neither deferred schemas nor batching nor
+> server-side projection substitutes for it.
+
+Only two contrasts are defensible: **residency measured on the code row, and
+representation measured with docs non-resident.** The `docs-in` column fails the
+sign test in both strata (6/10 p=0.75, 7/10 p=0.34) despite t-test p=0.08/0.06 —
+because `tools/docs-in` made 37.6 API calls against `docs-out`'s 63.0, i.e. it did
+less work. **The sign test caught a confound the t-test nearly waved through**;
+cost differences are right-skewed, so when the two disagree, believe the sign test.
+
+All of it is **Opus 5 only**. Residency is a token-price effect and scales with
+model cost; representation is a capability effect and may not survive a weaker
+model. Neither is tested.
+
+The predictor row is the clincher: **the lowest first-turn context of any tools
+arm, below our own L1, and it still costs $0.64.** Residency is fully solved
+there and most of the cost remains — what remains is 36.9 sequential tool calls.
+
+Mechanism: **cost ≈ actions × context.** Representation acts on *actions* (6–9 for
+code vs 37–42 for tools at matched 37–43 API calls, barely moving with residency);
+residency acts on *tokens per action* (101k → 9k → 6.5k with actions barely
+moving).
+
+### It is not round trips — the representation term is "code can discard"
+
+An earlier version of this note predicted that a tools arm with **parallel** tool
+calls would close the action gap. **Measured, and false: the tools arms were
+already batching.** Vanilla L4 averages **4.6 tool calls per turn (max 11)** and
+the predictor arm 4.4 (max 12), while codemode is strictly **1.00 action per turn
+and still takes fewer turns** (8.7 vs 9.4). Dispatch was never the constraint.
+
+What is:
+
+| cell | output tokens | ctx accumulated beyond catalogue |
+|---|---|---|
+| codemode | 954–1,265 | ~39k |
+| vanilla (any residency) | 6,174–10,072 | ~108k |
+
+**5–8× the output tokens and ~2.7× the accumulated context, at matched API
+calls.** One code block per turn versus 37–41 JSON tool-call blocks, and every
+tool result enters context verbatim whereas a cell prints only what the code chose
+to print. (Output tokens are direct; the accumulation figure models catalogue cost
+as ctx0 × turns and is indicative — quote the output tokens.)
+
+The structural claim is about **who decides what survives**: with code the
+*caller* decides, per call, at run time; with tool-calling the *tool author*
+decided at schema-design time for every future call. Batching cannot help — eleven
+parallel calls still return eleven whole payloads.
+
+### Emission dominates reception, 87/13 — measured, not assumed
+
+Mirror test: an otherwise identical code arm *forbidden to filter* ("print every
+response in full"). Output tokens moved **−5%**; accumulated context **+115%**;
+cost +74%. So filtering controls reception and has essentially no effect on
+emission — the agent still emits one code block per turn either way.
+
+Decomposing the high-stratum representation term ($0.764):
+
+- **reception** (what a server-side projection argument could recover): **$0.100, ~13%**
+- **emission + per-result framing** (irreducible without code execution): **$0.664, ~87%**
+
+Even forbidden to discard anything, code is still **3.8× cheaper** than tools. So
+a response-projection argument on MCP tools is a **useful optimisation with a
+measured ceiling**, not the answer — recovers at least $0.100 and less than
+$0.664 (the bracket is honest because the mirror still returns one cell result per
+turn rather than N tool results, so some of the 87% is framing projection would
+also touch).
+
+So neither "code beats tool-calling" nor "it's really just residency" survives.
+TGC was 6–7 of 8 in every cell: **no score signal at all.**
+
+### Consequences for earlier results
+
+- **MCP-Bench's +0.050 is a representation-AND-residency measurement**, not a
+  representation one: its codemode arm is L0 and its vanilla arm is L4. The same
+  confound this 2×2 decomposes. Re-run as a factorial before citing it.
+- Score is the wrong endpoint once arms saturate. On AppWorld an identical config
+  on an identical task scored **8/8 then 3/8** on re-run — the ~27% noise landing
+  on the score itself. Use cost and action counts as primary; report score as
+  underpowered.
+
+### Always pre-warm the kernel before timing anything
+
+Codemode's first action took 190s mean / 310s max — **not** venv bootstrap and not
+the dead proxy. The kernel venv is 285 MB and the first boot page-faults it in;
+identical configs differ 15× cold vs warm, and six concurrent workers turned 70s
+into 310s. `bench/appworld/prewarm.mjs` boots one kernel and discards it: mean
+wall-clock 204s → 39s, which *reverses* the latency direction (code 33–41s, tools
+118–128s). Without it you will report "code is slower" from a one-time cost.
+
+
+## A documented check is not an executed check
+
+Two instances, one night:
+
+- **CLAUDE.md has mandated a paired t-test since the v3 episode. The repo contained
+  none.** `report.mjs` printed mean ratios over paired tasks and stopped, so every
+  comparison since was quoted without the statistic the rules required.
+- **The vanilla L1 arm was never L1.** Deferred registration returned schemas the
+  model could see and never call; the label was believed, the behaviour was not.
+
+Both were believed to be in force for months. When a rule here matters, pin it as
+a test that runs (`bench/test/fairness.test.mjs`) and assert on the observable
+effect — a statistic actually printed, a transport actually reached. Prose in a
+rules file is a statement of intent, not a control.

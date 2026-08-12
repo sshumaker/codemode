@@ -7,10 +7,13 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "node --test \"bench/test/*.test.mjs\"",
+    "test": "npm run test:js && npm run test:runtime",
     "report": "node bench/residency-report.mjs",
     "iterate": "node bench/quick.mjs",
-    "validate": "node bench/validate.mjs"
+    "validate": "node bench/validate.mjs",
+    "test:js": "node --test \"bench/test/*.test.mjs\"",
+    "test:runtime": "python3 -m unittest discover -s runtime -p 'test_*.py'",
+    "eval:jobs": "node runtime/eval/all.mjs"
   },
   "keywords": [],
   "author": "",
@@ -19,5 +22,8 @@
   "dependencies": {
     "js-tiktoken": "^1.0.21"
   },
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.71"
+  }
 }

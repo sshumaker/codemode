@@ -239,14 +239,27 @@ sub(
 sub(
 	"core/tools/ipython.ts",
 	"\t\t\t\tlet text = r.stdout;",
-	"\t\t\t\tlet text = r.stdout;\n" +
-		"\t\t\t\tif (cellTimedOut) {\n" +
+	// The cell timer must stop when the cell RETURNS, not in the `finally`.
+	//
+	// Found by reading a trajectory: an agent used jobs.wait(wake_after=90)
+	// correctly and was told "[this cell was INTERRUPTED after 60s]". It had not
+	// been. The cell finished in milliseconds; the 90s host-side wait happens
+	// after it, and the 60s timer ran through that and set cellTimedOut. Every
+	// wait longer than the cell timeout accused a correct cell of being cut off,
+	// teaching the agent to distrust the primitive it had just used properly.
+	"\t\t\t\tclearTimeout(cellTimer);\n" +
+		"\t\t\t\tconst cellTimedOutWhileExecuting = cellTimedOut;\n" +
+		"\t\t\t\tlet text = r.stdout;\n" +
+		"\t\t\t\tif (cellTimedOutWhileExecuting) {\n" +
 		"\t\t\t\t\ttext =\n" +
 		"\t\t\t\t\t\t`[this cell was INTERRUPTED after ${Math.round(cellTimeoutMs / 1000)}s and did not finish. ` +\n" +
 		"\t\t\t\t\t\t`Any output below is partial, and whatever it was computing did NOT complete. ` +\n" +
 		"\t\t\t\t\t\t`Variables bound before this cell are still available. Do not assume this ` +\n" +
-		"\t\t\t\t\t\t`worked — either make it faster, bound it yourself, or run it in the ` +\n" +
-		"\t\t\t\t\t\t`background and poll.]\\n\\n${text}`;\n" +
+		"\t\t\t\t\t\t`worked. For work that legitimately takes this long, hand it to a job so it ` +\n" +
+		"\t\t\t\t\t\t`outlives the cell:\\n` +\n" +
+		"\t\t\t\t\t\t`    jobs.submit('your command', name='pick-a-name')\\n` +\n" +
+		"\t\t\t\t\t\t`    jobs.wait(wake_after=120)   # last line of the cell\\n` +\n" +
+		"\t\t\t\t\t\t`then jobs.get('pick-a-name') to collect it.]\\n\\n${text}`;\n" +
 		"\t\t\t\t}",
 	"tell the model when a cell was interrupted",
 	"this cell was INTERRUPTED after",
@@ -264,6 +277,36 @@ sub(
 		"\t\t\t\tif (hasWorkingMessage) {",
 	"clear the cell timer",
 	"clearTimeout(cellTimer);",
+);
+
+// The hosted-runtime v1 surface (docs/HOSTED-RUNTIME-DESIGN.md §4).
+//
+// Two patches. First: when a cell prints the wait sentinel, the *tool* sleeps —
+// after the cell has finished and the kernel is free. That is the whole point.
+// `time.sleep(235)` inside a cell holds a single-threaded kernel for the interval
+// and collides with the cell timeout; this holds nothing. Same wall-clock, no
+// kernel, no frame, no thread.
+//
+// Second: `threading.Thread` and long `time.sleep` fail loudly, pointing at
+// jobs.*. The agent wrote the in-process form four times unprompted on one task
+// — the in-distribution pull is strong enough that documentation loses to it.
+log("\nhosted runtime (jobs):");
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\tlet text = r.stdout;",
+	"\t\t\t\tlet text = r.stdout;\n" +
+		"\t\t\t\t// jobs.wait(wake_after=N) — the cell has already returned, so this\n" +
+		"\t\t\t\t// sleep holds nothing. See bench/tac/jobs_runtime.py.\n" +
+		"\t\t\t\tconst waitMatch = /__HARNESS_WAIT_SECONDS__:(\\d+)/.exec(text);\n" +
+		"\t\t\t\tif (waitMatch) {\n" +
+		"\t\t\t\t\tconst secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));\n" +
+		"\t\t\t\t\tsetToolWorkingMessage(`waiting ${secs}s (kernel released)`);\n" +
+		"\t\t\t\t\tawait new Promise((resolve) => setTimeout(resolve, secs * 1000));\n" +
+		"\t\t\t\t\ttext = text.replace(waitMatch[0], `[waited ${secs}s outside the kernel]`);\n" +
+		"\t\t\t\t}",
+	"host-side wait for jobs.wait",
+	"__HARNESS_WAIT_SECONDS__",
 );
 
 log("\ncontainer kernel:");
@@ -312,3 +355,40 @@ sub(
 );
 
 log("\ndone.");
+
+// --- sandbox the REPL, not the agent -----------------------------------------
+//
+// Hands, not brain. The agent process runs no model-authored code — it talks to the
+// model API and owns a daemon socket. The kernel is where code the model wrote
+// actually executes, so it is the only thing that needs an OS-level boundary.
+//
+// Wrapping the agent instead was tried first and is wrong twice: it buys nothing
+// (nothing untrusted runs there) and it breaks the daemon, whose Unix socket srt
+// blocks by default.
+//
+// It is also where benchmark integrity lives. `curl` to an API that the MCP tools
+// wrap happens in a *cell*. A network allowlist on the kernel is the enforcement the
+// dead-proxy trick was approximating — and on Linux it is airtight, because srt
+// removes the network namespace entirely and routes over Unix sockets, so unsetting
+// http_proxy leaves no route rather than an unfiltered one.
+//
+// Gated on HARNESS_KERNEL_SANDBOX_SETTINGS: with it unset the spawn is byte-identical
+// to upstream, so an unsandboxed run is unchanged and the two are comparable.
+log("\nsandboxed kernel:");
+
+sub(
+	"core/kernel/index.ts",
+	`\t\t\tconst kernel = spawn(python, ["-m", "ipykernel_launcher", "-f", connection.path], {`,
+	`\t\t\t// Sandbox the REPL (hands), never the agent (brain). See\n` +
+		`\t\t\t// scripts/neutralize-prime.mjs and runtime/eval/run.mjs.\n` +
+		`\t\t\tconst sandboxSettings = process.env.HARNESS_KERNEL_SANDBOX_SETTINGS;\n` +
+		`\t\t\tconst sandboxBin = process.env.HARNESS_KERNEL_SANDBOX_BIN ?? "srt";\n` +
+		`\t\t\tconst kernelArgv: [string, string[]] = sandboxSettings\n` +
+		`\t\t\t\t// srt takes SPLIT argv, not one command string: the README's\n` +
+		`\t\t\t\t// \`srt "cmd"\` form fails with "command not found".\n` +
+		`\t\t\t\t? [sandboxBin, ["--settings", sandboxSettings, python, "-m", "ipykernel_launcher", "-f", connection.path]]\n` +
+		`\t\t\t\t: [python, ["-m", "ipykernel_launcher", "-f", connection.path]];\n` +
+		`\t\t\tconst kernel = spawn(kernelArgv[0], kernelArgv[1], {`,
+	"sandbox the ipython kernel",
+	"HARNESS_KERNEL_SANDBOX_SETTINGS",
+);

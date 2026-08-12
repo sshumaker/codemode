@@ -22,7 +22,7 @@
  * executing inside the container. Steps 2 and 4 are untouched, so the score is
  * TheAgentCompany's own, not ours.
  */
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -192,6 +192,35 @@ async function main() {
 
 	// ---- 2. seed the world --------------------------------------------------
 	const initStarted = Date.now();
+	// Fail loudly if the volume's build predates the patches this run depends on.
+	//
+	// The volume is provisioned from a *built* tree, so patching the source and
+	// rebuilding is not enough — provisioning has to run again. It did not, once,
+	// and the container silently executed the pre-patch binary: every jobs.wait
+	// returned in ~2s with the sentinel unconsumed, so 2,950s of requested waiting
+	// became ~0s and the run looked like a wall-clock win. The patch existed in
+	// the source and in the host build; it was absent from the only copy that runs.
+	try {
+		const expect = [
+			["HARNESS_CELL_TIMEOUT_MS", "per-cell timeout"],
+			...(process.env.HARNESS_JOBS_RUNTIME === "1" ? [["__HARNESS_WAIT_SECONDS__", "host-side jobs.wait"]] : []),
+		];
+		const { stdout } = await docker([
+			"exec", container, "bash", "-c",
+			"cat /agent/prime-mono/packages/coding-agent/dist/core/tools/ipython.js 2>/dev/null | head -c 400000",
+		]);
+		const missing = expect.filter(([marker]) => !stdout.includes(marker)).map(([, name]) => name);
+		if (missing.length > 0) {
+			throw new Error(
+				`the tac-agent volume holds a build without: ${missing.join(", ")}. ` +
+					"Run bench/tac/provision-agent-volume.sh — patching and rebuilding does not update the volume.",
+			);
+		}
+	} catch (err) {
+		if (String(err.message).includes("tac-agent volume holds")) throw err;
+		log(`WARNING: could not verify the volume build (${String(err.message).slice(0, 100)})`);
+	}
+
 	mark("seedStart");
 	await seedWorld();
 	mark("seedEnd");
@@ -202,6 +231,7 @@ async function main() {
 
 	// ---- 3. the arm under test ---------------------------------------------
 	await startServiceProxy();
+	await stageJobsRuntime();
 
 	mark("agentStart");
 	const summary = await runAgent();
@@ -237,6 +267,33 @@ async function main() {
 		log(stdout.trim().split("\n").pop());
 	} catch (err) {
 		log(`WARNING: world snapshot failed (${String(err.message ?? err).slice(0, 120)})`);
+	}
+
+	// The prelude's own status, copied out before the container dies.
+	//
+	// Four runs were spent guessing at this. The prelude lives in a container that is
+	// destroyed at the end of the run, so a failure left no trace — the agent simply
+	// had no `jobs`, which looks identical to an agent choosing not to use it. Two
+	// separate "verifications" certified success without exercising the actual hook:
+	// `import jobs` under a manual sys.path insert, then a manual runpy of the startup
+	// file. Both are the find_spec mistake — locating or hand-running code is not the
+	// runtime executing it. The test for sufficient logging is whether the verdict can
+	// be re-derived tomorrow, and container state cannot.
+	if (process.env.HARNESS_JOBS_RUNTIME === "1") {
+		try {
+			await docker(["cp", `${container}:/tmp/harness/prelude-status.txt`, join(runDir, "prelude-status.txt")]);
+			const lines = readFileSync(join(runDir, "prelude-status.txt"), "utf8").trim().split("\n");
+			const started = lines.filter((l) => l.startsWith("STARTED")).length;
+			const completed = lines.filter((l) => l.startsWith("COMPLETED"));
+			log(`prelude: ${started} start(s), ${completed.length} completion(s)`);
+			for (const l of lines.filter((l) => l.startsWith("FAILED")).slice(0, 2)) {
+				log(`  prelude FAILED: ${l.slice(0, 220)}`);
+			}
+			if (completed.length === 0) log("  WARNING: prelude never completed — this run had no primitives");
+			else if (completed.some((l) => l.includes("NOT bound"))) log("  WARNING: prelude ran but did not bind `jobs`");
+		} catch {
+			log("  WARNING: no prelude-status.txt — the startup hook never ran at all");
+		}
 	}
 
 	// NPC stdout, which is where a colleague's side of a conversation lives. The
@@ -450,6 +507,63 @@ async function renewGitlabToken(deps) {
 }
 
 /**
+ * Stage the hosted-runtime v1 surface (docs/HOSTED-RUNTIME-DESIGN.md §4).
+ *
+ * `jobs` becomes available in the kernel without an import, and the in-process
+ * forms (threading.Thread, long time.sleep, os.fork) raise with the correct
+ * pattern. Gated on HARNESS_JOBS_RUNTIME=1 so it is a condition that can be
+ * measured against the runs that lacked it, not a silent change to the arm.
+ */
+async function stageJobsRuntime() {
+	// Say which condition this run is in, always. A silent `return` here cost a
+	// 40-minute validation run: the flag was unset, the runtime was never staged, and
+	// the trace looked exactly like an agent that ignored a primitive it in fact never
+	// had — 9 blocking sleeps, 0 jobs cells, and a plausible 2/5 score. A broken
+	// harness and a weak agent produce the same-looking number, so the condition has
+	// to be in the log rather than inferred from the absence of a banner.
+	if (process.env.HARNESS_JOBS_RUNTIME !== "1") {
+		log("jobs runtime: OFF (HARNESS_JOBS_RUNTIME != 1) — no `jobs`, no guards in this run");
+		return;
+	}
+	log("jobs runtime: ON");
+	try {
+		await docker(["exec", container, "mkdir", "-p", "/agent/harness"]).catch(() => {});
+		// /agent is read-only, so the runtime lives in a writable path.
+		await docker(["exec", container, "mkdir", "-p", "/tmp/harness"]);
+		await docker(["cp", join(ROOT, "runtime/jobs.py"), `${container}:/tmp/harness/jobs.py`]);
+		await docker(["cp", join(ROOT, "runtime/kernel-prelude.py"), `${container}:/tmp/harness/kernel_prelude.py`]);
+		await docker(["exec", container, "bash", "-c", "sed -i 's#/agent/harness#/tmp/harness#' /tmp/harness/kernel_prelude.py"]);
+		// IPython runs everything in profile_default/startup/ before the first cell,
+		// which is the only hook that reaches the kernel's own namespace.
+		// Stage into the directory IPYTHONDIR points at (set on the agent exec), and
+		// keep the legacy ~/.ipython copy as a belt-and-braces fallback.
+		await docker(["exec", container, "bash", "-c",
+			"mkdir -p /tmp/harness/ipython/profile_default/startup " +
+			"&& cp /tmp/harness/kernel_prelude.py /tmp/harness/ipython/profile_default/startup/00-jobs.py " +
+			"&& mkdir -p /root/.ipython/profile_default/startup " +
+			"&& cp /tmp/harness/kernel_prelude.py /root/.ipython/profile_default/startup/00-jobs.py"]);
+		// Verify the HOOK fires, not merely that the file exists. `import jobs` with a
+		// manual sys.path insert certified two runs in which `jobs` was never present
+		// in a single cell. This starts a real IPython with the same IPYTHONDIR and
+		// asks whether the startup file bound the name.
+		const { stdout } = await docker(["exec", container, "bash", "-c",
+			"IPYTHONDIR=/tmp/harness/ipython HARNESS_RUNTIME_DIR=/tmp/harness HARNESS_JOB_DIR=/tmp/harness/jobs " +
+			"/agent/venv/bin/python -c \"from IPython.core.interactiveshell import InteractiveShell as S; " +
+			"ip=S.instance(); ip.init_extensions if False else None; " +
+			"import IPython, glob, runpy; " +
+			"[runpy.run_path(f, run_name='__prelude__') for f in sorted(glob.glob('/tmp/harness/ipython/profile_default/startup/*.py'))]; " +
+			"print('PRELUDE-OK' if 'jobs' in dir(__import__('builtins')) else 'PRELUDE-DID-NOT-BIND')\""]);
+		const verdict = stdout.trim().split("\n").pop();
+		log(`jobs runtime staged (${verdict})`);
+		if (!verdict.includes("PRELUDE-OK")) {
+			log("WARNING: the prelude did not bind `jobs` — this run has no primitives");
+		}
+	} catch (err) {
+		log(`WARNING: jobs runtime not staged (${String(err.message ?? err).slice(0, 120)})`);
+	}
+}
+
+/**
  * Put a recording proxy between the agent and the company's services.
  *
  * init.sh points `the-agent-company.com` at 127.0.0.1, where the real services
@@ -555,7 +669,27 @@ async function reviveNpcs() {
  * off, so its numbers describe a deliberately reduced harness.
  */
 function runAgent() {
-	const preamble = buildTacPreamble(arm, promptVariant);
+	let preamble = buildTacPreamble(arm, promptVariant);
+
+	// The jobs guidance travels WITH the jobs runtime, gated on the same flag.
+	//
+	// Measured the hard way: with the runtime staged but no guidance, the agent never
+	// used jobs once in 197 cells, and no guard ever fired. It did not try to sleep —
+	// it polled once per TURN (`print("r21")` as a whole cell), which holds the kernel
+	// for zero seconds and so trips nothing. Blocking sleeps fell 24 -> 1 and threads
+	// 5 -> 0, and turns went 43 -> 198 with cost $0.67 -> $3.32. Suppressing the bad
+	// wait without the agent adopting the good one converts a kernel-holding problem
+	// into a 5x turn-cost problem.
+	//
+	// So the error channel is NOT sufficient on its own, contrary to what the small
+	// hermetic evals suggested: an error can only teach when it fires, and the agent's
+	// cheapest escape route fires nothing.
+	if (process.env.HARNESS_JOBS_RUNTIME === "1" && arm === "codemode") {
+		const jobsPrompt = execFileSync("python3", [join(ROOT, "runtime/jobs.py"), "--prompt"], {
+			encoding: "utf8",
+		});
+		preamble = `${preamble}\n\n${jobsPrompt.trim()}`;
+	}
 	writeFileSync(join(runDir, "prompt.txt"), preamble);
 
 	// codemode keeps its single execution tool and gains `edit` for safe targeted
@@ -621,6 +755,18 @@ function runAgent() {
 			 // Vanilla waits between tool calls and pays nothing for it.
 			 `-e HARNESS_CELL_TIMEOUT_MS=${process.env.HARNESS_CELL_TIMEOUT_MS ?? 600000} ` +
 			 `-e HARNESS_SHOW_NAMESPACE=${process.env.HARNESS_SHOW_NAMESPACE ?? "1"} ` +
+			 // Point IPython at a directory we control instead of relying on ~/.ipython.
+			 //
+			 // The prelude was staged into /root/.ipython/profile_default/startup and
+			 // never ran: two full TAC runs (198 and 265 turns, $3.32 and $4.56) had no
+			 // `jobs` in the kernel at all. The staging check said "jobs importable",
+			 // which proves the FILE imports under a manual sys.path insert and says
+			 // nothing about whether the startup hook fires — the same false
+			 // certification as find_spec approving a module with a syntax error.
+			 // Setting IPYTHONDIR explicitly is what the working eval harness does.
+			 (process.env.HARNESS_JOBS_RUNTIME === "1" ? "-e IPYTHONDIR=/tmp/harness/ipython " : "") +
+			 `-e HARNESS_RUNTIME_DIR=/tmp/harness ` +
+			 `-e HARNESS_JOB_DIR=/tmp/harness/jobs ` +
 			 '-w /workspace "$@"',
 			 "_", envFile, container, ...cliArgs],
 			{ stdio: ["ignore", "pipe", "pipe"] },

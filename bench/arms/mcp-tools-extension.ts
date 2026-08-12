@@ -25,6 +25,16 @@ const PROXY = process.env.HARNESS_MCP_PROXY ?? "http://127.0.0.1:8765";
 const SERVERS = (process.env.HARNESS_MCP_SERVERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 const RUN_ID = process.env.HARNESS_RUN_ID ?? "";
 const RESIDENCY = process.env.HARNESS_RESIDENCY ?? "L4";
+/**
+ * Optional explicit subset of wire names to expose, comma-separated.
+ *
+ * Used by the `predicted` arm, which mirrors AppWorld's own APIPredictor: an LLM
+ * call narrows the catalogue to <=20 APIs before the agent starts, and only those
+ * are registered. Registration (not activation) is the right mechanism here
+ * because the subset is fixed for the whole session — the failure mode documented
+ * in the L1 branch only bites when the set changes mid-run.
+ */
+const SUBSET = (process.env.HARNESS_TOOL_SUBSET ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
 interface McpTool {
 	name: string;
@@ -73,7 +83,13 @@ export default function (pi: ExtensionAPI) {
 		for (const tool of tools) index.set(wireName(server, tool.name), { server, tool });
 	}
 
-	if (RESIDENCY === "L4") {
+	if (SUBSET.length > 0) {
+		const unknown = SUBSET.filter((n) => !index.has(n));
+		if (unknown.length > 0) throw new Error(`HARNESS_TOOL_SUBSET names tools that do not exist: ${unknown.join(",")}`);
+		for (const name of [...index.keys()]) if (!SUBSET.includes(name)) index.delete(name);
+	}
+
+	if (RESIDENCY === "L4" || RESIDENCY === "predicted") {
 		for (const [name, { server, tool }] of index) {
 			pi.registerTool({
 				name,
@@ -92,32 +108,48 @@ export default function (pi: ExtensionAPI) {
 
 	if (RESIDENCY !== "L1") throw new Error(`unsupported vanilla residency: ${RESIDENCY}`);
 
-	// Deferral by *registration*, not activation.
+	// L1: names resident, schemas on demand, dispatched through one call_tool.
 	//
-	// The obvious route — allowlist all 250 via --tools, activate a few via
-	// initialActiveToolNames — does not work: _buildRuntime unconditionally
-	// activates every allowed tool (patched), and the CLI flag is then dropped
-	// again when print mode re-spawns a session worker with a rebuilt argv.
+	// Three attempts, recorded because the first two each produced a run that
+	// looked plausible and was not L1:
 	//
-	// Only *registered* tools are sent to the provider, so registering a tool
-	// lazily achieves the same deferral with none of that plumbing. load_tool
-	// registers on demand; everything else stays unknown to the model.
+	//  1. Allowlist all N via --tools and narrow with the --active-tools CLI flag.
+	//     The flag does not reach print mode's session worker, which rebuilds argv,
+	//     so the run was silently L4 under an L1 label. That is what the residency
+	//     guard in run-task.mjs exists to catch.
+	//
+	//  2. Deferral by *registration* — register only the meta-tools, and have
+	//     load_tool call pi.registerTool on demand. The schema comes back correctly,
+	//     the model calls the tool, and prime answers "Tool <name> not found":
+	//     `prepareToolCall` resolves against `currentContext.tools`, a per-turn
+	//     snapshot of `agent.state.tools`
+	//     (packages/agent/dist/agent-loop.js:538). Measured on AppWorld: 70 turns,
+	//     78 tool calls, **0** reaching the transport, 32 errors, $1.71, failed.
+	//
+	//  3. Register everything up front and narrow with `pi.setActiveTools`. This
+	//     half-worked and is the instructive one: residency was genuinely reduced
+	//     (first turn 8,748 prompt tokens against L4's 101,137), so the model no
+	//     longer saw the catalogue — but execution still answered "not found", so
+	//     again 0 calls reached the transport. Advertisement and executability are
+	//     controlled by the same per-turn snapshot, and an extension cannot update
+	//     it mid-loop.
+	//
+	// So dynamic tool *identity* is not expressible in this harness. What is
+	// expressible is a fixed set of tools whose *arguments* carry the identity:
+	// `search_tools` / `describe_tool` / `call_tool`. All three are registered at
+	// load time and never change, so `prepareToolCall` always resolves them, and the
+	// N schemas stay out of context until asked for. This is also what a number of
+	// real MCP harnesses ship.
+	//
+	// The honest cost to this arm, which must be reported with any result: the model
+	// does not get provider-side validation of the inner call's arguments, because
+	// as far as the provider is concerned it called `call_tool`. That is a small
+	// ergonomic penalty relative to L4, and it is the price of not having the
+	// schemas resident — which is the trade-off under study, not a handicap we
+	// imposed. `describe_tool` returns the exact JSON Schema so the model can
+	// satisfy it, and `call_tool` validates required parameters itself and says what
+	// is missing.
 	const summary = [...index].map(([name, { tool }]) => `${name} — ${firstLine(tool.description)}`);
-	const loaded = new Set<string>();
-
-	function registerReal(name: string) {
-		if (loaded.has(name)) return;
-		const entry = index.get(name);
-		if (!entry) throw new Error(`Unknown tool "${name}". Use search_tools to find valid names.`);
-		loaded.add(name);
-		pi.registerTool({
-			name,
-			label: `${entry.server}: ${entry.tool.name}`,
-			description: entry.tool.description ?? "",
-			parameters: (entry.tool.inputSchema ?? { type: "object", properties: {} }) as never,
-			execute: (_id: string, params: unknown) => invoke(entry.server, entry.tool.name, params),
-		});
-	}
 
 	pi.registerTool({
 		name: "search_tools",
@@ -137,11 +169,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "load_tool",
-		label: "Load tool",
+		name: "describe_tool",
+		label: "Describe tool",
 		description:
-			"Load one or more tools by exact name. Returns their parameter schemas AND makes them directly " +
-			"callable for the rest of this session. You must load a tool before you can call it.",
+			"Get the full JSON Schema for one or more tools by exact name. Call this before call_tool " +
+			"unless you already know the parameters.",
 		parameters: {
 			type: "object",
 			properties: { names: { type: "array", items: { type: "string" }, description: "Exact tool names." } },
@@ -149,21 +181,51 @@ export default function (pi: ExtensionAPI) {
 		} as never,
 		async execute(_id: string, params: { names: string[] }) {
 			const wanted = params?.names ?? [];
-			for (const n of wanted) registerReal(n);
-			const schemas = wanted.map((n) => {
-				const e = index.get(n)!;
+			const out = wanted.map((n) => {
+				const e = index.get(n);
+				if (!e) return { name: n, error: `Unknown tool. Use search_tools to find valid names.` };
 				return {
 					name: n,
 					description: e.tool.description ?? "",
 					input_schema: e.tool.inputSchema ?? { type: "object", properties: {} },
 				};
 			});
-			return {
-				content: [
-					{ type: "text", text: `Loaded ${wanted.length} tool(s); now directly callable.\n\n${JSON.stringify(schemas, null, 2)}` },
-				],
-				details: {},
-			};
+			return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "call_tool",
+		label: "Call tool",
+		description:
+			"Call one of the available tools by exact name. `arguments` must match the tool's JSON Schema — " +
+			"use describe_tool first if you do not know it. Returns the tool's result.",
+		parameters: {
+			type: "object",
+			properties: {
+				name: { type: "string", description: "Exact tool name, e.g. spotify__login." },
+				arguments: { type: "object", description: "Arguments object matching the tool's input schema." },
+			},
+			required: ["name", "arguments"],
+		} as never,
+		async execute(_id: string, params: { name: string; arguments?: Record<string, unknown> }) {
+			const entry = index.get(params?.name);
+			// Thrown, so it reaches the model as a tool error the same way an unknown
+			// tool name would at L4. Otherwise a typo reads as a successful call.
+			if (!entry) throw new Error(`Unknown tool "${params?.name}". Use search_tools to find valid names.`);
+			// Deliberately NOT pre-validated against the inner tool's schema.
+			//
+			// A local required-parameter check here would be more helpful, and it would
+			// make this arm's error text differ from what codemode and L4 receive for
+			// the same mistake — which is a difference in error legibility, not in
+			// representation. Every arm gets the server's own message verbatim; only
+			// the delivery differs, and the delivery difference IS the independent
+			// variable. Verified byte-for-byte by bench/appworld/error-symmetry.mjs.
+			//
+			// L4 does get provider-side validation of these arguments for free. That is
+			// a real advantage of having the schema resident, and it should be visible
+			// in the results rather than neutralised here.
+			return invoke(entry.server, entry.tool.name, params?.arguments ?? {});
 		},
 	});
 }

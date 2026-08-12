@@ -3,6 +3,7 @@
  * Fast iteration loop.
  *
  *   bench/quick.mjs <env-file> [--variants v1,v5] [--arms codemode] [--repeat 2]
+ *   bench/quick.mjs <env-file> --cells 2x2 [--repeat 2]    the factorial, paired
  *
  * The full sweep takes ~2 hours because a handful of tasks run 10-12 minutes
  * each; the median task finishes in 137s. This runs only the fast tasks, at high
@@ -92,32 +93,131 @@ if (repeat < 2 && variants.length > 1) {
 }
 
 const available = new Set(loadTasks().map((t) => t.id));
-const tasks = FAST_TASKS.filter((t) => available.has(t));
+// --tasks narrows the fast set, for validating a new cell before paying for the
+// whole factorial. It cannot widen it: FAST_TASKS is the speed-selected subset and
+// CLAUDE.md records that efficiency findings on it do not generalise.
+const taskFlag = flag("tasks", "");
+const requested = taskFlag ? taskFlag.split(",").map((s) => s.trim()) : null;
+if (requested) {
+	const unknown = requested.filter((t) => !FAST_TASKS.includes(t));
+	if (unknown.length) {
+		console.error(`--tasks names tasks outside the fast set: ${unknown.join(",")}\nfast set: ${FAST_TASKS.join(",")}`);
+		process.exit(2);
+	}
+}
+const tasks = FAST_TASKS.filter((t) => available.has(t)).filter((t) => !requested || requested.includes(t));
 
 if (tasks.length === 0) {
 	console.error("no fast tasks are currently runnable — check bench/validate.mjs and the task filters");
 	process.exit(1);
 }
 
+/**
+ * The 2x2 from docs/DESIGN.md, as MCP-Bench cells.
+ *
+ * Deliberately the same four cells AppWorld's factorial.mjs runs — representation
+ * (code | tools) x documentation residency (in | out) — because the open question
+ * is whether the AppWorld result reproduces, and two benchmarks running two
+ * different designs answer nothing. MCP-Bench is the mirror-image control: its
+ * bias on pagination runs the other way.
+ *
+ * Prompts differ per benchmark because the variant names do (q8/w2/w3 here,
+ * a1/b1/b2 there); the *structure* is identical. Within each row the two cells now
+ * share their guidance verbatim, so residency is the only thing that varies.
+ */
+const CELLS_2X2 = [
+	{ key: "code / docs out", row: "code", col: "out", arm: "codemode", residency: "L0", prompt: "q8" },
+	{ key: "code / docs in", row: "code", col: "in", arm: "codemode", residency: "L4", prompt: "q8" },
+	{ key: "tools / docs out", row: "tools", col: "out", arm: "vanilla", residency: "L1", vanillaPrompt: "w3" },
+	{ key: "tools / docs in", row: "tools", col: "in", arm: "vanilla", residency: "L4", vanillaPrompt: "w2" },
+];
+
+// --cells runs the factorial instead of variants x arms. Named subsets allowed so
+// a single cell can be re-run without re-running the other three.
+const cellsFlag = flag("cells", "");
+const selectedCells = cellsFlag
+	? cellsFlag === "2x2"
+		? CELLS_2X2
+		: CELLS_2X2.filter((c) => cellsFlag.split(",").map((s) => s.trim()).includes(c.key))
+	: null;
+if (cellsFlag && selectedCells.length === 0) {
+	console.error(`--cells matched nothing. Available: 2x2, or any of: ${CELLS_2X2.map((c) => `"${c.key}"`).join(", ")}`);
+	process.exit(2);
+}
+
 const jobs = [];
-for (const variant of variants) {
-	for (const arm of arms) {
+if (selectedCells) {
+	for (const cell of selectedCells) {
 		for (const task of tasks) {
-			for (let rep = 0; rep < repeat; rep++) jobs.push({ variant, arm, task, rep });
+			for (let rep = 0; rep < repeat; rep++) jobs.push({ cell, arm: cell.arm, task, rep, variant: cell.prompt ?? cell.vanillaPrompt });
+		}
+	}
+} else {
+	for (const variant of variants) {
+		for (const arm of arms) {
+			for (const task of tasks) {
+				for (let rep = 0; rep < repeat; rep++) jobs.push({ variant, arm, task, rep });
+			}
 		}
 	}
 }
 
 // Repeats need distinct ids, and quick runs are throwaway — never let them
 // collide with or overwrite a sweep's recorded results.
-const runId = ({ variant, arm, task, rep }) =>
-	`quick__${task}__${arm}__${variant}${nsMode === "1" ? "-ns" : nsMode === "delta" ? "-nsd" : ""}__r${rep}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+const runId = ({ variant, arm, task, rep, cell }) =>
+	`quick__${task}__${arm}__${cell ? `${cell.residency}__` : ""}${variant}${nsMode === "1" ? "-ns" : nsMode === "delta" ? "-nsd" : ""}__r${rep}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 
-console.log(`quick: ${variants.join(",")} x ${arms.join(",")} x ${tasks.length} tasks x ${repeat} = ${jobs.length} runs`);
+if (selectedCells) {
+	console.log(`quick 2x2: ${selectedCells.length} cells x ${tasks.length} tasks x ${repeat} = ${jobs.length} runs`);
+	for (const c of selectedCells) console.log(`   ${c.key.padEnd(18)} ${c.arm}/${c.residency} prompt=${c.prompt ?? c.vanillaPrompt}`);
+} else {
+	console.log(`quick: ${variants.join(",")} x ${arms.join(",")} x ${tasks.length} tasks x ${repeat} = ${jobs.length} runs`);
+}
 console.log(`concurrency ${concurrency}, timeout ${timeout}s, no judge\n`);
 
 const started = Date.now();
 let done = 0;
+
+// --dry-run prints the exact argv per job and spends nothing. Worth having: three
+// separate result sets in this project were invalidated by a flag that did not
+// reach the runner, and each was only visible in the argv.
+const dryRun = argv.includes("--dry-run");
+
+const argsFor = (job, id) => [
+	join(ROOT, "bench/run-task.mjs"),
+	envFile,
+	model,
+	job.task,
+	job.arm,
+	...(job.cell
+		? job.cell.prompt
+			? ["--prompt", job.cell.prompt]
+			: ["--vanilla-prompt", job.cell.vanillaPrompt]
+		: ["--prompt", job.variant]),
+	"--run-id",
+	id,
+	"--residency",
+	job.cell ? job.cell.residency : job.arm === "codemode" ? residency : job.arm === "notools" ? "none" : "L4",
+	"--timeout",
+	timeout,
+	"--max-cost",
+	"1.0",
+];
+
+if (dryRun) {
+	const seen = new Set();
+	for (const job of jobs) {
+		const a = argsFor(job, runId(job));
+		// One line per distinct (cell, arm) shape — 200 identical-shaped lines hide
+		// the one that differs.
+		const shape = a.slice(4).filter((x) => !String(x).startsWith("quick__")).join(" ");
+		if (seen.has(shape)) continue;
+		seen.add(shape);
+		console.log(`  node bench/run-task.mjs <env> ${model} ${job.task} ${shape}`);
+	}
+	console.log(`\n${jobs.length} runs, ${seen.size} distinct argv shapes. Nothing spent.`);
+	process.exit(0);
+}
 
 await pool(
 	jobs,
@@ -133,16 +233,22 @@ await pool(
 					model,
 					job.task,
 					job.arm,
-					"--prompt",
-					job.variant,
+					// In cells mode the prompt belongs to the arm: codemode reads
+					// --prompt, vanilla reads --vanilla-prompt, and passing a w-name to
+					// --prompt would throw on an unknown codemode variant.
+					...(job.cell
+						? job.cell.prompt
+							? ["--prompt", job.cell.prompt]
+							: ["--vanilla-prompt", job.cell.vanillaPrompt]
+						: ["--prompt", job.variant]),
 					"--run-id",
 					id,
-					// Residency levels are arm-specific: codemode has L0/L1/L2, vanilla
-					// has L4/L1. Passing codemode's default to vanilla made the
+					// Residency levels are arm-specific: codemode has L0/L1/L2/L4,
+					// vanilla has L4/L1. Passing codemode's default to vanilla made the
 					// extension throw, and the run completed with zero tools and a
 					// floor score that looked like a model result.
 					"--residency",
-					job.arm === "codemode" ? residency : job.arm === "notools" ? "none" : "L4",
+					job.cell ? job.cell.residency : job.arm === "codemode" ? residency : job.arm === "notools" ? "none" : "L4",
 					"--timeout",
 					timeout,
 					"--max-cost",
@@ -182,6 +288,79 @@ if (withJudge) {
 
 // --- report -------------------------------------------------------------------
 const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+
+if (selectedCells) {
+	// Cells mode reports paired per-task differences, using the same bench/stats.mjs
+	// as AppWorld's factorial — same contrasts, same null control, same sign test.
+	// Reimplementing the statistics per benchmark is how two "identical" 2x2s stop
+	// being comparable, and cost is right-skewed enough that the sign test has
+	// already overturned a t-test in this project.
+	const { pairedTest, formatPaired } = await import("./stats.mjs");
+	const costs = new Map(); // `${task}|${cell.key}` -> mean cost over replicates
+	const cellRows = [];
+	for (const cell of selectedCells) {
+		const perTask = new Map();
+		for (const job of jobs.filter((j) => j.cell === cell)) {
+			const p = join(RUNS, runId(job), "result.json");
+			if (!existsSync(p)) continue;
+			const r = JSON.parse(readFileSync(p, "utf8"));
+			if (r.summary.stopReason !== "completed") continue;
+			if (r.summary.residencyViolation) {
+				console.log(`!! ${cell.key} ${job.task}: ${r.summary.residencyViolation}`);
+				continue;
+			}
+			if (!perTask.has(job.task)) perTask.set(job.task, []);
+			perTask.get(job.task).push(r);
+		}
+		// Average replicates within (task, cell) BEFORE pairing. Treating replicates
+		// as independent observations is pseudo-replication and inflates n.
+		for (const [task, rs] of perTask) costs.set(`${task}|${cell.key}`, mean(rs.map((r) => r.summary.cost)));
+		const flat = [...perTask.values()].flat();
+		cellRows.push({
+			cell: cell.key,
+			arm: `${cell.arm}/${cell.residency}`,
+			tasks: perTask.size,
+			runs: flat.length,
+			avgTurns: flat.length ? +mean(flat.map((r) => r.summary.turns)).toFixed(1) : "—",
+			avgCost: flat.length ? +mean(flat.map((r) => r.summary.cost)).toFixed(3) : "—",
+			ctx0: flat.length ? Math.round(mean(flat.map((r) => r.summary.firstTurnPromptTokens ?? 0))) : "—",
+		});
+	}
+	console.log(`\nwall clock: ${((Date.now() - started) / 1000 / 60).toFixed(1)} min\n`);
+	console.table(cellRows);
+
+	const cellFor = (row, col) => selectedCells.find((c) => c.row === row && c.col === col);
+	const costOf = (row, col, t) => costs.get(`${t}|${cellFor(row, col)?.key}`);
+	const complete = tasks.filter((t) =>
+		["in", "out"].every((col) => ["code", "tools"].every((row) => Number.isFinite(costOf(row, col, t)))),
+	);
+	if (selectedCells.length === 4 && complete.length >= 2) {
+		console.log(`\n=== paired per-task cost differences (n=${complete.length} tasks present in all 4 cells) ===\n`);
+		const contrasts = [
+			["residency, code row (in - out)", (t) => costOf("code", "in", t) - costOf("code", "out", t)],
+			["residency, tools row (in - out)", (t) => costOf("tools", "in", t) - costOf("tools", "out", t)],
+			["representation, docs-in (tools - code)", (t) => costOf("tools", "in", t) - costOf("code", "in", t)],
+			["representation, docs-out (tools - code)", (t) => costOf("tools", "out", t) - costOf("code", "out", t)],
+		];
+		for (const [name, fn] of contrasts) console.log(`  ${formatPaired(name, pairedTest(complete.map(fn)))}`);
+		const self = pairedTest(complete.map((t) => costOf("code", "out", t) - costOf("code", "out", t)));
+		console.log(`  ${formatPaired("NULL CONTROL (a cell vs itself)", self)}`);
+		if (self.mean !== 0 || Number.isFinite(self.t)) {
+			console.log("  !! NULL CONTROL FAILED — the pairing is wrong; do not read the numbers above");
+		}
+		const dropped = tasks.length - complete.length;
+		if (dropped > 0) {
+			console.log(`\n  ${dropped} task(s) missing from at least one cell and excluded — NOT substituted with zero.`);
+		}
+		console.log("\n  Compare against AppWorld: residency ~$0.51 flat, representation $0.067 (low) to $0.766 (high).");
+		console.log("  MCP-Bench is the mirror control — its pagination bias runs the other way.");
+	} else if (selectedCells.length === 4) {
+		console.log(`\n  Only ${complete.length} task(s) complete across all 4 cells — too few to pair. No statistics reported.`);
+	}
+	console.log("");
+	process.exit(0);
+}
+
 const rows = [];
 for (const variant of variants) {
 	for (const arm of arms) {
