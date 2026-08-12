@@ -840,52 +840,245 @@ Two cautions on that slice specifically:
 
 ---
 
-## 8. The ON/OFF measurement — a null result on n=1, reported as such
+## 8. The mailman ON/OFF measurement — a detector mistake, corrected
 
-Run by the lead after the scout set up the harness but left the runs incomplete.
+> **This section originally reported a "null result on n=1." That was wrong — it
+> was a mis-detection, and the correction is the point.** The first pass keyed
+> `wedged` on `compare-jobs.py`'s legacy heuristic (`hitDeadline and turns<=6`),
+> which false-negatived a wedge the per-cell timeout *bounds*: the cell is killed at
+> the ceiling, the agent recovers and keeps taking turns, so the agent-level
+> deadline is never hit. Both arms were scored `wedged=False` when both had held the
+> kernel to the ceiling. The detector now reads the per-cell interrupt notice from
+> the stream (`_cell_wedge_indices`), pinned by `bench/terminal/test_compare_jobs.py`.
+
 `mailman` (the §7.2 wedge task), prime codemode, Opus 5, cell timeout 600s. A0
-confirmed first: `jobs bound in builtins` in a real terminal-bench container.
+confirmed first: `jobs bound in builtins` in a real terminal-bench container. Two
+paired runs, re-scored with the corrected detector:
 
-| endpoint | OFF (p8m-off) | ON (p8m-on) |
+| endpoint | OFF p8m-off | ON p8m-on | OFF p8m-off2 | ON p8m-on2 |
+|---|---|---|---|---|
+| resolved | PASS | PASS | PASS | PASS |
+| **wedged** | **True** | **True** | **True** | **True** |
+| wedging cell | `mailman … start \| tail` | same | same | same |
+| blocking sleeps | 7 | 9 | 5 | 9 |
+| jobs cells | 0 | **2** | 0 | **0** |
+| turns | 29 | 48 | 15 | 42 |
+| cost | $1.054 | $1.566 | $0.515 | $1.360 |
+
+**The mailman wedge is reliable, not stochastic — 4/4 arms wedged — and the runtime
+ON does NOT prevent it.** This is the honest, corrected result, and it is more
+interesting than the "null" it replaces:
+
+1. **The wedge reproduces every time.** `su list -c "mailman start" 2>&1 | tail -5`
+   daemonises; the runners inherit the pipe's write end; `tail` never sees EOF; the
+   cell hangs to the ceiling. Both OFF and both ON runs hit it.
+2. **ON does not prevent it, because the agent never submits the wedging command.**
+   p8m-on2 used `jobs` zero times; p8m-on applied `jobs.submit` to a *different*
+   command (an `mbox-perm-fix` loop), not the daemon start. The agent writes
+   `mailman start | tail` as a bash reflex — it is not a sleep, thread, or import, so
+   no guard fires, and nothing steers it to a job. The runtime *can* prevent this
+   wedge (submit the daemon → output to a file → no blocking reader), but the
+   affordance is never reached for this pattern.
+
+**This is the gap §8.1 closes at the harness level and §8.3 measures.** Contrast it
+with `compile-compcert` (§8.2), where the wait is an *explicit long build* the agent
+recognises and voluntarily hands to `jobs` — there ON does prevent the wedge. The
+distinction is the finding: **the runtime helps when the agent recognises work as
+long-running; it does not help when the block is an unrecognised side-effect of an
+idiomatic command — which is exactly the class the teaching backstop (§8.3) exists
+for.**
+
+## 8.1 The detector fix and the fresh-pair confirmation
+
+`compare-jobs.py` now counts a cell as wedged if its result carries either the
+harness interrupt notice (`INTERRUPTED after`, a bare kill) **or** the prelude
+watchdog's teaching interrupt (`held the kernel for`, §8.3) — because the watchdog
+fires at ceiling−margin and *preempts* the harness marker, so keying on the harness
+marker alone would score a fixed run `wedged=False` and make the teaching backstop
+look like a cure. Both mean "the cell held the kernel to the ceiling"; the watchdog
+one is additionally tracked as `taught`. Tests: `test_compare_jobs.py`, 7 passing,
+including `test_watchdog_interrupt_counts_as_a_wedge_and_is_tracked_as_taught`.
+
+The fresh pair (p8m-off2/on2) was run to confirm reproducibility and is in the table
+above: both wedged, ON adopted no jobs for the daemon. The wedge is not a one-off.
+
+## 8.2 The cleaner test — a DETERMINISTIC long build (compile-compcert)
+
+§8's mailman is stochastic and benign: the wait is a 2–3s service settle, and when the
+wedge doesn't reproduce there is nothing to save. The cleaner existence-check the
+handoff asked for is a task whose long wait is *deterministic* and long enough to
+collide with the 600s cell ceiling — a build or train the agent cannot make finish
+faster. This section runs that. **n=1 per arm; existence-check, not a rate.**
+
+### Task selection — what actually has a >600s single wait, and what only looks like it
+
+Screened the five candidates by *shape*, not just budget, because the budget lies:
+
+| task | budget | verdict | why |
+|---|---|---|---|
+| `cartpole-rl-training` | 900s | **run OFF (null)** | REINFORCE trains to reward>400 in ~90s — far under the ceiling |
+| `build-pov-ray` | 12000s | **rejected** | POV-Ray 2.2 is a 1990s C program; the *compile* is seconds. The 12000s is agent *difficulty* (arcane `.TAR.Z` download + K&R-C patching), not a wait |
+| `compile-compcert` | 2400s | **the task** | `opam install coq.8.16.1` compiles Coq **from source** — an unavoidable multi-minute wait, and the 8.16.1 pin blocks the fast `apt coq` shortcut (Ubuntu 24.04 ships a newer Coq) |
+| `build-linux-kernel-qemu` | 1800s | not run | `--platform=linux/amd64` → kernel build under Rosetta, arch-emulation-slow (§1.3) |
+| `hf-train-lora-adapter` | 1800s | not run | needs a HF-hub download; compcert is the cleaner deterministic-CPU wait |
+
+**General finding worth recording: terminal-bench's ≥1800s budgets are mostly agent
+*difficulty*, not single deterministic waits.** POV-Ray is the clean example — a
+12000s budget on a compile that takes seconds. Only tasks that *compile something
+large from source* (Coq, a kernel) or *train for real* have an unavoidable >600s
+single operation. That narrows the venue for this claim considerably.
+
+### Oracle screens (both $0, both PASS)
+
+- `cartpole-rl-training` — PASS, 2:27 total (incl. torch-CPU image build).
+- `compile-compcert` — PASS, **6:46 total** (22:25:19→22:32:05). **Arch-clean:** the
+  reference explicitly branches `aarch64|arm64) COMP_TARGET="aarch64-linux"` and the
+  test only checks `ccomp -version`/compiles a probe, so §1.3's arch-hazard listing of
+  this task **does not bite** on this host. Note the whole from-source build fits in
+  ~350s of compute on this 8-core box — i.e. the *oracle's* one-shot recipe is under
+  the ceiling; the stress comes from the *agent* decomposing and polling it.
+
+### cartpole OFF — a NULL, and why (the fast-train case)
+
+`p82-cartpole-off`: PASS, 6 turns, $0.177, **134s**, `blockingSleepCells=0`. The agent
+ran training as one foreground cell — `%%bash cd /app && timeout 3000 python train.py`
+— holding the kernel, but training finished in ~90s, **well under the 600s ceiling**,
+so nothing was stressed. (It even set `timeout 3000` > the 600s cell ceiling, so had
+training been that slow the cell would have been killed first.) **Same shape as
+mailman: the wait is real but too short to bite.** No ON run was warranted.
+
+### compile-compcert OFF vs ON — the demonstration
+
+Both `--arm codemode`, Opus 5, cell ceiling 600s. A0 on the ON run confirmed
+`jobs_staging.bound = true` ("jobs bound in builtins"), `valid = true`.
+
+| endpoint | OFF (`p82-compcert-off`) | ON (`p82-compcert-on`) |
+|---|---|---|
+| resolved | **PASS** | **PASS** |
+| **wedged cell** (600s ceiling interrupt) | **True — cell 16** | **False** |
+| **blocking-sleep cells** | **5** (120/60/600/300/400s) | **0** |
+| jobs cells | 0 | **10** |
+| daemon cells | 3 | 0 |
+| turns | 26 | 25 |
+| procs created | 42,815 | 34,387 |
+| cost | $0.562 | $0.554 |
+| wall-clock | 1697.6s | 1857.2s |
+
+**OFF blocked the kernel, unprompted, and hit the ceiling.** Its natural idiom for the
+long build was *background-and-poll-with-sleep*:
+
+```
+[ 8] nohup make -j$(nproc) > /tmp/build.log 2>&1 &   ... sleep 120
+[15] nohup bash -c 'opam init … && opam switch create …' &   ... (poll)
+[16] sleep 600; tail -3 /tmp/opam.log        <-- ABORTED at 600.0s: "Process was interrupted."
+[18] … make …                                (300s foreground)
+[19] sleep 400; tail -5 /tmp/build2.log …
+```
+
+Cell 16's `sleep 600` **collided with the 600s cell ceiling and was interrupted** —
+`compare-jobs.py`'s `cellWedgeCells=[16]` (it now reads the `INTERRUPTED after` mark
+from `stream.jsonl`; the old `hitDeadline and turns<=6` heuristic false-negatived this,
+as it did on §8). The coq build actually *finished* inside that sleep, so the wasted
+cell was non-fatal — but it is precisely the self-collision the runtime exists to
+remove, occurring on a deterministic build. Five cells (~1480s of 1698s) were spent
+holding the kernel on sleeps.
+
+**ON adopted jobs and never blocked.** The `%%bash sleep`/`time.sleep` guards refuse
+in-cell blocking, so the agent went to `jobs.submit` + `jobs.get`/`jobs.wait` from cell
+5 onward (10 jobs cells). Every wait released the kernel — the submit cells print
+`[waiting 600s outside the kernel; nothing is held. running jobs: opam]` and return in
+0s; `jobs.get("opam") → done` on the next turn. **Zero blocking sleeps, zero wedged
+cells**, `ccomp --version → 3.13`, PASS.
+
+### Honest verdict
+
+**What IS demonstrated (and was not before): on a genuine deterministic long build the
+runtime eliminates the kernel-blocking pattern (5→0 blocking sleeps) and the
+cell-ceiling wedge (OFF wedged cell 16; ON wedged none).** This is the mechanism §8/
+mailman could not exercise, because there the wait was benign and neither arm wedged.
+Here the wait is real, OFF demonstrably wedged a cell on it, and ON demonstrably did
+not. A0 valid, both arms real (jobs bound in a real terminal-bench container).
+
+**What is NOT demonstrated: an outcome, cost, or turn win.** Both PASS; cost ($0.562 vs
+$0.554) and turns (26 vs 25) are within noise; ON's wall-clock was *higher* (1857 vs
+1698s) — expected, since the build's compute is fixed and the runtime changes only how
+the wait is held, not its length. The reason the wedge was non-fatal is the load-
+bearing point: **Opus OFF already self-mitigates by backgrounding the build with
+`nohup … &` and polling** — a hand-rolled approximation of `jobs.submit`. So the
+runtime converts a *working-but-kernel-holding* pattern into a clean one; on this
+task/model it does not enable an otherwise-impossible completion. (This is the
+CLAUDE.md "match the idiom" lesson from the other side: the agent already reached for
+`cmd > log &` + `cat log`.)
+
+**Where a completion/cost win would actually appear:** a task or model where the long
+command is run *foreground with no detach*, so the ceiling interrupt loses the build
+and forces a costly restart — or a build with no incremental-resume, where the wasted
+600s cell is not recoverable. Neither is what Opus does on compcert. The `%%bash` guard
+is also relevant here: it only catches literal `sleep N`, **not** an arbitrary long
+foreground command (`make`, `python train.py`), so ON cannot *force* jobs adoption on a
+foreground build — it relies on the agent choosing `sleep`-poll (which the guard then
+redirects) or adopting `jobs.submit` from the preamble. Opus did the latter cleanly.
+
+**Bottom line, updated:** the runtime's *mechanistic* benefit on deterministic long
+work is now DEMONSTRATED (no kernel block, no ceiling wedge, where OFF has both); its
+benefit *to the score/cost* remains UNDEMONSTRATED and, on a self-mitigating model like
+Opus, may require a task shaped to punish foreground blocking specifically. n=1 — treat
+as an existence proof of the mechanism, not a rate.
+
+(Minor, since fixed: the ON A0 probe tail carried a benign shutdown-time
+`NameError: name '_BANNED_IMPORTS' is not defined` from `_guarded_import` during
+`weakref._exitfunc`. `_guarded_import` now accesses its own state defensively and
+binds the real import as a default arg, so teardown imports fall through cleanly.
+Pinned by `test_import_guard_survives_module_teardown`.)
+
+## 8.3 Closing the mailman gap — a teaching backstop, and what it does not do
+
+§8 showed the mailman wedge passes every guard (no sleep/thread/import) and ON never
+prevents it because the agent does not submit the daemon. The runtime's own design
+(§6) names the cell wall-clock ceiling as the universal backstop for exactly this
+residue — the problem was that the harness kills the wedged cell with a *bare*
+interrupt that teaches nothing, so the agent writes the same line again.
+
+**The fix** (`kernel-prelude.py`, `_install_cell_watchdog`): a SIGALRM watchdog armed
+only for the span of a cell (`pre_run_cell`→arm, `post_run_cell`→disarm, so it can
+never fire in kernel machinery) trips just under the ceiling, interrupts the held
+cell, and raises the same `jobs.submit` redirect the other guards do — quoting the
+agent's own command. Gated on `HARNESS_CELL_CEILING`, derived from the harness cell
+timeout so the two cannot drift. Tests: 4 in `test_prelude.py`.
+
+**Re-measure** (p8m-on-fix, mailman ON, watchdog live, n=1):
+
+| | OFF p8m-off | ON+fix p8m-on-fix |
 |---|---|---|
 | resolved | PASS | PASS |
-| **wedged** | **False** | **False** |
-| blocking sleeps | 7 | 9 |
-| jobs cells | 0 | **2** (adopted) |
-| turns | 29 | 48 |
-| procs created | 617 | 5798 |
-| cost | $1.054 | $1.566 |
-| wall-clock | 961s | 1263s |
+| wedged | True (bare kill) | **True (taught)** |
+| what the agent did next | muddled on | recovered; final script drops `\| tail` for `>/dev/null` |
+| turns / wall-clock | 29 / 961s | 50 / 1165s |
 
-**The runtime did not demonstrate benefit here, and it cost more.** ON was adopted
-(2 jobs cells) but did not reduce the blocking sleeps (9 vs 7), cost 50% more, and
-took more turns and wall-clock. Reported straight, per the pre-stated falsifier.
+**What the fix does:** the watchdog fired once (the daemon-pipe cell), converted the
+silent kill into an actionable message, and the agent recovered and fixed the *right*
+thing — its final start script redirects to `/dev/null` instead of piping the daemon
+through `tail`. That is a real improvement over the bare-kill runs, where the agent
+never fixed the wedge.
 
-**Why the measurement is inconclusive rather than a clean refutation, stated
-honestly:**
+**What the fix does NOT do — stated plainly:** it does not prevent the ~585s kernel
+hold. The watchdog trips at ceiling−margin *by design*, to avoid false-positiving
+legitimately long foreground compute. So `wedged` is `taught`, not `False` — the
+kernel was still held, the interrupt just taught instead of bare-killing, and
+aggregate cost is within noise of the bare-kill run. The agent also did **not** adopt
+`jobs.submit` (it found its own `/dev/null` fix); the message names both the `| tail`
+problem and the primitive, and the agent took the former.
 
-1. **The wedge did not reproduce.** §7.2's kernel wedge was one occurrence and is
-   evidently stochastic — OFF passed cleanly here. The runtime's strongest
-   mechanistic case (jobs.submit's detached stdio prevents the pipe-inheritance
-   hang) therefore *could not be tested* on this run: there was no wedge to prevent.
-2. **Without the wedge, mailman is a benign case.** Its sleeps are 2–3s
-   service-startup waits (§7.1) that neither hurt the outcome nor cost much — so the
-   runtime has nothing to save, the same shape as the healthy TAC tasks. The runtime
-   helps only when a wait is *long* or *wedges*; this run had neither.
-3. **n=1, and the cost/proc gap is uninterpretable at that n.** ON created 9× the
-   processes (5798 vs 617) at 48 vs 29 turns — trajectory variance, the exact
-   arms-do-different-work confound `compare-jobs.py` is built to flag, and at n=1 it
-   cannot be attributed to the runtime.
+**The real cure — tripping earlier — is a separate, measured step.** Firing the
+watchdog at ~90–120s would cut the hold, but risks interrupting a genuine 90s+
+foreground compile. That threshold can only be set with data on how long real
+foreground builds run (cartpole's foreground train was ~90s; compcert backgrounded
+its build). Tracked as a follow-up gated on the long-task corpus, not guessed.
 
-**What this does and does not establish.** It does NOT show the runtime helps on
-long-horizon work. It also does NOT refute it — it fails to demonstrate benefit on
-one noisy sample of a task whose cost-of-waiting was, this run, near zero.
-Demonstrating benefit requires either (a) catching the stochastic wedge with more n,
-or (b) running the genuinely multi-minute-to-multi-hour tasks (`chem-rf`,
-`build-pov-ray`, the Windows installs) where a wait is unavoidably expensive — which
-are out of this scout's budget and correctly flagged as a separate item (§6 cond. 4).
-
-**Bottom line: the affirmative benefit of the runtime on long-horizon work is
-UNDEMONSTRATED.** The runtime is correct, safe, durable, and cheap on API-call work;
-whether it *helps* on real long work is the one claim no measurement in this effort
-has supported, and this run is the closest attempt.
+**Bottom line across §8–§8.3:** two distinct wedge classes, two distinct answers.
+Recognised long work (compcert): the runtime *prevents* the wedge, because the agent
+adopts `jobs`. Unrecognised idiomatic blocking (mailman's daemon-pipe): the runtime
+cannot prevent it (the agent never submits it), and the ceiling watchdog makes the
+inevitable wedge *recoverable and taught* rather than a silent kill — a mitigation,
+not a cure. Both are honest, and neither is a score/cost win on a self-mitigating
+model like Opus.

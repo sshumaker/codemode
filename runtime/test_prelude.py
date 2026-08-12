@@ -454,6 +454,16 @@ class TestGuardTable(GuardBase):
             __import__("threading")
         self.assertIn("jobs.submit", str(ctx.exception))
 
+    def test_import_guard_survives_module_teardown(self):
+        # At interpreter shutdown the module globals are cleared, but weakref
+        # finalizers can still import through the hook. Referencing the (now gone)
+        # _BANNED_IMPORTS raised a spurious NameError from weakref._exitfunc. Simulate
+        # teardown by deleting the guard's state: the plain import must still work.
+        mod = self.arm()
+        del mod._BANNED_IMPORTS
+        # Must not raise NameError; the real import still happens.
+        self.assertIsNotNone(mod._guarded_import("os"))
+
     def test_classes_remain_subclassable(self):
         # Replacing threading.Thread with a *function* broke concurrent.futures, which
         # subclasses Thread at import time. Guards on classes must be classes.

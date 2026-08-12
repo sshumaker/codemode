@@ -33,6 +33,47 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNS = ROOT / ".run" / "terminal-bench"
 
 
+# The per-cell timeout (HARNESS_CELL_TIMEOUT_MS, injected by
+# scripts/neutralize-prime.mjs) wraps every cell and, when it fires, replaces the
+# result with a fixed notice: "[this cell was INTERRUPTED after <N>s and did not
+# finish. ...]". That is the ground-truth signal for a wedged cell — a blocking
+# pipe read on a reparented daemon (§7.2) hits it every time.
+INTERRUPT_MARK = "INTERRUPTED after"
+# The prelude's cell watchdog (kernel-prelude.py) fires at CELL_CEILING-margin and
+# raises this, BEFORE the harness's own INTERRUPT_MARK at the full ceiling. A run
+# with the watchdog therefore never carries INTERRUPT_MARK — but the kernel was
+# still held to ~ceiling, so it is just as wedged. Counting only INTERRUPT_MARK
+# would score a watchdog run wedged=False and make the fix look like a cure when it
+# is a teaching interrupt at the same wall-clock. Both markers mean "cell held the
+# kernel to the ceiling"; the difference is bare-kill vs taught, tracked separately.
+WATCHDOG_MARK = "held the kernel for"
+
+
+def _cell_wedge_indices(results_parent: Path) -> tuple[list[int], list[int]]:
+    """(all wedged cell indices, taught-only indices).
+
+    A cell is wedged if its result carries either the harness interrupt notice
+    (bare kill) or the watchdog's teaching interrupt. Read from stream.jsonl
+    because result.json records cell *sources* but not their results."""
+    stream = results_parent / "agent-logs" / "stream.jsonl"
+    if not stream.is_file():
+        return [], []
+    wedged_idx, taught_idx, i = [], [], 0
+    for line in stream.open():
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("type") == "tool_execution_end":
+            res = str(e.get("result") or "")
+            if INTERRUPT_MARK in res or WATCHDOG_MARK in res:
+                wedged_idx.append(i)
+                if WATCHDOG_MARK in res and INTERRUPT_MARK not in res:
+                    taught_idx.append(i)
+            i += 1
+    return wedged_idx, taught_idx
+
+
 def load(run_id: str) -> dict[str, dict]:
     out = {}
     for results in sorted((RUNS / run_id).glob("*/*/results.json")):
@@ -41,18 +82,28 @@ def load(run_id: str) -> dict[str, dict]:
         cond_path = results.parent / "agent-logs" / "condition.json"
         log = json.loads(log_path.read_text()) if log_path.is_file() else {}
         cond = json.loads(cond_path.read_text()) if cond_path.is_file() else {}
+        # Attach the cell-level wedge signal, computed from the stream. Without
+        # this, wedged() false-negatives every wedge the per-cell timeout bounds.
+        wedge_idx, taught_idx = _cell_wedge_indices(results.parent)
+        log["cellWedgeCells"] = wedge_idx
+        log["taughtWedgeCells"] = taught_idx
         out[trial["task_id"]] = {"trial": trial, "log": log, "cond": cond}
     return out
 
 
 def wedged(log: dict) -> bool:
-    """A cell that never returned.
+    """Did a cell fail to return, held on a blocking read?
 
-    The signature is the agent process being killed by its in-container deadline
-    while it had taken very few turns — a run that is *working* keeps producing
-    turns. Deliberately not "the agent timed out": a genuinely hard task can
-    exhaust its budget while acting, and that is a result, not a wedge.
+    Primary signal: a cell hit the per-cell timeout and was INTERRUPTED. This is
+    the §7.2 wedge (a blocking pipe read on a reparented daemon). It is *bounded*
+    by HARNESS_CELL_TIMEOUT_MS, so the agent recovers and keeps taking turns —
+    which is exactly why the legacy `hitDeadline and turns<=6` heuristic below
+    false-negatived it (p8m-off/on both wedged at 29/48 turns and were scored
+    False). The cell interrupt is the ground truth; keep the legacy check only as
+    a fallback for runs recorded before a per-cell timeout existed.
     """
+    if log.get("cellWedgeCells"):
+        return True
     return bool(log.get("hitDeadline")) and log.get("turns", 0) <= 6
 
 
@@ -61,8 +112,12 @@ def row(task: str, cell: dict) -> str:
     cost = float(log.get("cost") or 0)
     procs = log.get("procsCreated")
     rate = f"{cost / procs:.5f}" if procs else "—"
+    taught = log.get("taughtWedgeCells") or []
+    wedge_str = ("taught" if wedged(log) and taught and
+                 len(taught) == len(log.get("cellWedgeCells") or [])
+                 else str(wedged(log))[:5])
     return (f"  {task:24s} {'PASS' if t.get('is_resolved') else 'fail':4s} "
-            f"wedged={str(wedged(log))[:5]:5s} "
+            f"wedged={wedge_str:6s} "
             f"turns={log.get('turns', '-'):>3} "
             f"sleep={log.get('blockingSleepCells', '-'):>2} "
             f"thread={log.get('threadCells', '-'):>2} "

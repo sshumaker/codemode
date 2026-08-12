@@ -483,14 +483,29 @@ _BANNED_IMPORTS = {
 _real_import = __import__
 
 
-def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name in _BANNED_IMPORTS and _called_from_agent_code():
-        what = _BANNED_IMPORTS[name]
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0, _real=_real_import):
+    # `_real` is bound as a default so the real import survives module teardown.
+    #
+    # At interpreter shutdown Python clears this module's globals, but weakref
+    # finalizers can still trigger imports through this hook — at which point
+    # `_BANNED_IMPORTS` and `_called_from_agent_code` are already gone and
+    # referencing them raises `NameError: name '_BANNED_IMPORTS' is not defined`
+    # from inside `weakref._exitfunc`. Harmless (the binding already happened) but
+    # noise in the run tail, and noise is exactly what hides a real error. So the
+    # guard's own state is accessed defensively: if it has been torn down, there is
+    # nothing left to guard and the plain import is correct.
+    try:
+        banned = _BANNED_IMPORTS
+        flagged = name in banned and _called_from_agent_code()
+    except Exception:
+        flagged = False
+    if flagged:
+        what = banned[name]
         raise ImportError(_redirect(
             f"{what} is not available in this kernel: it is single-threaded and shared, so "
             f"anything started with {what} cannot be tracked, recovered after a restart, or stopped."
         ))
-    return _real_import(name, globals, locals, fromlist, level)
+    return _real(name, globals, locals, fromlist, level)
 
 
 _guarded_import._harness_guarded = True
