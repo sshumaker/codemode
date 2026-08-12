@@ -86,6 +86,11 @@ const docker = (args, opts = {}) => run("docker", args, { maxBuffer: 64 * 1024 *
 const log = (m) => console.log(`[${taskName}/${arm}] ${m}`);
 /** Everything the seeding step emitted, kept for post-mortems. */
 const seedLog = [];
+/**
+ * null when the task has no NPCs; true/false once their reply path is probed.
+ * Read at the end to decide whether the world the agent worked in was intact.
+ */
+let npcLlmOk = null;
 
 /**
  * The environment LLM, used by the NPC colleagues during seeding and by the
@@ -110,6 +115,32 @@ const ENV_LLM = [
 	"-e", "LITELLM_API_KEY", // value forwarded from the sourced env file
 	"-e", `LITELLM_BASE_URL=${process.env.HARNESS_TAC_LLM_BASE ?? "https://api.anthropic.com/v1/"}`,
 	"-e", `LITELLM_MODEL=${process.env.HARNESS_TAC_LLM_MODEL ?? "openai/claude-sonnet-5"}`,
+];
+
+/**
+ * The NPC colleagues need a *different* model from the grader, and the reason is
+ * not a preference.
+ *
+ * sotopia hard-codes `temperature: float = 0.7` on every generation path, and
+ * `claude-sonnet-5` rejects the parameter outright:
+ *
+ *     400 {"message": "`temperature` is deprecated for this model."}
+ *
+ * So every NPC's first reply 400s, the bot loops printing "No message received,
+ * waiting...", and the colleague is silent for the whole task. Nothing anywhere
+ * says so: `ps` shows the processes alive, the liveness check passes, and the
+ * *arm* is blamed for a conversation that never happened. This is why
+ * `pm-schedule-meeting-2` is recorded in TAC-HANDOFF.md as "questionable — the two
+ * required NPCs never replied to any arm": they could not.
+ *
+ * The grader is unaffected — `llm_complete` passes no temperature — and it is the
+ * component that must not drift, so it keeps its validated model and only the NPCs
+ * move to one that still accepts the parameter.
+ */
+const NPC_ENV_LLM = [
+	"-e", "LITELLM_API_KEY",
+	"-e", `LITELLM_BASE_URL=${process.env.HARNESS_TAC_LLM_BASE ?? "https://api.anthropic.com/v1/"}`,
+	"-e", `LITELLM_MODEL=${process.env.HARNESS_TAC_NPC_MODEL ?? "openai/claude-sonnet-4-5"}`,
 ];
 
 /**
@@ -369,7 +400,14 @@ async function main() {
 	if ((summary.turns ?? 0) === 0 && !summary.timedOut) {
 		invalidReasons.push("agent produced zero turns");
 	}
-	const integrity = { valid: invalidReasons.length === 0, reasons: invalidReasons, preflight };
+	// A conversation task whose colleagues cannot answer is a broken world, not a
+	// hard task: the agent waits for a reply that the harness has made impossible,
+	// and the score records that as the agent's failure. Same class as a wedged
+	// kernel — plausible number, no error anywhere.
+	if (npcLlmOk === false) {
+		invalidReasons.push("NPC colleagues could not reply (env-LLM rejected sotopia's request)");
+	}
+	const integrity = { valid: invalidReasons.length === 0, reasons: invalidReasons, preflight, npcLlmOk };
 	if (!integrity.valid) log(`  !! RUN INVALID: ${invalidReasons.join("; ")} — numbers must not be compared`);
 
 	writeFileSync(
@@ -701,8 +739,30 @@ async function reviveNpcs() {
 	// init.sh's own attempt has already died; clear any survivor so a second
 	// bot does not answer every message twice.
 	await docker(["exec", container, "bash", "-c", "pkill -f run_one_npc.py || true"]).catch(() => {});
+	// Capability before liveness. See bench/tac/npc-llm-preflight.py: a colleague can
+	// be running, connected and reading the agent's DM and still unable to answer,
+	// and the only place that shows up is a 400 buried in /tmp/npc_*.log.
+	try {
+		await docker(["cp", join(ROOT, "bench/tac/npc-llm-preflight.py"), `${container}:/tmp/npc-llm-preflight.py`]);
+		const { stdout } = await dockerWithKey([
+			"exec", ...NPC_ENV_LLM, container, "python_default", "/tmp/npc-llm-preflight.py",
+		]);
+		const line = stdout.split("\n").find((l) => l.startsWith("NPCLLM ")) ?? "NPCLLM {}";
+		const verdict = JSON.parse(line.slice(7));
+		writeFileSync(join(runDir, "npc-preflight.json"), `${JSON.stringify(verdict, null, 2)}\n`);
+		npcLlmOk = !!verdict.ok;
+		log(`NPC LLM pre-flight: ok=${verdict.ok} model=${verdict.model}${verdict.ok ? "" : ` — ${verdict.body ?? verdict.error ?? "?"}`}`);
+		if (!verdict.ok) {
+			log("  !! colleagues will NEVER reply — a conversation task is unsolvable and the arm will look weak");
+		}
+	} catch (err) {
+		writeFileSync(join(runDir, "npc-preflight.json"), `${JSON.stringify({ ok: false, error: String(err.message ?? err).slice(0, 300) }, null, 2)}\n`);
+		npcLlmOk = false;
+		log(`  !! NPC LLM pre-flight could not run (${String(err.message ?? err).slice(0, 120)})`);
+	}
+
 	await dockerWithKey([
-		"exec", "-d", ...ENV_LLM, container,
+		"exec", "-d", ...NPC_ENV_LLM, container,
 		// Replaces run_multi_npc.py rather than supplementing it — that script loops
 		// the same scenarios.json keys into run_one_npc.py with stdout to DEVNULL, so
 		// running both would put two bots in every conversation. Launching them here

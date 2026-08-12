@@ -701,7 +701,9 @@ def _announce_existing_jobs():
         return
     if not rows:
         return
-    live = [r for r in rows if r.get("state") == "running"]
+    # `starting` counts as live: it is a job whose submit was interrupted, which is
+    # exactly the state a fresh kernel is most likely to be looking at.
+    live = [r for r in rows if r.get("state") in jobs.LIVE_STATES]
     print(f"[{len(rows)} job(s) from a previous kernel, {len(live)} still running — "
           f"reach them with jobs.get('<name>')]")
     print(jobs.manifest())

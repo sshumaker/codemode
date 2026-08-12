@@ -12,3 +12,4 @@ vendor/appworld/
 __pycache__/
 *.pyc
 vendor/tau-bench/
+vendor/terminal-bench/

@@ -4,11 +4,16 @@
  *
  *   node runtime/eval/all.mjs <env-file> [--repeat 1] [--model ...]
  *
- * Costs about $0.20 and four minutes. Cheap enough to run after any change to the
+ * Costs about $0.45 and five minutes. Cheap enough to run after any change to the
  * primitives, the prompt or the guards — which is the point, because every defect
  * found here so far was invisible to the unit tests and visible in the first
  * trajectory: a false "cell INTERRUPTED" notice on a correct wait, `jobs` vanishing
  * after `%reset -f`, and a thread guard that broke IPython's own `%%bash`.
+ *
+ * The three A5 durability cases (`kernel-death`, `concurrent`, `long-horizon`) are the
+ * slow ones — `long-horizon` alone is ~200s of real elapsed time, because a horizon the
+ * agent has to poll across is the one thing that cannot be simulated away. They run in
+ * parallel with everything else; see docs/DURABILITY-RESULTS.md for what they establish.
  *
  * `background --no-prompt` is included deliberately. It removes the resident
  * guidance so the run has to succeed on the guards and api/jobs.md alone, which is
@@ -55,7 +60,21 @@ const run = (c) =>
 		const id = `${(c.label ?? c.task).replace(/\//g, "-")}__${stamp}__r${c.rep}`;
 		const p = spawn(
 			"node",
-			[join(HERE, "run.mjs"), envFile, c.task, "--model", model, "--timeout", "330", "--run-id", id, ...c.args],
+			// Per-task timeout, not a fixed 330s. The A5 durability tasks are minutes
+			// long by construction — a shared ceiling silently truncates `long-horizon`
+			// and reports it as a failure to finish.
+			[
+				join(HERE, "run.mjs"),
+				envFile,
+				c.task,
+				"--model",
+				model,
+				"--timeout",
+				String(TASKS[c.task].timeout ?? 330),
+				"--run-id",
+				id,
+				...c.args,
+			],
 			{ cwd: ROOT, stdio: ["ignore", "ignore", "ignore"] },
 		);
 		p.on("close", () => {

@@ -43,11 +43,11 @@ Consequences for the plan:
 | A2 | it does not cost more | turns, $ paired vs baseline | n=1 positive (25/$0.57 vs 43/$0.67) |
 | A3 | it does not hurt quality | score, paired | n=1 neutral (2/5 = 2/5) |
 | A4 | it is neutral on tasks that need no waiting | negative control | **untested** |
-| A5 | it survives kernel death / concurrency / long horizon | recovery via get(), N concurrent jobs, multi-minute waits | **untested (#7)** |
+| A5 | it survives kernel death / concurrency / long horizon | recovery via get(), N concurrent jobs, multi-minute waits | **done — all three hold, n=2 each ([DURABILITY-RESULTS.md](DURABILITY-RESULTS.md))** |
 
 A1–A3 are "the runtime helps on the task it targets." A4 is "it doesn't hurt
-elsewhere." A5 is the durability story that motivated the design and has no evidence
-at all.
+elsewhere." A5 is the durability story that motivated the design and, until now, had no
+evidence at all.
 
 ### A0 — the integrity gate (do this first, everything depends on it)
 
@@ -97,23 +97,33 @@ design needs rework — which is exactly what the *broken* runs falsely showed.
   on normal code, the surface is too loud — same failure as an API used when it
   should not be.
 
-### A5 — durability (the untested motivation, #7)
+### A5 — durability (DONE — see [DURABILITY-RESULTS.md](DURABILITY-RESULTS.md))
 
-Three sub-tests, mostly hermetic (fast, cheap), one on TAC:
+Three hermetic tasks in `runtime/eval/tasks.mjs`, ~$0.05 and 1–4 min per run:
 
-- [ ] **kernel death:** submit a long job, `%reset -f` (or kill+respawn the kernel),
-      confirm `jobs.get(name)` recovers it and the work completed. Assert the agent is
-      told the kernel restarted and recovers without re-doing work.
-- [ ] **concurrency:** submit N jobs, `jobs.wait` once, collect all N. Assert no
-      races, correct per-job output, `manifest()` lists all.
-- [ ] **long horizon:** a genuinely multi-minute task (build + test, or a staged
-      pipeline) where a single `wait` is not enough and the agent must poll across
-      several waits. This is the only case that exercises the design's actual point;
-      every eval task so far finishes inside one wait.
+- [x] **kernel death** (`kernel-death`): the kernel process is SIGKILLed from outside
+      mid-wait. The job survives, `jobs.get(name)` recovers it in the replacement
+      kernel, and the work is **not** redone — verified by a per-invocation trace and an
+      unguessable token, not by the agent's word for it.
+- [x] **concurrency** (`concurrent`): four jobs armed within 0.0s of each other, all
+      four alive at one instant, 50s wall against ~140s sequential, no record crossed
+      another.
+- [x] **long horizon** (`long-horizon`): check-then-wait across a horizon capped below
+      the length of the work. The `print(N)` degeneracy did **not** recur.
 
-**Falsifier:** if recovery loses work, or concurrent jobs race, or the poll loop
-degenerates (per-turn `print(N)` as seen in the broken runs — confirm it does NOT
-recur with a working kernel), the durability claim fails.
+**Falsifier — none of these fired.** Recovery did not lose work, concurrent jobs did not
+race, the poll loop did not degenerate. Two things did turn up:
+
+1. **prime cannot replace a dead kernel** — `ensure()` memoises a shut-down manager, so
+   a killed kernel wedges the rest of the run (measured: 11 consecutive
+   `Kernel has been shut down`, agent unable to read a job that had completed). Patched
+   in `scripts/neutralize-prime.mjs`, gated on `HARNESS_KERNEL_AUTORESTART=1`.
+2. **A staged pipeline does not force a poll loop** — the agent hoists the sequencing
+   into one job with `&&` and waits once. Only a horizon longer than a single wait
+   forces polling.
+
+Checks are pinned in `bench/test/durability-checks.test.mjs`, which asserts each one
+fails a hand-built wrong world as well as passing a right one.
 
 ### Parallelizable units (A)
 

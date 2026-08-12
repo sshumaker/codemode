@@ -186,6 +186,127 @@ class TestLintValidation(unittest.TestCase):
 # submit
 # ---------------------------------------------------------------------------------
 
+class TestStartingStateRecovery(Base):
+    """
+    Reconciling a job whose submit was interrupted.
+
+    `submit` writes the record BEFORE spawning, so a kernel that dies between the two
+    leaves a `starting` record: a job that is visible and may not exist. Recovering it
+    means answering "did the work start?" from the only two things the job itself
+    writes — its pid file and its exit marker.
+
+    The integration suite reproduces the window with a real SIGKILL, but which branch
+    it lands in depends on whether the child had time to write its pid file, so it
+    cannot pin all three outcomes. These do, deterministically, by constructing each
+    on-disk state directly. That matters because the ambiguous branch — started or not,
+    nobody knows — is the one an agent is most likely to meet and the one no real-kill
+    test reliably produces.
+    """
+
+    def interrupted(self, name="victim", cmd="expensive-thing"):
+        """A record exactly as an interrupted submit leaves it: claimed, no pid."""
+        rec = {
+            "name": name,
+            "cmd": cmd,
+            "expect": "once",
+            "pid": None,
+            "log": self.store._log_path(name),
+            "exit_marker": os.path.join(self.dir, f"{name}.exit"),
+            "pid_file": self.store._pid_path(name),
+            "state": "starting",
+            "reason": None,
+            "started_at": self.world.now(),
+            "max_runtime": None,
+            "lint": [],
+            "events": 0,
+            "silent": False,
+        }
+        self.store._write(rec)
+        return rec
+
+    def test_the_job_that_wrote_its_pid_is_adopted_and_becomes_running(self):
+        self.interrupted()
+        with open(self.store._pid_path("victim"), "w") as fh:
+            fh.write("4242\n")
+
+        job = self.store.get("victim")
+        self.assertEqual(job.state, "running")
+        self.assertEqual(self.store._read("victim")["pid"], 4242)
+        self.assertIn("recovered", job.reason)
+        # Adopting the pid is what makes the recovered job an ordinary one: killable,
+        # and not a special case anywhere else in the surface.
+        self.assertTrue(self.store.kill("victim"))
+        self.assertIn(4242, self.world.killed)
+
+    def test_a_job_that_never_started_stays_visible_instead_of_vanishing(self):
+        # The residual window: crash between claiming the name and spawning. Nothing is
+        # running and nothing ever will be, but the record must NOT disappear — an
+        # invisible job is the failure this ordering exists to prevent, and "visible
+        # and may not exist" is the state that can be resolved by looking.
+        self.interrupted()
+
+        job = self.store.get("victim")
+        self.assertIsNotNone(job)
+        self.assertEqual(job.state, "starting")
+        self.assertFalse(job.done)
+        self.assertIn("victim", self.store.manifest())
+        self.assertNotIn("no jobs yet", self.store.manifest())
+
+    def test_resubmitting_an_interrupted_name_is_refused_and_explains_the_ambiguity(self):
+        # The protection itself. Silently allowing the name back is how an interrupted
+        # submit becomes a second copy of expensive work.
+        self.interrupted()
+        with self.assertRaises(J.JobError) as caught:
+            self.store.submit("expensive-thing", name="victim")
+        message = str(caught.exception)
+        self.assertIn("may or may not be running", message)
+        self.assertIn("jobs.kill('victim')", message)
+        self.assertEqual(len(self.world.spawned), 0, "the work was started a second time")
+
+    def test_a_job_that_finished_unobserved_is_recovered_as_done(self):
+        # The kernel died in the window AND the work finished before anyone looked.
+        # The exit marker is the only record of it, which is precisely why it exists.
+        self.interrupted()
+        self.write_log("victim", "all done\n")
+        self.finish("victim", 0)
+
+        job = self.store.get("victim")
+        self.assertTrue(job.done)
+        self.assertTrue(job.ok)
+        self.assertEqual(job.exit_code, 0)
+        self.assertEqual(job.reason, "completed")
+        self.assertIn("all done", job.output)
+
+    def test_a_nonzero_exit_is_recovered_too(self):
+        self.interrupted()
+        self.finish("victim", 7)
+        job = self.store.get("victim")
+        self.assertTrue(job.done)
+        self.assertFalse(job.ok)
+        self.assertEqual(job.exit_code, 7)
+
+    def test_giving_up_on_an_unknown_job_frees_the_name_without_claiming_a_kill(self):
+        # `kill` on a pid-less job cannot signal anything. Reporting a clean kill would
+        # be a lie in the one case where it matters — the work may be running — so the
+        # reason has to say what was actually done.
+        self.interrupted()
+        self.assertTrue(self.store.kill("victim"))
+        self.assertEqual(self.world.killed, [], "signalled a pid it does not have")
+        self.assertIn("nothing was signalled", self.store._read("victim")["reason"])
+        # And the name is usable again, which is the point of giving up.
+        self.store.submit("expensive-thing", name="victim")
+        self.assertEqual(len(self.world.spawned), 1)
+
+    def test_an_interrupted_job_is_announced_to_a_fresh_kernel(self):
+        # `starting` counts as live: it is exactly the state a kernel that just came
+        # back is most likely to be looking at, and a fresh kernel that reported it as
+        # finished would send the agent off to redo the work.
+        self.interrupted()
+        self.assertIn("starting", self.store.manifest())
+        live = [r for r in self.store.list() if r.get("state") in J.LIVE_STATES]
+        self.assertEqual([r["name"] for r in live], ["victim"])
+
+
 class TestSubmit(Base):
     def test_happy_path_records_and_spawns_once(self):
         job = self.store.submit("gradle build", name="build", max_runtime="1h")
@@ -227,8 +348,22 @@ class TestSubmit(Base):
         # was never written and every job reported "running" forever.
         self.store.submit("do_thing; exit 3", name="x")
         cmd = self.world.spawned[0]["cmd"]
-        self.assertTrue(cmd.startswith("( "))
-        self.assertIn("echo $? >", cmd)
+        # The invariant is that the command sits inside a subshell and the marker is
+        # written after it closes — not that the line *begins* with "( ". Asserting the
+        # prefix was checking where the subshell is rather than that there is one, and
+        # it broke the moment anything legitimate was prepended (the pid file).
+        self.assertIn("( do_thing; exit 3 )", cmd)
+        self.assertRegex(cmd, r"\)\s*;\s*echo \$\? >")
+
+    def test_the_job_records_its_own_pid_before_running(self):
+        # The pid Popen returns is known only to the process that called it, and that
+        # is the process this design expects to die. A job that writes its own pid is
+        # the only way a kernel that never saw the spawn can kill it — see
+        # TestInterruptedSubmit in test_integration.py.
+        self.store.submit("do_thing", name="x")
+        cmd = self.world.spawned[0]["cmd"]
+        self.assertRegex(cmd, r"^echo \$\$ > \S*x\.pid ;")
+        self.assertLess(cmd.index("x.pid"), cmd.index("( do_thing )"))
 
     def test_duplicate_running_name_is_refused(self):
         self.store.submit("sleep 1", name="dup")

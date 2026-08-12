@@ -376,6 +376,17 @@ describe("the paired analysis carries its own null control", () => {
 
 	it("paired contrasts use only tasks present in every compared cell", { skip: haveFactorial ? false : "no factorial.mjs" }, () => {
 		assert.match(source, /const usable = taskSet\.filter\(\(t\) =>/);
-		assert.match(source, /Number\.isFinite\(costOf\(row, col, t\)\)/);
+		assert.match(source, /Number\.isFinite\(costOf\(r, c, t\)\)/);
+	});
+
+	it("a contrast whose cell was not run is skipped, never computed from fewer tasks", { skip: haveFactorial ? false : "no factorial.mjs" }, () => {
+		// `--cells` lets a deliberately partial design be analysed (the challenge-split
+		// pilot ran three of the four corners). The danger it introduces is the one this
+		// file already guards elsewhere: a missing cell quietly shrinking the sample a
+		// contrast is computed over. So contrasts are filtered by cell availability and
+		// the omitted ones are named in the output rather than silently absent.
+		assert.match(source, /\.filter\(\(\[a, b\]\) => have\(\.\.\.a\) && have\(\.\.\.b\)\)/);
+		assert.match(source, /SKIPPED — a cell it needs was not run/);
+		assert.match(source, /interaction: SKIPPED — needs all four corners/);
 	});
 });

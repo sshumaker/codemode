@@ -57,8 +57,27 @@ const repeat = Number(flag("repeat", 1));
 const split = flag("split", "train");
 const seed = Number(flag("seed", 0));
 const promptName = flag("prompt", "a1");
-const vanillaPromptName = flag("vanilla-prompt", "b1");
 const residencyFor = (arm) => flag(`${arm}-residency`, undefined);
+/**
+ * The vanilla preamble must match the residency it is describing.
+ *
+ * `b1` says "their full parameter schemas are already in front of you; you do not
+ * need to look anything up" — true at L4, false at L1, where the arm holds only
+ * `search_tools`/`describe_tool`/`call_tool`. `run-task.mjs` has always picked the
+ * matching default (b2 for L1, b3 for `predicted`); this file used to hardcode `b1`
+ * and pass it explicitly, silently overriding that and mis-briefing the L1 arm.
+ *
+ * An L1 run so briefed never calls `describe_tool` at all — it guesses arguments
+ * straight into `call_tool`, which mostly works, so nothing raises. Measured on ten
+ * challenge tasks, b1-vs-b2 paired: b2 (correct) cost **+$0.020/task more**, with 262
+ * actions and 0 tool errors against b1's 253 and 2. So the misbrief made the tools arm
+ * look slightly *cheaper* than it is — it understated the representation gap rather
+ * than flattering codemode, which is the opposite of the guess that motivated the fix.
+ *
+ * Small either way; the reason to fix it is that the arm was not in the condition its
+ * label claimed, and nothing in the numbers would ever have said so.
+ */
+const vanillaPromptFor = (residency) => flag("vanilla-prompt", residency === "L1" ? "b2" : residency === "predicted" ? "b3" : "b1");
 
 /** Task ids for a split, read out of AppWorld rather than hardcoded. */
 function splitTaskIds(name) {
@@ -104,9 +123,10 @@ for (const task of tasks ?? []) {
 	for (const arm of arms) {
 		for (let r = 1; r <= repeat; r++) {
 			const residency = residencyFor(arm) ?? (arm === "codemode" ? "L0" : arm === "notools" ? "none" : "L4");
+			const vanillaPromptName = vanillaPromptFor(residency);
 			const suffix = arm === "codemode" ? `__${promptName}` : arm === "vanilla" ? `__${vanillaPromptName}` : "";
 			const base = `${task}__${arm}__${residency}${suffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
-			cells.push({ task, arm, residency, repeat: r, runId: repeat > 1 ? `${base}__r${r}` : base });
+			cells.push({ task, arm, residency, vanillaPromptName, repeat: r, runId: repeat > 1 ? `${base}__r${r}` : base });
 		}
 	}
 }
@@ -142,7 +162,7 @@ async function runCell(cell) {
 		"--force",
 	];
 	if (cell.arm === "codemode") args.push("--prompt", promptName);
-	if (cell.arm === "vanilla") args.push("--vanilla-prompt", vanillaPromptName);
+	if (cell.arm === "vanilla") args.push("--vanilla-prompt", cell.vanillaPromptName);
 	if (flag("max-cost")) args.push("--max-cost", flag("max-cost"));
 	if (flag("timeout")) args.push("--timeout", flag("timeout"));
 

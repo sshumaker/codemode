@@ -305,3 +305,46 @@ describe("the vanilla variants differ only in the residency mechanism", () => {
 		assert.match(runner, /toolCount: predicted\.names\.length/);
 	});
 });
+
+describe("the vanilla preamble matches the residency it describes", () => {
+	// Found on the challenge-split scout: `sweep.mjs` hardcoded `--vanilla-prompt b1`
+	// and passed it explicitly for every residency, overriding run-task.mjs's
+	// residency-aware default. An L1 arm was therefore told "their full parameter
+	// schemas are already in front of you; you do not need to look anything up" while
+	// holding only search_tools/describe_tool/call_tool.
+	//
+	// It produced no error. The arm skipped `describe_tool` entirely, guessed arguments
+	// into `call_tool`, and mostly succeeded. Paired b1-vs-b2 on ten challenge tasks
+	// the misbrief was worth -$0.020/task — it made the tools arm look slightly cheaper
+	// than it is. The point is not the magnitude: the arm was not in the condition its
+	// label claimed, and no number in the output would ever have said so.
+	const ctx = { toolCount: 469, serverCount: 10 };
+	const SWEEP = readFileSync(join(ROOT, "bench/appworld/sweep.mjs"), "utf8");
+
+	it("the non-resident variant does not claim resident schemas", () => {
+		// b1 (L4) and b3 (predicted) both genuinely hold schemas — 469 and <=20. b2 is
+		// the only variant whose schemas are not in the prompt, so it is the only one
+		// for which the claim would be false.
+		const resident = /already in front|do not need to look anything up/i;
+		assert.match(buildVanillaPreamble("b1", ctx), resident);
+		assert.doesNotMatch(buildVanillaPreamble("b2", ctx), resident, "b2 is the L1 variant and holds no schemas");
+	});
+
+	it("b2 tells the L1 arm about the dispatcher it actually holds", () => {
+		const text = buildVanillaPreamble("b2", ctx);
+		for (const tool of ["describe_tool", "call_tool", "search_tools"]) {
+			assert.ok(text.includes(tool), `b2 never mentions ${tool}, which is all the L1 arm has`);
+		}
+	});
+
+	it("sweep.mjs derives the vanilla prompt from residency rather than hardcoding one", () => {
+		assert.doesNotMatch(
+			SWEEP,
+			/flag\("vanilla-prompt",\s*"b1"\)/,
+			'sweep.mjs hardcodes --vanilla-prompt b1; it must default per residency (b2 at L1, b3 at predicted)',
+		);
+		assert.match(SWEEP, /residency === "L1" \? "b2"/);
+		// …and the per-cell value must reach the runner, not a module-level constant.
+		assert.match(SWEEP, /"--vanilla-prompt", cell\.vanillaPromptName/);
+	});
+});

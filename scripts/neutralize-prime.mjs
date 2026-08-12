@@ -309,6 +309,107 @@ sub(
 	"__HARNESS_WAIT_SECONDS__",
 );
 
+// --- surviving the death of the kernel ---------------------------------------
+//
+// The hosted runtime's central claim is that work outlives the kernel. Testing it
+// needs a kernel that comes back, and upstream has no such path: a kernel killed out
+// from under the agent (SIGKILL, OOM, container restart) sets state="shutdown", and
+// `IpythonKernelProvisioner.ensure()` keeps returning that same memoised corpse, so
+// every later cell throws "Kernel has been shut down" for the rest of the run.
+// Upstream only ever rebuilds a kernel when a *human* picks "Kill kernel and restart"
+// at the busy-kernel prompt, and print mode has no human.
+//
+// Measured with HARNESS_KERNEL_AUTORESTART unset: after an external SIGKILL the agent
+// spent its remaining 11 cells on "Kernel has been shut down", never ran another line
+// of Python, and reported failure on a job that had in fact completed on disk. That is
+// a harness limit, not an agent failure, and it makes the durability property
+// unobservable — see docs/DURABILITY-RESULTS.md.
+//
+// Gated on HARNESS_KERNEL_AUTORESTART=1 so the wedge is preserved by default and the
+// two conditions are the same code path with a flag.
+//
+// The notice deliberately says NOTHING about jobs. Whether the agent knows its
+// background work survived is the thing under test; putting the answer in the harness
+// notice would measure instruction-following instead.
+log("\nkernel auto-restart after death:");
+
+sub(
+	"core/tools/ipython.ts",
+	`const KERNEL_RESTART_NOTICE = [`,
+	`const KERNEL_DEATH_NOTICE = [
+	"<ipython_kernel_restarted>",
+	"The IPython kernel process died and a fresh one was started. Every variable, import and in-memory object defined before this point is gone; recreate anything you still need.",
+	"</ipython_kernel_restarted>",
+].join("\\n");
+const KERNEL_RESTART_NOTICE = [`,
+	"a notice for a kernel that died rather than one restarted on purpose",
+	"KERNEL_DEATH_NOTICE",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	`): Promise<{ result: ExecuteResult; kernelRestarted: boolean }> {\n\tlet kernelRestarted = false;`,
+	`): Promise<{ result: ExecuteResult; kernelRestarted: boolean; kernelDied: boolean }> {\n` +
+		`\tlet kernelRestarted = false;\n` +
+		`\t// Bounded: a kernel that dies on every boot must fail the call, not spin.\n` +
+		`\tlet deadKernelRestarts = 0;\n` +
+		`\tlet kernelDied = false;`,
+	"track a dead kernel separately from a deliberately restarted one",
+	"let deadKernelRestarts = 0;",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	`\t\t\treturn {\n\t\t\t\tresult: await m.execute(code, {`,
+	`\t\t\treturn {\n\t\t\t\tkernelDied,\n\t\t\t\tresult: await m.execute(code, {`,
+	"return the death flag",
+	"kernelDied,\n\t\t\t\tresult:",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	`\t\t} catch (error) {\n\t\t\tif (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {\n\t\t\t\tthrow error;\n\t\t\t}`,
+	`\t\t} catch (error) {\n` +
+		`\t\t\t// The kernel died under us. Drop the corpse the provisioner is memoising and\n` +
+		`\t\t\t// boot a fresh one, then tell the model — the same recovery the busy path\n` +
+		`\t\t\t// already performs, minus the human. See scripts/neutralize-prime.mjs.\n` +
+		`\t\t\tif (\n` +
+		`\t\t\t\tprocess.env.HARNESS_KERNEL_AUTORESTART === "1" &&\n` +
+		`\t\t\t\tdeadKernelRestarts < 3 &&\n` +
+		`\t\t\t\t!signal?.aborted &&\n` +
+		`\t\t\t\t/Kernel has been shut down|Kernel exited/.test(String((error as { message?: string })?.message ?? ""))\n` +
+		`\t\t\t) {\n` +
+		`\t\t\t\tdeadKernelRestarts += 1;\n` +
+		`\t\t\t\tonWorkingMessage("Restarting IPython kernel...");\n` +
+		`\t\t\t\tawait provisioner.kill();\n` +
+		`\t\t\t\tkernelRestarted = true;\n` +
+		`\t\t\t\tkernelDied = true;\n` +
+		`\t\t\t\tcontinue;\n` +
+		`\t\t\t}\n` +
+		`\t\t\tif (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {\n\t\t\t\tthrow error;\n\t\t\t}`,
+	"rebuild a dead kernel instead of throwing forever",
+	"HARNESS_KERNEL_AUTORESTART",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	`\t\t\t\tconst { result: r, kernelRestarted } = await executeWithBusyKernelChoice(`,
+	`\t\t\t\tconst { result: r, kernelRestarted, kernelDied } = await executeWithBusyKernelChoice(`,
+	"destructure the death flag at the call site",
+	"kernelRestarted, kernelDied }",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	`\t\t\t\tif (kernelRestarted) {\n\t\t\t\t\ttext = text ? \`\${KERNEL_RESTART_NOTICE}\\n\\n\${text}\` : KERNEL_RESTART_NOTICE;\n\t\t\t\t}`,
+	`\t\t\t\tif (kernelRestarted) {\n` +
+		`\t\t\t\t\tconst notice = kernelDied ? KERNEL_DEATH_NOTICE : KERNEL_RESTART_NOTICE;\n` +
+		`\t\t\t\t\ttext = text ? \`\${notice}\\n\\n\${text}\` : notice;\n` +
+		`\t\t\t\t}`,
+	"pick the notice that matches what actually happened",
+	"const notice = kernelDied ?",
+);
+
 log("\ncontainer kernel:");
 
 // Appended *after* the provenance import pair, never between its two lines:

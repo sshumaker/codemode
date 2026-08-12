@@ -156,6 +156,11 @@ const BUSY_KERNEL_PROMPT = [
 	"Ctrl+C sent an interrupt, but the previous cell has not stopped yet. A new IPython command cannot start until it finishes.",
 	"Waiting preserves the current kernel state. Killing restarts IPython and loses in-memory variables, imports, and running tasks.",
 ].join("\n");
+const KERNEL_DEATH_NOTICE = [
+	"<ipython_kernel_restarted>",
+	"The IPython kernel process died and a fresh one was started. Every variable, import and in-memory object defined before this point is gone; recreate anything you still need.",
+	"</ipython_kernel_restarted>",
+].join("\n");
 const KERNEL_RESTART_NOTICE = [
 	"<ipython_kernel_reset>",
 	"The IPython kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.",
@@ -575,12 +580,16 @@ async function executeWithBusyKernelChoice(
 	onWorkingMessage: (message?: string) => void,
 	onLateSentAgentMessage: ((toolCallId: string, message: KernelSentAgentMessage) => void) | undefined,
 	ctx: ExtensionContext | undefined,
-): Promise<{ result: ExecuteResult; kernelRestarted: boolean }> {
+): Promise<{ result: ExecuteResult; kernelRestarted: boolean; kernelDied: boolean }> {
 	let kernelRestarted = false;
+	// Bounded: a kernel that dies on every boot must fail the call, not spin.
+	let deadKernelRestarts = 0;
+	let kernelDied = false;
 	while (true) {
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
 			return {
+				kernelDied,
 				result: await m.execute(code, {
 					signal,
 					onStream,
@@ -591,6 +600,22 @@ async function executeWithBusyKernelChoice(
 				kernelRestarted,
 			};
 		} catch (error) {
+			// The kernel died under us. Drop the corpse the provisioner is memoising and
+			// boot a fresh one, then tell the model — the same recovery the busy path
+			// already performs, minus the human. See scripts/neutralize-prime.mjs.
+			if (
+				process.env.HARNESS_KERNEL_AUTORESTART === "1" &&
+				deadKernelRestarts < 3 &&
+				!signal?.aborted &&
+				/Kernel has been shut down|Kernel exited/.test(String((error as { message?: string })?.message ?? ""))
+			) {
+				deadKernelRestarts += 1;
+				onWorkingMessage("Restarting IPython kernel...");
+				await provisioner.kill();
+				kernelRestarted = true;
+				kernelDied = true;
+				continue;
+			}
 			if (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {
 				throw error;
 			}
@@ -981,7 +1006,7 @@ export function createIpythonToolDefinition(
 					: undefined;
 			try {
 				const code = applyShellSettingsToBashMagicCell(params.code, options);
-				const { result: r, kernelRestarted } = await executeWithBusyKernelChoice(
+				const { result: r, kernelRestarted, kernelDied } = await executeWithBusyKernelChoice(
 					provisioner,
 					reportStartupProgress,
 					toolCallId,
@@ -1035,7 +1060,8 @@ export function createIpythonToolDefinition(
 					text += (text ? "\n" : "") + r.error.traceback.join("\n");
 				}
 				if (kernelRestarted) {
-					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
+					const notice = kernelDied ? KERNEL_DEATH_NOTICE : KERNEL_RESTART_NOTICE;
+					text = text ? `${notice}\n\n${text}` : notice;
 				}
 
 				// See scripts/neutralize-prime.mjs — opt-in kernel state visibility.

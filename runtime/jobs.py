@@ -112,6 +112,10 @@ SILENCE_FRACTION = 0.4
 
 VALID_EXPECT = ("once", "stream")
 
+# States in which a job's process may exist. `starting` is the interval between
+# claiming the name on disk and recording the pid — see submit().
+LIVE_STATES = ("running", "starting")
+
 
 class JobError(RuntimeError):
     """Raised for arming failures and for access to a dead job's results."""
@@ -399,7 +403,7 @@ class Job:
     def __repr__(self) -> str:
         rec = self._store._refresh(self._store._read(self.name)) or {"state": "missing"}
         extra = ""
-        if rec.get("state") == "running" and rec.get("silent"):
+        if rec.get("state") in LIVE_STATES and rec.get("silent"):
             extra = " ⚠ never fired"
         return f"<Job {self.name} {rec.get('state')}{extra}>"
 
@@ -558,6 +562,18 @@ class JobStore:
     def _log_path(self, name: str) -> str:
         return os.path.join(self.job_dir, f"{name}.log")
 
+    def _pid_path(self, name: str) -> str:
+        """
+        Where the job records its OWN pid.
+
+        The pid returned by Popen is known only to the process that called it, and that
+        process is exactly the one this design expects to die. A job that writes its own
+        pid is findable by a kernel that never saw the spawn — same reasoning as the
+        exit marker, which exists because a completed child of a dead kernel cannot be
+        reported by anything held in memory.
+        """
+        return os.path.join(self.job_dir, f"{name}.pid")
+
     def _read(self, name: str) -> Optional[dict]:
         try:
             with open(self._path(name)) as fh:
@@ -566,8 +582,18 @@ class JobStore:
             return None
 
     def _write(self, rec: dict) -> None:
-        with open(self._path(rec["name"]), "w") as fh:
+        """
+        Atomically. A record is the only evidence a job exists, so a half-written one is
+        indistinguishable from no job at all: `_read` catches the ValueError and returns
+        None, `_all` skips it, `manifest()` says "no jobs yet" and `submit` allows the
+        name to be reused. Write to a sibling and rename, so a reader sees either the
+        previous record or the new one and never a prefix of either.
+        """
+        path = self._path(rec["name"])
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as fh:
             json.dump(rec, fh)
+        os.replace(tmp, path)
 
     def _read_log(self, rec: dict) -> str:
         try:
@@ -605,8 +631,22 @@ class JobStore:
         completed jobs as running. The exit marker is also the only signal that
         survives the kernel dying.
         """
-        if not rec or rec.get("state") != "running":
+        if not rec or rec.get("state") not in LIVE_STATES:
             return rec
+        # A `starting` record is one whose submit was interrupted between claiming the
+        # name and recording the pid. The job may or may not have been spawned, and the
+        # only two things that can say are written by the job itself: its pid file and
+        # its exit marker. Adopt the pid the moment it appears, so a recovered job is an
+        # ordinary running job — killable, and not a special case anywhere else.
+        if rec.get("state") == "starting":
+            try:
+                with open(self._pid_path(rec["name"])) as fh:
+                    rec["pid"] = int(fh.read().strip())
+                rec["state"] = "running"
+                rec["reason"] = "recovered: submit was interrupted after this job started"
+                self._write(rec)
+            except (OSError, ValueError):
+                pass
         marker = rec.get("exit_marker")
         if marker and os.path.exists(marker):
             try:
@@ -649,6 +689,11 @@ class JobStore:
                 self._kill(pid)
             except OSError:
                 pass
+        elif rec.get("state") == "starting":
+            # Nothing to signal, and saying "killed" without qualification would be a
+            # lie in the one case where it matters: the job may be running and simply
+            # never got as far as writing its pid. Record what was actually done.
+            reason = f"{reason}; no pid was recorded, so nothing was signalled — if the work did start it is still running"
         rec["state"] = state
         rec["reason"] = reason
         rec["finished_at"] = self._now()
@@ -694,6 +739,19 @@ class JobStore:
             raise JobError(
                 f"job {name!r} is already running. Use a different name, or jobs.kill({name!r}) first."
             )
+        # `starting` means a previous submit of this name was interrupted, and whether
+        # its work is running is unknown. Refusing is the whole protection: silently
+        # allowing the name back is how an interrupted submit becomes a second copy of
+        # an expensive job, which is the failure the durability design exists to prevent.
+        if existing and existing.get("state") == "starting":
+            raise JobError(
+                f"job {name!r} was submitted but the submit did not complete — most likely the "
+                "kernel died between starting the work and recording it. The work may or may "
+                "not be running.\n"
+                f"  jobs.get({name!r}).output   to see whether it has produced anything\n"
+                f"  jobs.kill({name!r})         to give up on it and free the name\n"
+                "Re-submitting under this name is refused because it would run the work twice."
+            )
 
         command = payload if isinstance(payload, str) else " ".join(shlex.quote(str(x)) for x in payload)
         problems = lint_condition(command, expect)
@@ -706,25 +764,22 @@ class JobStore:
 
         log = self._log_path(name)
         marker = os.path.join(self.job_dir, f"{name}.exit")
-        for stale in (log, marker):
+        pidfile = self._pid_path(name)
+        for stale in (log, marker, pidfile):
             try:
                 os.remove(stale)
             except OSError:
                 pass
-        # A subshell, not a brace group: a command ending in `exit N` inside `{ }`
-        # exits the *outer* shell, so the marker was never written and every job
-        # reported "running" forever.
-        wrapped = f"( {command} ) ; echo $? > {shlex.quote(marker)}"
-        pid = self._spawn(wrapped, log, cwd or self._cwd)
 
         rec = {
             "name": name,
             "cmd": command,
             "expect": expect,
-            "pid": pid,
+            "pid": None,
             "log": log,
             "exit_marker": marker,
-            "state": "running",
+            "pid_file": pidfile,
+            "state": "starting",
             "reason": None,
             "started_at": self._now(),
             "max_runtime": parse_duration(max_runtime) if max_runtime is not None else None,
@@ -732,7 +787,44 @@ class JobStore:
             "events": 0,
             "silent": False,
         }
+        # Claim the name on disk BEFORE anything can be running under it.
+        #
+        # Spawn-then-write leaves a window in which the work exists and no record of it
+        # does. Measured, with a real SIGKILL landing between the two: the job ran to
+        # completion, wrote its output, and `jobs.get(name)` returned None while
+        # `manifest()` reported "no jobs yet" — which does not merely fail to help, it
+        # asserts that nothing was started. An agent that believes it re-submits, and
+        # running an expensive job twice is precisely the failure durability is for.
+        #
+        # Ordering it the other way cannot lose work. The residual window — a crash
+        # between this write and the spawn — leaves a `starting` record with no process,
+        # which is a job that is *visible and may not exist* rather than one that exists
+        # and is invisible. That asymmetry is the whole point: the first is recoverable
+        # by looking, the second is not recoverable at all.
         self._write(rec)
+
+        # A subshell, not a brace group: a command ending in `exit N` inside `{ }`
+        # exits the *outer* shell, so the marker was never written and every job
+        # reported "running" forever.
+        #
+        # `echo $$` first, so the job records its own pid. In `sh -c`, `$$` is the
+        # shell's pid, which is exactly what Popen returns — so this is the same number,
+        # written by the process that survives rather than by the one expected to die.
+        # Without it a job recovered from `starting` would be unkillable.
+        wrapped = (
+            f"echo $$ > {shlex.quote(pidfile)} ; "
+            f"( {command} ) ; echo $? > {shlex.quote(marker)}"
+        )
+        try:
+            pid = self._spawn(wrapped, log, cwd or self._cwd)
+        except BaseException:
+            # A spawn that never happened must not leave a name claimed forever.
+            self._terminate(rec, state="killed", reason="failed to start")
+            raise
+        rec["pid"] = pid
+        rec["state"] = "running"
+        self._write(rec)
+
         if problems and not strict:
             for code, msg in problems:
                 self._emit(f"[warn {code}] {msg}")
@@ -763,7 +855,7 @@ class JobStore:
         pending = []
         for rec in self._all():
             fresh = self._refresh(rec)
-            if fresh and fresh.get("state") == "running":
+            if fresh and fresh.get("state") in LIVE_STATES:
                 mark = " ⚠ never fired" if fresh.get("silent") else ""
                 pending.append(f"{fresh['name']}{mark}")
         note = ""
@@ -806,7 +898,7 @@ class JobStore:
 
     def kill(self, name: str) -> bool:
         rec = self._refresh(self._read(name))
-        if not rec or rec.get("state") != "running":
+        if not rec or rec.get("state") not in LIVE_STATES:
             return False
         self._terminate(rec, state="killed", reason="killed by agent")
         return True
@@ -839,7 +931,7 @@ class JobStore:
         rec = self._read(name)
         if not rec:
             return False
-        if rec.get("state") == "running":
+        if rec.get("state") in LIVE_STATES:
             self._terminate(rec, state="pruned", reason=reason)
         else:
             rec["state"] = "pruned"

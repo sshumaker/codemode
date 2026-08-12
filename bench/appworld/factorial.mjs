@@ -63,6 +63,31 @@ const CELLS = [
 ];
 
 /**
+ * `--cells "code / docs out,code / docs in,tools / docs out"` — analyse a partial design.
+ *
+ * The full 2x2 requires four cells and every task to be present in all of them, and
+ * that is the right default: a contrast read off a design that was only half run is
+ * how a half-finished cell got reported as a cheap one. But a *deliberately* partial
+ * design is a legitimate thing to run — the challenge-split pilot bought the two
+ * contrasts CLAUDE.md calls defensible (residency on the code row, representation with
+ * docs non-resident) and skipped `tools / docs in`, which neither contrast uses.
+ *
+ * Naming the cells makes the restriction explicit and auditable, rather than letting a
+ * missing cell quietly shrink the sample. Contrasts that need an omitted cell are
+ * skipped and listed as skipped, never computed from a smaller task set.
+ */
+const cellFilter = flag("cells", null);
+if (cellFilter) {
+	const wanted = new Set(cellFilter.split(",").map((s) => s.trim()));
+	const unknown = [...wanted].filter((k) => !CELLS.some((c) => c.key === k));
+	if (unknown.length) {
+		console.error(`unknown cell key(s): ${unknown.join(", ")}\nhave: ${CELLS.map((c) => c.key).join(" | ")}`);
+		process.exit(2);
+	}
+	for (let i = CELLS.length - 1; i >= 0; i--) if (!wanted.has(CELLS[i].key)) CELLS.splice(i, 1);
+}
+
+/**
  * Every replicate of one (task, cell), averaged.
  *
  * `sweep.mjs --repeat N` writes `<base>__r1 … __rN`; a single run writes `<base>`.
@@ -134,25 +159,38 @@ function read(task, cell) {
  */
 function pairedReport(taskSet, label) {
 	const cell = (row, col) => CELLS.find((c) => c.row === row && c.col === col);
-	const costOf = (row, col, t) => table.get(`${t}|${cell(row, col).key}`)?.cost;
-	const usable = taskSet.filter((t) =>
-		["in", "out"].every((col) => ["code", "tools"].every((row) => Number.isFinite(costOf(row, col, t)))),
-	);
+	const costOf = (row, col, t) => table.get(`${t}|${cell(row, col)?.key}`)?.cost;
+	// Which of the four factorial corners this run actually has. Under `--cells` some
+	// are absent by design; without it, an absent corner still means a half-run design.
+	const have = (row, col) => Boolean(cell(row, col));
+	const corners = [
+		["code", "out"],
+		["code", "in"],
+		["tools", "out"],
+		["tools", "in"],
+	].filter(([r, c]) => have(r, c));
+	if (!have("code", "out")) return; // every contrast and the null control reference it
+	const usable = taskSet.filter((t) => corners.every(([r, c]) => Number.isFinite(costOf(r, c, t))));
 	if (usable.length < 2) return;
 
 	const censored = (row, col) => usable.some((t) => table.get(`${t}|${cell(row, col).key}`)?.capped);
 	const mark = (...pairs) => (pairs.some(([r, c]) => censored(r, c)) ? "  [CENSORED: lower bound]" : "");
-	const contrasts = [
-		[`residency, code row (in - out)${mark(["code", "in"], ["code", "out"])}`, (t) => costOf("code", "in", t) - costOf("code", "out", t)],
-		[`residency, tools row (in - out)${mark(["tools", "in"], ["tools", "out"])}`, (t) => costOf("tools", "in", t) - costOf("tools", "out", t)],
-		[`representation, docs-in (tools - code)${mark(["tools", "in"], ["code", "in"])}`, (t) => costOf("tools", "in", t) - costOf("code", "in", t)],
-		[`representation, docs-out (tools - code)${mark(["tools", "out"], ["code", "out"])}`, (t) => costOf("tools", "out", t) - costOf("code", "out", t)],
+	const allContrasts = [
+		[["code", "in"], ["code", "out"], "residency, code row (in - out)"],
+		[["tools", "in"], ["tools", "out"], "residency, tools row (in - out)"],
+		[["tools", "in"], ["code", "in"], "representation, docs-in (tools - code)"],
+		[["tools", "out"], ["code", "out"], "representation, docs-out (tools - code)"],
 	];
+	const contrasts = allContrasts
+		.filter(([a, b]) => have(...a) && have(...b))
+		.map(([a, b, name]) => [`${name}${mark(a, b)}`, (t) => costOf(...a, t) - costOf(...b, t)]);
+	const skipped = allContrasts.filter(([a, b]) => !have(...a) || !have(...b)).map(([, , name]) => name);
 
 	console.log(`\n=== paired per-task cost differences — ${label} (n=${usable.length} tasks) ===\n`);
 	for (const [name, fn] of contrasts) {
 		console.log(`  ${formatPaired(name, pairedTest(usable.map(fn)))}`);
 	}
+	for (const name of skipped) console.log(`  ${name}: SKIPPED — a cell it needs was not run`);
 	// A null control on every report, not a one-off check.
 	//
 	// One cell compared with itself must produce exactly zero with no significance.
@@ -496,22 +534,36 @@ report(complete, core, "the 2x2");
 
 if (complete.length > 0) {
 	const cell = (row, col) => CELLS.find((c) => c.row === row && c.col === col);
+	// Under `--cells` a corner can be absent by design; every line below is printed
+	// only when both of its corners ran. Substituting a mean over a different task set
+	// for a missing cell is the failure this file already carries two comments about.
+	const has = (row, col) => Boolean(cell(row, col));
 	const cost = (row, col) => agg(cell(row, col), complete, "cost");
 	const ctx = (row, col) => agg(cell(row, col), complete, "firstTurnPromptTokens");
 	console.log("\n--- cost, and what each factor buys on its own ---");
-	console.log(`  within docs-resident : code $${cost("code", "in").toFixed(3)} vs tools $${cost("tools", "in").toFixed(3)}  -> representation ${(cost("tools", "in") / cost("code", "in")).toFixed(1)}x`);
-	console.log(`  within docs-out      : code $${cost("code", "out").toFixed(3)} vs tools $${cost("tools", "out").toFixed(3)}  -> representation ${(cost("tools", "out") / cost("code", "out")).toFixed(1)}x`);
-	console.log(`  within code          : in $${cost("code", "in").toFixed(3)} vs out $${cost("code", "out").toFixed(3)}  -> residency ${(cost("code", "in") / cost("code", "out")).toFixed(1)}x`);
-	console.log(`  within tools         : in $${cost("tools", "in").toFixed(3)} vs out $${cost("tools", "out").toFixed(3)}  -> residency ${(cost("tools", "in") / cost("tools", "out")).toFixed(1)}x`);
+	if (has("code", "in") && has("tools", "in"))
+		console.log(`  within docs-resident : code $${cost("code", "in").toFixed(3)} vs tools $${cost("tools", "in").toFixed(3)}  -> representation ${(cost("tools", "in") / cost("code", "in")).toFixed(1)}x`);
+	if (has("code", "out") && has("tools", "out"))
+		console.log(`  within docs-out      : code $${cost("code", "out").toFixed(3)} vs tools $${cost("tools", "out").toFixed(3)}  -> representation ${(cost("tools", "out") / cost("code", "out")).toFixed(1)}x`);
+	if (has("code", "in") && has("code", "out"))
+		console.log(`  within code          : in $${cost("code", "in").toFixed(3)} vs out $${cost("code", "out").toFixed(3)}  -> residency ${(cost("code", "in") / cost("code", "out")).toFixed(1)}x`);
+	if (has("tools", "in") && has("tools", "out"))
+		console.log(`  within tools         : in $${cost("tools", "in").toFixed(3)} vs out $${cost("tools", "out").toFixed(3)}  -> residency ${(cost("tools", "in") / cost("tools", "out")).toFixed(1)}x`);
 	// A positive interaction here means the two factors are not additive: neither
 	// alone gets you the win, which is a different claim from either headline.
-	const interaction =
-		cost("tools", "in") - cost("tools", "out") - (cost("code", "in") - cost("code", "out"));
-	console.log(`  interaction (log-scale ratio of ratios): ${((cost("tools", "in") / cost("tools", "out")) / (cost("code", "in") / cost("code", "out"))).toFixed(2)}`);
-	console.log(`  interaction (linear $): ${interaction >= 0 ? "+" : ""}${interaction.toFixed(3)}`);
+	if (["code", "tools"].every((r) => ["in", "out"].every((c) => has(r, c)))) {
+		const interaction =
+			cost("tools", "in") - cost("tools", "out") - (cost("code", "in") - cost("code", "out"));
+		console.log(`  interaction (log-scale ratio of ratios): ${((cost("tools", "in") / cost("tools", "out")) / (cost("code", "in") / cost("code", "out"))).toFixed(2)}`);
+		console.log(`  interaction (linear $): ${interaction >= 0 ? "+" : ""}${interaction.toFixed(3)}`);
+	} else {
+		console.log("  interaction: SKIPPED — needs all four corners");
+	}
 	console.log("\n--- first-turn prompt tokens ---");
 	for (const row of ["code", "tools"]) {
-		console.log(`  ${row.padEnd(6)} docs-in ${ctx(row, "in").toFixed(0).padStart(7)}   docs-out ${ctx(row, "out").toFixed(0).padStart(7)}`);
+		const cells = ["in", "out"].filter((c) => has(row, c));
+		if (!cells.length) continue;
+		console.log(`  ${row.padEnd(6)}${cells.map((c) => ` docs-${c} ${ctx(row, c).toFixed(0).padStart(7)}`).join("  ")}`);
 	}
 	console.log(
 		"\nTGC is identical across cells at this sample size — read cost and context, " +

@@ -18,9 +18,11 @@ Kept deliberately small and fast; the exhaustive cases live in the mocked suite.
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
+import sys
 import unittest
 
 import jobs as J
@@ -144,6 +146,155 @@ class TestRealDetachment(RealBase):
         self.assertTrue(wait_until(lambda: _pid_alive(pid)))
         self.assertNotEqual(os.getpgid(pid), os.getpgid(os.getpid()))
         self.store.kill("detached")
+
+
+class TestInterruptedSubmit(RealBase):
+    """
+    The kill-during-submit window: the interval in which a job's process can exist
+    while nothing on disk says so.
+
+    Reproduced with a REAL process death, not a mock. A child process runs submit()
+    with a spawner that starts the job and then SIGKILLs itself the instant Popen
+    returns — which is exactly where a kernel OOM or a container restart can land.
+
+    Measured before the fix (spawn-then-write): the job ran to completion and wrote
+    its output, while `jobs.get(name)` returned None and `manifest()` reported "no
+    jobs yet" — not merely unhelpful but an active assertion that nothing had been
+    started. An agent that believes it re-submits, which runs an expensive job twice:
+    the precise failure durability exists to prevent.
+
+    These tests are the reason `submit` claims the name on disk before spawning and
+    the job writes its own pid. Remove either and the first test here fails.
+    """
+
+    SCRIPT = """
+import os, signal, sys
+sys.path.insert(0, {runtime!r})
+import jobs as J
+store = J.JobStore(sys.argv[1], cwd=sys.argv[2])
+real = store._spawn
+
+def spawn_then_die(cmd, log, cwd):
+    pid = real(cmd, log, cwd)
+    os.kill(os.getpid(), signal.SIGKILL)   # the window
+    return pid
+
+store._spawn = spawn_then_die
+store.submit(sys.argv[3], name="victim")
+"""
+
+    def _submit_and_die(self, command):
+        """Run one submit in a child that dies between the spawn and the record write."""
+        script = os.path.join(self.dir, "interrupted_submit.py")
+        with open(script, "w") as fh:
+            fh.write(self.SCRIPT.format(runtime=os.path.dirname(os.path.abspath(J.__file__))))
+        proc = subprocess.run(
+            [sys.executable, script, self.dir, self.dir, command],
+            capture_output=True, text=True,
+        )
+        # -9: the child really was killed mid-submit rather than returning normally.
+        self.assertEqual(proc.returncode, -signal.SIGKILL,
+                         f"child did not die in the window: rc={proc.returncode} {proc.stderr[-300:]}")
+
+    def test_a_job_started_by_an_interrupted_submit_is_still_findable(self):
+        marker = os.path.join(self.dir, "survived.txt")
+        self._submit_and_die(f"sleep 1; echo alive > {marker}")
+
+        # A brand-new store over the same directory is the replacement kernel.
+        fresh = J.JobStore(self.dir, cwd=self.dir, emit=lambda m: None)
+        job = fresh.get("victim")
+        self.assertIsNotNone(
+            job, "a job whose submit was interrupted is invisible — this is the orphan window"
+        )
+        self.assertIn(job.state, J.LIVE_STATES + ("done",))
+        self.assertNotIn("no jobs yet", fresh.manifest())
+
+        # And the work itself really did run, which is what makes the invisibility bad
+        # rather than merely untidy.
+        self.assertTrue(wait_until(lambda: os.path.exists(marker), timeout=8),
+                        "the orphaned job never ran, so this is not the window under test")
+        self.assertTrue(wait_until(lambda: job.done, timeout=8))
+        self.assertTrue(job.ok)
+
+    def test_resubmitting_the_same_name_is_refused_so_the_work_is_not_redone(self):
+        # The falsifier, stated as a test: an interrupted submit must not let the agent
+        # silently start a second copy of expensive work.
+        trace = os.path.join(self.dir, "invocations.txt")
+        self._submit_and_die(f"echo ran >> {trace}; sleep 1")
+
+        fresh = J.JobStore(self.dir, cwd=self.dir, emit=lambda m: None)
+        with self.assertRaises(J.JobError) as caught:
+            fresh.submit(f"echo ran >> {trace}; sleep 1", name="victim")
+        self.assertIn("victim", str(caught.exception))
+
+        self.assertTrue(wait_until(lambda: fresh.get("victim").done, timeout=8))
+        with open(trace) as fh:
+            self.assertEqual(fh.read().count("ran"), 1, "the work ran more than once")
+
+    def test_the_recovered_job_is_killable(self):
+        # Recovery is worth little if the job cannot then be stopped: the pid Popen
+        # returned died with the kernel, so the job has to have recorded its own.
+        self._submit_and_die("sleep 30")
+        fresh = J.JobStore(self.dir, cwd=self.dir, emit=lambda m: None)
+        self.assertTrue(wait_until(lambda: fresh.get("victim").state == "running", timeout=5),
+                        "never adopted the pid the job wrote for itself")
+        pid = fresh._read("victim")["pid"]
+        self.assertTrue(_pid_alive(pid))
+        self.assertTrue(fresh.kill("victim"))
+        self.assertTrue(wait_until(lambda: not _pid_alive(pid)), "recovered job could not be killed")
+
+    def test_the_name_is_claimed_before_anything_can_run_under_it(self):
+        # The ordering invariant itself, checked without killing anything: at the
+        # moment the spawner is called, the record must already be on disk. Assert it
+        # from inside the spawner, which is the only point that can see the interval.
+        seen = {}
+
+        def spy(cmd, log, cwd):
+            seen["record"] = self.store._read("ordered")
+            return real(cmd, log, cwd)
+
+        real = self.store._spawn
+        self.store._spawn = spy
+        self.store.submit("true", name="ordered")
+        self.assertIsNotNone(seen["record"], "spawned before the name was claimed on disk")
+        self.assertEqual(seen["record"]["state"], "starting")
+        self.assertIsNone(seen["record"]["pid"])
+
+    def test_a_torn_write_leaves_the_previous_record_readable(self):
+        # A record is the only evidence a job exists, so a half-written one is as bad
+        # as none: _read swallows the ValueError and returns None, _all skips it,
+        # manifest says "no jobs yet" and the name becomes reusable — the same
+        # invisibility as the orphan window, reached by a different route.
+        #
+        # Simulated by failing json.dump after it has emitted a valid-looking prefix,
+        # which is what a full disk or a process death mid-write produces. Writing in
+        # place truncates on open, so the prefix IS the file; writing to a sibling and
+        # renaming leaves the previous record untouched.
+        self.store.submit("sleep 5", name="atomic")
+        rec = self.store._read("atomic")
+        self.assertIsNotNone(rec)
+
+        real_dump = J.json.dump
+
+        def torn_dump(obj, fh):
+            fh.write('{"name": "atomic", "state": "run')
+            raise OSError("no space left on device")
+
+        J.json.dump = torn_dump
+        try:
+            with self.assertRaises(OSError):
+                self.store._write(rec)
+        finally:
+            J.json.dump = real_dump
+
+        recovered = self.store._read("atomic")
+        self.assertIsNotNone(recovered, "a torn write destroyed the record")
+        self.assertEqual(recovered["name"], "atomic")
+        self.assertIsNotNone(self.store.get("atomic"))
+        self.assertNotIn("no jobs yet", self.store.manifest())
+        # And the debris must not be mistaken for a job of its own.
+        self.assertEqual([f for f in os.listdir(self.dir) if f.endswith(".json")], ["atomic.json"])
+        self.store.kill("atomic")
 
 
 class TestRealDeadline(RealBase):

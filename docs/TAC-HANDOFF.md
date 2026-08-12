@@ -152,6 +152,10 @@ Pipeline per run: container → `init.sh` (seeds services) → arm → upstream
 - **`pm-schedule-meeting-2` is questionable**: the two required NPCs never
   replied to *any* arm. Codemode and Claude Code both waited and reported "no
   meeting"; vanilla scheduled Friday unilaterally and took 3/3. Rewards acting
+  <!-- SUPERSEDED 2026-08-12: not "questionable" — UNANSWERABLE. The NPCs could
+  not reply at all (sotopia hard-codes temperature; sonnet-5 400s on it). Fixed;
+  with colleagues actually conversing the task solves 5/5 in 7 turns. See the
+  RETRACTION section below and docs/TAC-VALIDATION-RESULTS.md (authoritative). -->
   without information.
 - **MongoDB swapped** to official `mongo:5.0` (arm64) — Bitnami is amd64-only and
   MongoDB 5.0 needs AVX, which Rosetta lacks. Fixture differs from upstream.
@@ -348,6 +352,13 @@ what the agent sees on wake (must be a delta, or we rebuild the 88% redundancy).
 
 ## Jobs-runtime validation on TAC — five runs, and what they actually established
 
+> **SUPERSEDED — read `docs/TAC-VALIDATION-RESULTS.md` for the authoritative TAC
+> result.** This section and its 302-sleep / 48-thread baseline record what was
+> believed before the mute-NPC bug was found. Those counts are an artefact of the
+> agent polling colleagues who could never answer; on the fixed stack the task has
+> no waiting at all. Retained as the trail of what was believed when. See RETRACTION
+> below.
+
 Run with `HARNESS_JOBS_RUNTIME=1` on `pm-schedule-meeting-2` (the worst recorded
 offender: 302 raw sleep mentions, 48 thread mentions).
 
@@ -531,3 +542,33 @@ colleagues cannot reply. NPC model recorded as a deviation applied symmetrically
 both arms (before, they used nothing).
 
 The A1–A3 sweep on the fixed stack supersedes tacval9 entirely.
+
+---
+
+## TAC TRACK COMPLETE (2026-08-12) — authoritative summary
+
+Full result in `docs/TAC-VALIDATION-RESULTS.md`. 13 runs, 7 tasks, 0 INVALID (every
+ON run: exec/persist/jobs true, npcLlmOk true, no "kernel did not respond", no
+timeout). Bottom line: **the runtime is safe to leave on, and TAC is the wrong
+instrument to show its value.**
+
+- **A4 (safety/neutrality), promoted to primary, passes on every axis:** 0 guard
+  fires across 79 cells, 0 unnecessary `jobs` adoption, no turn/cost penalty (ON
+  nominally cheaper, sign 1/3 — read as "no penalty", not a saving).
+- **Score is neutral under the honest rule.** Restricted to programmatic checkpoints
+  (LLM-judged dropped uniformly, decided before looking at the arm split), every pair
+  ties: Δ = 0.000. The apparent −0.133 was one coin-flip LLM checkpoint.
+- **The wait-heavy premise was an artefact.** Fix the NPCs and the "wait-heavy" tasks
+  have no waiting — colleagues reply within a cell. TAC-when-healthy contains no
+  genuine elapsed-time waiting, so the runtime has nothing to attach to. The
+  affirmative case lives in `docs/DURABILITY-RESULTS.md` and terminal-bench, not here.
+- **Three more benchmark defects, each checked before believing, none about the
+  runtime:** `admin-read-survey-and-summarise` has an undefined reference under a
+  third-place tie (answering precisely fails, dumping the full tally passes);
+  `hr-check-attendance-one-day` shows `bonus_for_completing_final` inflation
+  (final_score 3/3 vs checkpoints summing 2/3 — the rule-based figure strips it);
+  plus the already-recorded `admin-arrange-meeting-rooms` mis-key.
+
+New/changed for this track: `bench/tac/npc-llm-preflight.py`,
+`bench/tac/jobs-ab-sweep.mjs`, `bench/tac/jobs-ab-report.mjs`,
+`bench/tac/run-task.mjs` (NPC_ENV_LLM + kernel pre-flight + integrity gate).

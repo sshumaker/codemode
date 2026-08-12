@@ -19,11 +19,12 @@
  * Generated rather than copied, so none of them can drift from the implementation.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, createWriteStream } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, createWriteStream } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { TASKS } from "./tasks.mjs";
+import { pollShape } from "./poll-shape.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUNTIME = join(ROOT, "runtime");
@@ -49,7 +50,7 @@ if (!task) {
 }
 
 const model = flag("model", "anthropic/claude-opus-5");
-const timeoutSec = Number(flag("timeout", "420"));
+const timeoutSec = Number(flag("timeout", String(task.timeout ?? 420)));
 const runId = flag("run-id", `${taskName}__${Date.now()}`);
 const runDir = join(ROOT, ".run/jobs", runId);
 mkdirSync(runDir, { recursive: true });
@@ -194,11 +195,15 @@ writeFileSync(
 );
 
 const started = Date.now();
+const preludeMarker = join(runDir, "prelude-status.txt");
 const streamPath = join(runDir, "stream.jsonl");
 const streamFile = createWriteStream(streamPath);
 const summary = {
 	turns: 0, cells: 0, cost: 0, toolCalls: 0,
 	errors: [], waits: [], cellSources: [], completedCells: [], refusedCells: [],
+	// Durability instrumentation. Cell indices, not booleans, so "when" is answerable
+	// afterwards from result.json alone.
+	restartNotices: [], preludeAnnouncements: [], deadKernelErrors: 0, cellOutcomes: [],
 };
 let pendingCell = null;
 let buffer = "";
@@ -226,10 +231,26 @@ const child = spawn(
 			...(sandboxed ? { HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettings, HARNESS_KERNEL_SANDBOX_BIN: srtBin } : {}),
 			// Deliberately low so a blocked cell is interrupted quickly and the eval
 			// can observe whether the interrupt teaches `submit`.
-			HARNESS_CELL_TIMEOUT_MS: String(Number(flag("cell-timeout", "60")) * 1000),
+			HARNESS_CELL_TIMEOUT_MS: String(Number(flag("cell-timeout", String(task.cellTimeout ?? 60))) * 1000),
 			// The floor exists to stop a wait costing a turn to save nothing; in an
 			// eval it just makes every run slow, so allow shorter waits.
 			HARNESS_MIN_WAIT_SECONDS: flag("min-wait", "5"),
+			// A kernel that dies mid-run leaves upstream's provisioner memoising a
+			// shut-down manager, so every later cell throws "Kernel has been shut down"
+			// forever. `--no-kernel-autorestart` preserves that wedge so it stays
+			// reproducible; the default rebuilds the kernel and tells the model.
+			// See scripts/neutralize-prime.mjs.
+			...(argv.includes("--no-kernel-autorestart") ? {} : { HARNESS_KERNEL_AUTORESTART: "1" }),
+			// Per-run rather than the machine-global /tmp default: it is appended to, so
+			// a shared file mixes kernels from every run on the box. It is also the only
+			// thing that identifies the kernel process (see kernelPidsFromPrelude) and
+			// the only evidence that a restarted kernel re-ran the runtime at all.
+			HARNESS_PRELUDE_MARKER: preludeMarker,
+			// Task-specific runtime settings, last so a task can override the defaults
+			// above. `long-horizon` uses it to cap a single wait below the length of the
+			// work, which is the only thing that actually forces a poll loop — see the
+			// note on that task.
+			...(task.env ?? {}),
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 	},
@@ -239,6 +260,121 @@ const killer = setTimeout(() => {
 	summary.timedOut = true;
 	child.kill("SIGKILL");
 }, timeoutSec * 1000);
+
+// --- killing the kernel out from under the agent --------------------------------
+//
+// `%reset -f` clears the namespace; it does not test durability, because the process
+// that owns the jobs' parentage, the guards and the prelude is still alive. The claim
+// under test is that work outlives the *kernel*, so the kernel has to actually die —
+// unannounced, mid-task, exactly as an OOM or a container restart would.
+//
+// Fired on the appearance of a job record rather than on a timer: a wall-clock trigger
+// races the agent's first few turns, and a kill that lands before anything was
+// submitted tests nothing. Everything it observes is written to kernel-kill.json —
+// pids, argv and the moment — because a verdict recorded without its evidence cannot
+// be re-derived once the run directory is the only thing left.
+
+/** `ps` as records. */
+function processTable() {
+	const r = spawnSync("ps", ["-eo", "pid=,ppid=,command="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+	return (r.stdout ?? "")
+		.split("\n")
+		.map((l) => {
+			const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l);
+			return m ? { pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] } : null;
+		})
+		.filter(Boolean);
+}
+
+/**
+ * The kernel's pid, from the kernel itself.
+ *
+ * Walking down from our spawned child finds nothing: prime's print mode hands the
+ * work to a session worker that retitles its argv to `prime-agent` and is reparented,
+ * so the kernel is not our descendant at all. Matching on the command line is no
+ * better — a bare kernel's argv names only a connection file under TMPDIR, and this
+ * machine already had two orphaned `ipykernel_launcher` processes from earlier runs
+ * that such a match would happily have killed.
+ *
+ * The prelude runs *inside* the kernel and already writes `STARTED pid=…` to the
+ * marker file, so the kernel identifies itself. It appends, so the last line is the
+ * current kernel — which is also how a restart is confirmed: a second STARTED line
+ * with a different pid is the fresh kernel running the runtime again.
+ */
+function kernelPidsFromPrelude(markerPath) {
+	let text = "";
+	try {
+		text = readFileSync(markerPath, "utf8");
+	} catch {
+		return [];
+	}
+	return [...text.matchAll(/^STARTED\tpid=(\d+)/gm)].map((m) => Number(m[1]));
+}
+
+const killKernel = argv.includes("--kill-kernel") || task.killKernel;
+const killDelayMs = Number(flag("kill-kernel-delay", "3000"));
+let kernelWatchdog;
+if (killKernel) {
+	// Armed by the job record, then delayed — the delay runs from ARMING, not from the
+	// start of the run. Measured from the start it would already have elapsed by the
+	// time the agent submitted, and the kill would land inside the submitting cell,
+	// where a failed cell is indistinguishable from a job that was never created. Three
+	// seconds after the record appears puts it in the host-side wait, which is where a
+	// kernel realistically dies: nothing of ours is running.
+	let armedAt = 0;
+	kernelWatchdog = setInterval(() => {
+		if (!armedAt) {
+			try {
+				if (!readdirSync(jobDir).some((f) => f.endsWith(".json"))) return;
+			} catch {
+				return;
+			}
+			armedAt = Date.now();
+		}
+		if (Date.now() - armedAt < killDelayMs) return;
+		const pids = kernelPidsFromPrelude(preludeMarker);
+		if (!pids.length) return; // prelude has not recorded a kernel yet
+		clearInterval(kernelWatchdog);
+		kernelWatchdog = undefined;
+		const table = processTable();
+		const byPid = new Map(table.map((p) => [p.pid, p]));
+		const target = byPid.get(pids[pids.length - 1]);
+		const record = {
+			atMs: Date.now() - started,
+			atCell: summary.cells,
+			atTurn: summary.turns,
+			preludePids: pids,
+			// The process table as it looked, not just the verdict. When a kill finds
+			// nothing the only way to find out why is to see what was actually there.
+			candidates: table
+				.filter((p) => /ipykernel_launcher|srt --settings/.test(p.cmd))
+				.map((p) => ({ pid: p.pid, ppid: p.ppid, cmd: p.cmd.slice(0, 160) })),
+			killed: [],
+		};
+		// Pid reuse is the one way this could hit an unrelated process, so confirm the
+		// pid still belongs to a kernel before signalling it.
+		const doomed = [];
+		if (target && /ipykernel_launcher/.test(target.cmd)) {
+			doomed.push(target);
+			// The srt wrapper is prime's direct child and the process whose `exit` event
+			// it listens for. Killing only the python inside it leaves that event to
+			// arrive via srt's own teardown, which is a race; kill both.
+			const parent = byPid.get(target.ppid);
+			if (parent && /srt --settings/.test(parent.cmd)) doomed.push(parent);
+		}
+		for (const k of doomed) {
+			try {
+				process.kill(k.pid, "SIGKILL");
+				record.killed.push({ pid: k.pid, cmd: k.cmd.slice(0, 160) });
+			} catch (e) {
+				record.killed.push({ pid: k.pid, error: String(e) });
+			}
+		}
+		summary.kernelKill = { atMs: record.atMs, atCell: record.atCell, atTurn: record.atTurn, killed: record.killed };
+		writeFileSync(join(runDir, "kernel-kill.json"), `${JSON.stringify(record, null, 2)}\n`);
+		console.log(`[kill-kernel] SIGKILLed ${record.killed.length} kernel process(es) after cell ${record.atCell}`);
+	}, 500);
+}
 
 child.stderr.on("data", (d) => (stderr = (stderr + d).slice(-4000)));
 child.stdout.on("data", (chunk) => {
@@ -277,6 +413,13 @@ child.stdout.on("data", (chunk) => {
 			// vacuously true. The detectorBroken assertion below exists because of it.
 			if (pendingCell !== null) {
 				(failed ? summary.refusedCells : summary.completedCells).push(pendingCell);
+				// Also keep the outcome positionally, aligned with cellSources.
+				//
+				// Without it "cells after the kill" counted eleven cells that every one
+				// of them threw "Kernel has been shut down", and the run read as the
+				// agent recovering when it had been handed a corpse eleven times. A
+				// count of attempts is not a count of work done.
+				summary.cellOutcomes[summary.cells - 1] = failed ? "failed" : "ok";
 				pendingCell = null;
 			}
 			// The host consumes the sentinel and rewrites it, so match what the agent
@@ -285,6 +428,17 @@ child.stdout.on("data", (chunk) => {
 			for (const m of text.matchAll(/\[waited (\d+)s outside the kernel\]/g)) {
 				summary.waits.push(Number(m[1]));
 			}
+			// Durability: which of the two channels actually reached the model.
+			//
+			// The restart notice is host-side text prepended to a cell result, so it
+			// certainly arrives. The prelude's announcement is printed during kernel
+			// *boot*, before any cell runs — whether that ever reaches the agent is an
+			// open question this eval exists to answer, so record it rather than
+			// assume it. A durability claim resting on an unread announcement is the
+			// same shape as a documented check that is never executed.
+			if (/<ipython_kernel_restarted>/.test(text)) summary.restartNotices.push(summary.cells);
+			if (/job\(s\) from a previous kernel/.test(text)) summary.preludeAnnouncements.push(summary.cells);
+			if (/Kernel has been shut down/.test(text)) summary.deadKernelErrors++;
 		} else if (e.type === "message_end" && e.message?.role === "assistant") {
 			summary.turns++;
 			const id = e.message.responseId;
@@ -315,6 +469,7 @@ function blockingShellSleep(sources) {
 
 child.on("close", (code) => {
 	clearTimeout(killer);
+	if (kernelWatchdog) clearInterval(kernelWatchdog);
 	summary.sandboxed = sandboxed;
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;
@@ -358,6 +513,39 @@ child.on("close", (code) => {
 			? summary.refusedCells.length
 			: summary.refusedCells.filter((c) => summary.cellSources.indexOf(c) < firstJobsCell).length;
 
+	// --- durability instrumentation ------------------------------------------
+	summary.poll = pollShape(summary.cellSources);
+	// One STARTED line per kernel boot. Two pids means a second kernel really came up
+	// AND re-ran the prelude — i.e. the replacement kernel has `jobs`, which is not
+	// something to take on trust after the first version of the prelude died silently
+	// on the startup-file path and left seven runs with no runtime at all.
+	summary.preludeStartPids = kernelPidsFromPrelude(preludeMarker);
+
+	// Fan-out vs. serialize. Submitting job 2 only after job 1 has finished is
+	// sequential work wearing a concurrency API, and it looks identical in the
+	// transcript — same calls, same final answer, three times the wall clock.
+	const firstWait = summary.cellSources.findIndex((c) => /jobs\.wait\(/.test(c));
+	summary.submitsBeforeFirstWait =
+		firstWait < 0
+			? (all.match(/jobs\.submit\(/g) ?? []).length
+			: (summary.cellSources
+					.slice(0, firstWait + 1)
+					.join("\n")
+					.match(/jobs\.submit\(/g) ?? []).length;
+
+	// Cells the agent got to run after its kernel was killed. Zero means the harness
+	// never gave it another kernel, which is a harness failure and must not be read as
+	// the agent failing to recover.
+	if (summary.kernelKill) {
+		const after = summary.cellSources
+			.map((src, i) => ({ src, ok: summary.cellOutcomes[i] === "ok" }))
+			.slice(summary.kernelKill.atCell);
+		summary.cellsAfterKernelKill = after.filter((c) => c.ok).length;
+		summary.failedCellsAfterKernelKill = after.length - summary.cellsAfterKernelKill;
+		summary.recoveredAfterKill = after.some((c) => c.ok && /jobs\.(get|list|manifest)\(/.test(c.src));
+		summary.resubmittedAfterKill = after.some((c) => c.ok && /jobs\.submit\(/.test(c.src));
+	}
+
 	// Grade against what the task required, so a run is pass/fail rather than vibes.
 	// The detector must have seen the cells it is judging. Without this, losing the
 	// pairing reads as "clean run" rather than as a broken measurement.
@@ -378,6 +566,16 @@ child.on("close", (code) => {
 		`turns ${summary.turns}  cells ${summary.cells}  waits [${summary.waits.join(",")}]  ` +
 			`errors ${summary.errors.length}  $${summary.cost.toFixed(3)}  ${(summary.wallMs / 1000).toFixed(0)}s` +
 			`${summary.timedOut ? "  [TIMED OUT]" : ""}`,
+	);
+	console.log(
+		`poll: ${summary.poll.waitCells} wait cells, ${summary.poll.bareWaitCells} without a check, ` +
+			`${summary.poll.trivialPollCells} trivial probes  |  submits before first wait: ${summary.submitsBeforeFirstWait}` +
+			(summary.kernelKill
+				? `\nkernel killed at cell ${summary.kernelKill.atCell} (${summary.kernelKill.killed.length} pid(s)); ` +
+					`cells after: ${summary.cellsAfterKernelKill} ok / ${summary.failedCellsAfterKernelKill} failed, ` +
+					`dead-kernel errors: ${summary.deadKernelErrors}, ` +
+					`restart notices: ${summary.restartNotices.length}, prelude announcements: ${summary.preludeAnnouncements.length}`
+				: ""),
 	);
 	console.log(
 		`used: submit ${mark(summary.used.submit)}  wait ${mark(summary.used.wait)}  ` +

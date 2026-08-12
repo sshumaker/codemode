@@ -31,10 +31,18 @@
  *   `82e2fac_1 / 29caf6f_1 / d0b1f43_1` with their ground-truth `required_apis` in
  *   the prompt, so those generators are excluded outright.
  *
- * Ground-truth call counts exist only for train+dev (the licence withholds test
- * solutions), which is why the sample is drawn from there. That is fine here: the
- * question is about cost, not about score, and train's score ceiling is irrelevant
- * to it. Any *score* claim still needs test_normal.
+ * Ground-truth *solutions* exist only for train+dev (the licence withholds test
+ * solutions), so the executed call count can only be measured there. The held-out
+ * splits are still stratifiable: every task's `ground_truth/metadata.json` ships
+ * `num_api_calls` even in `minimal` mode, and on all 147 train+dev tasks that field
+ * equals the executed count **exactly** (147/147, r=1.0000 — checked against the
+ * `appworld-gt-calls.json` cache). So `--split test_challenge` reads metadata and
+ * gets the same quantity without running anything.
+ *
+ *   node bench/appworld/stratify.mjs --split test_challenge --per-stratum 5
+ *
+ * The one thing metadata cannot supply is `gtPassed`, the train+dev positive
+ * control. On the test splits that control comes from `challenge-p0.py` instead.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -54,6 +62,7 @@ const flag = (n, d) => {
 };
 const perStratum = Number(flag("per-stratum", 10));
 const seed = Number(flag("seed", 0));
+const split = flag("split", "train+dev");
 const lowMax = Number(flag("low-max", 20));
 const highMin = Number(flag("high-min", 60));
 
@@ -124,7 +133,34 @@ function mulberry32(a) {
 	};
 }
 
-const rows = groundTruthCallCounts().filter((r) => !r.error && r.gtPassed !== false);
+/**
+ * Call counts for a held-out split, read from each task's shipped metadata.
+ *
+ * `num_api_calls` is written by the task generator from the ground-truth run, and
+ * it survives into `minimal` mode where the solution itself does not. Validated
+ * against the executed counts on train+dev: exact on 147/147.
+ */
+function metadataCallCounts(splitName) {
+	const ids = execFileSync(
+		PYTHON,
+		["-c", `import warnings;warnings.filterwarnings('ignore')\nfrom appworld import load_task_ids\nprint(','.join(load_task_ids('${splitName}')))`],
+		{ cwd: APPWORLD, encoding: "utf8" },
+	)
+		.trim()
+		.split(",")
+		.filter(Boolean);
+	return ids.map((task) => {
+		const meta = JSON.parse(readFileSync(join(APPWORLD, "data/tasks", task, "ground_truth/metadata.json"), "utf8"));
+		// nTests is not in metadata; the grader reports it per run. Left undefined so
+		// the balance line below prints NaN rather than a fabricated number.
+		return { task, nCalls: meta.num_api_calls, difficulty: meta.difficulty, source: "metadata" };
+	});
+}
+
+const rows =
+	split === "train+dev"
+		? groundTruthCallCounts().filter((r) => !r.error && r.gtPassed !== false)
+		: metadataCallCounts(split);
 const generator = (task) => task.split("_")[0];
 const eligible = rows.filter((r) => !PREDICTOR_DEMO_GENERATORS.has(generator(r.task)));
 
@@ -159,6 +195,8 @@ const high = draw(
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const summary = {
 	seed,
+	split,
+	callCountSource: rows[0]?.source ?? "executed",
 	perStratum,
 	thresholds: { lowMax, highMin },
 	excludedGenerators: [...PREDICTOR_DEMO_GENERATORS],
@@ -171,7 +209,11 @@ if (argv.includes("--json")) {
 } else {
 	console.error(`low  stratum (<=${lowMax} gt calls, mean ${summary.low.meanCalls.toFixed(1)}): ${low.map((r) => `${r.task}(${r.nCalls})`).join(" ")}`);
 	console.error(`high stratum (>=${highMin} gt calls, mean ${summary.high.meanCalls.toFixed(1)}): ${high.map((r) => `${r.task}(${r.nCalls})`).join(" ")}`);
-	console.error(`\ngrader tests/task: low ${mean(low.map((r) => r.nTests)).toFixed(1)}  high ${mean(high.map((r) => r.nTests)).toFixed(1)}  (balanced = the strata differ on call volume, not structural complexity)`);
+	if (rows[0]?.source === "metadata") {
+		console.error(`\ndifficulty/task: low ${mean(low.map((r) => r.difficulty)).toFixed(1)}  high ${mean(high.map((r) => r.difficulty)).toFixed(1)}  (call counts from metadata; nTests is only known after a run)`);
+	} else {
+		console.error(`\ngrader tests/task: low ${mean(low.map((r) => r.nTests)).toFixed(1)}  high ${mean(high.map((r) => r.nTests)).toFixed(1)}  (balanced = the strata differ on call volume, not structural complexity)`);
+	}
 	// stdout is the --tasks argument, so this composes: --tasks "$(stratify.mjs)"
 	console.log([...low, ...high].map((r) => r.task).join(","));
 }
