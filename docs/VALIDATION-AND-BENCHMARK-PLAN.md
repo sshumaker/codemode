@@ -7,6 +7,31 @@ a broken harness producing the same-looking number as a real result.
 
 ---
 
+## STRATEGIC UPDATE (2026-08-12): TAC cannot validate the runtime — the wait was an artefact
+
+Discovered mid-execution: TheAgentCompany's "wait-heavy" tasks were wait-heavy only
+because the NPC colleagues could never reply (sotopia hard-codes temperature; our
+env-LLM 400s on it). The 302 in-cell sleeps / 48 poll threads on pm-schedule-meeting-2
+were the agent grinding against a mute channel. **Fix the colleagues and the task
+solves in 6 clean cells with 0 sleeps, 0 threads, 0 jobs calls** — there is nothing to
+wait for, because a healthy TAC world has no genuine elapsed-time waiting (no builds,
+no training, no real latency; colleagues reply within a cell).
+
+Consequences for the plan:
+
+- **A1–A3 on TAC is demoted from "does the runtime help" to a SAFETY/NEUTRALITY check**
+  (A4 promoted to primary): on realistic tasks with no waiting, does the runtime do
+  harm — unnecessary `jobs` adoption, false guard fires, cost regression? ~6–8 runs,
+  not a 24-run sweep. A clean "neutral, safe to have on" is the honest deliverable.
+- **The runtime's real validation moves entirely off TAC** to (1) the durability
+  harness (A5 — synthetic, controlled elapsed-time waits, kernel death, concurrency)
+  and (2) a benchmark with *inherent* waiting (terminal-bench: long commands, real
+  subprocesses). These are the only instruments that exercise submit/wait/get.
+- This is itself a finding: **TAC is the wrong instrument for the runtime**, proven by
+  measurement, not assumed.
+
+---
+
 ## Plan A — validate the jobs runtime
 
 ### The claims, ranked, and what evidence each needs

@@ -491,3 +491,43 @@ runtime — a working kernel with the runtime is FASTER than the baseline, not s
 
 n=1, score unchanged rather than improved. But it is the first end-to-end valid
 measurement and it is positive on the axis the runtime targets.
+
+---
+
+## RETRACTION: tacval9 (and every prior conversation-task run) measured a mute world
+
+Found by tac-runner during A1 setup, from the live `/tmp/npc_*.log`, not inferred:
+**no NPC colleague has ever been able to reply on this stack.** sotopia hard-codes
+`temperature: float = 0.7` on every generation path; our env-LLM
+`openai/claude-sonnet-5` returns `400 "temperature is deprecated for this model"` on
+Anthropic's OpenAI-compatible endpoint. The NPC receives the agent's DM, builds the
+prompt, calls the LLM, gets 400, and loops `"No message received, waiting..."`
+forever. `ps` shows it alive and the liveness check passes — so nothing reported a
+failure and the *arm* was blamed for a conversation that never happened. Same class
+as `find_spec`: liveness certified the wrong thing.
+
+**What this retracts:**
+
+- **tacval9's 2/5 and its turn/cost numbers are void.** It has no integrity field and
+  no npc-preflight (it predates both the A0 gate and this fix), so it fails the gate
+  retroactively. It was reported up-thread as "the first valid positive result"; it
+  was not. `pm-schedule-meeting-2`'s 302-sleep baseline is partly an artefact of
+  polling a reply that could never arrive.
+- **The 40-task sweep's conversation tasks** measured the same mute world; the parity
+  conclusion on those should be re-read with that in mind.
+
+**What survives:** the behavioral *direction* (runtime → jobs.wait instead of
+time.sleep) does not depend on the colleague replying — the agent's intent to wait is
+identical — so it likely holds. The magnitude and the score do not. The grader is
+unaffected: `evaluate_with_llm` passes no temperature, verified end to end
+(true→True, false→False).
+
+**Fix (owned by tac-runner, in run-task.mjs):** NPCs get their own `NPC_ENV_LLM`
+(default `claude-sonnet-4-5`, which accepts temperature; sonnet-5/opus-4-5/haiku-4-5
+probed — 4-5 family 200, sonnet-5 400); the grader keeps validated sonnet-5 so the
+judge does not drift. `npc-llm-preflight.py` makes sotopia's exact call before the
+agent starts and writes `npc-preflight.json`; `integrity.valid` goes false when
+colleagues cannot reply. NPC model recorded as a deviation applied symmetrically to
+both arms (before, they used nothing).
+
+The A1–A3 sweep on the fixed stack supersedes tacval9 entirely.

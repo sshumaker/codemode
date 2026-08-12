@@ -11,3 +11,4 @@ vendor/appworld/
 .claude/
 __pycache__/
 *.pyc
+vendor/tau-bench/
