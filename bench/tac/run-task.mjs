@@ -352,9 +352,29 @@ async function main() {
 
 	mark("gradeEnd");
 	const score = result ? result.final_score : null;
+
+	// A0 integrity verdict, computed from the run's own evidence rather than inferred.
+	// A run is INVALID — its numbers must not enter any comparison — when the machinery
+	// under it was broken, which is indistinguishable from a weak agent by score alone.
+	const preflight = existsSync(join(runDir, "kernel-preflight.json"))
+		? JSON.parse(readFileSync(join(runDir, "kernel-preflight.json"), "utf8"))
+		: null;
+	const invalidReasons = [];
+	if (process.env.HARNESS_JOBS_RUNTIME === "1" && preflight && !(preflight.exec && preflight.persist && preflight.jobs)) {
+		invalidReasons.push(`kernel pre-flight failed (${JSON.stringify(preflight)})`);
+	}
+	if ((summary.kernelNoResponse ?? 0) > 0) {
+		invalidReasons.push(`${summary.kernelNoResponse} cells got "kernel did not respond"`);
+	}
+	if ((summary.turns ?? 0) === 0 && !summary.timedOut) {
+		invalidReasons.push("agent produced zero turns");
+	}
+	const integrity = { valid: invalidReasons.length === 0, reasons: invalidReasons, preflight };
+	if (!integrity.valid) log(`  !! RUN INVALID: ${invalidReasons.join("; ")} — numbers must not be compared`);
+
 	writeFileSync(
 		join(runDir, "result.json"),
-		`${JSON.stringify({ ...meta, summary, result, score, graded: result !== null, finishedAt: new Date().toISOString() }, null, 2)}\n`,
+		`${JSON.stringify({ ...meta, summary, result, score, graded: result !== null, integrity, finishedAt: new Date().toISOString() }, null, 2)}\n`,
 	);
 	// NPC colleagues answer over RocketChat; when a conversation task fails, their
 	// log is usually the only place that says whether anyone was listening.
@@ -557,6 +577,66 @@ async function stageJobsRuntime() {
 		log(`jobs runtime staged (${verdict})`);
 		if (!verdict.includes("PRELUDE-OK")) {
 			log("WARNING: the prelude did not bind `jobs` — this run has no primitives");
+		}
+
+		// A0 pre-flight: start the REAL kernel the way the agent will, and prove it
+		// executes cells, keeps state across them, and binds `jobs` — before spending
+		// a multi-minute agent run on a wedged kernel.
+		//
+		// This is the check the earlier "verifications" were not. `import jobs` under a
+		// manual sys.path insert and a manual runpy of the startup file both certified
+		// success while the live kernel answered every cell "did not respond" — the
+		// find_spec mistake. This uses jupyter_client to launch ipykernel_launcher with
+		// the same IPYTHONDIR/env, which is the path that was actually broken.
+		const probe = [
+			"import os, queue, json",
+			"from jupyter_client import KernelManager",
+			"km = KernelManager()",
+			"km.kernel_cmd = ['/agent/venv/bin/python','-m','ipykernel_launcher','-f','{connection_file}']",
+			"km.start_kernel(env=dict(os.environ))",
+			"kc = km.client(); kc.start_channels(); kc.wait_for_ready(timeout=30)",
+			"def run(code):",
+			"    mid = kc.execute(code); out = []",
+			"    while True:",
+			"        try: m = kc.get_iopub_msg(timeout=15)",
+			"        except queue.Empty: break",
+			"        c = m['content']",
+			"        if m['msg_type'] == 'stream': out.append(c.get('text',''))",
+			"        elif m['msg_type'] == 'error': out.append('ERR')",
+			"        elif m['msg_type'] == 'status' and c.get('execution_state')=='idle' and m['parent_header'].get('msg_id')==mid: break",
+			"    return ''.join(out)",
+			"a = run('print(6*7)').strip()",
+			"run('x = 41')",
+			"b = run('print(x + 1)').strip()",
+			"j = run('print(type(jobs).__name__)').strip()",
+			"km.shutdown_kernel(now=True)",
+			"print('PROBE ' + json.dumps({'exec': a=='42', 'persist': b=='42', 'jobs': j=='module'}))",
+		].join("\n");
+		try {
+			// Copy the probe in as a file rather than passing it via `-c`: it contains
+			// `{connection_file}`, quotes and newlines that shell-quoting through
+			// docker exec mangles. And parse stdout for the PROBE line rather than
+			// trusting the exit code — jupyter_client emits a harmless __del__
+			// traceback at interpreter shutdown that would otherwise fail the check on
+			// a kernel that is in fact fine.
+			await docker(["exec", container, "bash", "-c",
+				`cat > /tmp/kernel-preflight.py <<'PROBE_EOF'\n${probe}\nPROBE_EOF`]);
+			const { stdout: probeOut } = await docker(["exec",
+				"-e", "IPYTHONDIR=/tmp/harness/ipython",
+				"-e", "HARNESS_RUNTIME_DIR=/tmp/harness",
+				"-e", "HARNESS_JOB_DIR=/tmp/harness/jobs",
+				container, "bash", "-c", "/agent/venv/bin/python /tmp/kernel-preflight.py 2>/dev/null"],
+				{ timeout: 120_000 }).catch((e) => ({ stdout: e.stdout ?? "" }));
+			const line = probeOut.split("\n").find((l) => l.startsWith("PROBE ")) ?? "PROBE {}";
+			const r = JSON.parse(line.slice(6));
+			writeFileSync(join(runDir, "kernel-preflight.json"), JSON.stringify(r, null, 2));
+			log(`kernel pre-flight: exec=${r.exec} persist=${r.persist} jobs=${r.jobs}`);
+			if (!(r.exec && r.persist && r.jobs)) {
+				log("  !! kernel pre-flight FAILED — the live kernel is broken; this run's numbers will be INVALID");
+			}
+		} catch (err) {
+			writeFileSync(join(runDir, "kernel-preflight.json"), JSON.stringify({ error: String(err.message ?? err).slice(0, 200) }));
+			log(`  !! kernel pre-flight could not run (${String(err.message ?? err).slice(0, 100)})`);
 		}
 	} catch (err) {
 		log(`WARNING: jobs runtime not staged (${String(err.message ?? err).slice(0, 120)})`);
@@ -813,8 +893,16 @@ function runAgent() {
 				if (e.type === "tool_execution_start") {
 					summary.toolCalls++;
 					summary.toolNames.push(e.toolName);
-				} else if (e.type === "tool_execution_end" && e.isError) {
-					summary.toolErrors++;
+				} else if (e.type === "tool_execution_end") {
+					if (e.isError) summary.toolErrors++;
+					// A0 integrity: a wedged kernel answers every cell with "Kernel did
+					// not respond to kernel_info_request". Seven TAC runs scored a
+					// plausible 0–2/5 that way. Counting it here is what lets the run
+					// self-flag INVALID instead of reporting the number.
+					const txt = (e.result?.content ?? []).map((c) => c.text ?? "").join("");
+					if (/kernel.*did not respond|Kernel did not respond/i.test(txt)) {
+						summary.kernelNoResponse = (summary.kernelNoResponse ?? 0) + 1;
+					}
 				} else if (e.type === "message_end" && e.message?.role === "assistant") {
 					const m = e.message;
 					const texts = (m.content ?? []).filter((c) => c.type === "text" && c.text);

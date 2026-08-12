@@ -73,6 +73,12 @@ function summarise(runId) {
 	const result = existsSync(join(RUNS, runId, "result.json"))
 		? JSON.parse(readFileSync(join(RUNS, runId, "result.json"), "utf8"))
 		: {};
+	// A0: a run whose machinery was broken is not a data point. Surface it as such
+	// rather than letting a wedged-kernel 0/5 sit in the table looking like a weak
+	// agent — the exact confusion that cost seven runs.
+	if (result.integrity && result.integrity.valid === false) {
+		return { run: runId.length > 44 ? `…${runId.slice(-42)}` : runId, INVALID: result.integrity.reasons.join("; ") };
+	}
 	return {
 		run: runId.length > 44 ? `…${runId.slice(-42)}` : runId,
 		cells: src.length,
