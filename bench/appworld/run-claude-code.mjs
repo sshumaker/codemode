@@ -68,7 +68,7 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFi
 import { createServer as createSocketServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildBase, buildClaudePreamble } from "./prompts.mjs";
+import { BASE_PROMPTS, buildBase, buildClaudePreamble } from "./prompts.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const APPWORLD = join(ROOT, "vendor/appworld");
@@ -105,9 +105,22 @@ const promptName = flag("prompt", "c1");
 const timeoutSec = Number(flag("timeout", 900));
 const maxCost = Number(flag("max-cost", 3.0));
 const allowBash = has("allow-bash");
+// --base-prompt=v1|v2 — the shared base prompt, parsed exactly as run-task.mjs does
+// so the two runners cannot drift on which string "v2" names.
+const basePromptVersion = (() => {
+	const i = argv.findIndex((a) => a === "--base-prompt" || a.startsWith("--base-prompt="));
+	if (i < 0) return "v1";
+	const value = argv[i].includes("=") ? argv[i].split("=").slice(1).join("=") : argv[i + 1];
+	if (!BASE_PROMPTS[value]) {
+		console.error(`unknown --base-prompt: ${value} (have ${Object.keys(BASE_PROMPTS).join("|")})`);
+		process.exit(2);
+	}
+	return value;
+})();
 const runId = flag(
 	"run-id",
-	`${taskId}__${arm}__${residency}__${promptName}${allowBash ? "__bash" : ""}__${model.replace(/[^a-z0-9]/gi, "-")}`,
+	`${taskId}__${arm}__${residency}__${promptName}${allowBash ? "__bash" : ""}` +
+		`${basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`}__${model.replace(/[^a-z0-9]/gi, "-")}`,
 );
 const runDir = join(ROOT, ".run/appworld", runId);
 
@@ -398,7 +411,7 @@ async function main() {
 	writeFileSync(mcpConfigPath, `${JSON.stringify(mcpConfig, null, 2)}\n`);
 
 	// --- prompts ---
-	const basePrompt = buildBase({ supervisor: supervisorName, apps: appsBlock });
+	const basePrompt = buildBase({ supervisor: supervisorName, apps: appsBlock, version: basePromptVersion });
 	// 469 tools / 11 apps, the same catalogue the other arms count. Read off the MCP
 	// server's own tool list below and asserted, rather than asserted here.
 	const toolCount = 469;

@@ -425,6 +425,26 @@ class DocsFirst(McpError):
 # the error channel is measured behaviour, and a gate that could not be cleared
 # would be a deadlock rather than a hint.
 _DOCS_DELIVERED: set = set()
+
+# Optional narrowing: gate only the APIs named here (comma-separated
+# "<server>.<tool>"), instead of every API in the tree.
+#
+# Measured reason for existing: the blanket gate taxes all 469 APIs to fix a
+# contract problem on one, and it lost to a plain re-run on hard tasks
+# (43.5% vs a 37.0% noise floor, z=0.74, at 2.1x the cost). The failures it
+# was built for concentrate on APIs whose CONTRACT is subtle rather than whose
+# NAME is unfamiliar -- supervisor.complete_task, whose "pass answer only if
+# the task asks a question" rule is in the docstring the L0 arm never opens.
+# Narrowing costs at most one extra turn per task instead of one per API.
+_GATE_ONLY = {
+    item.strip()
+    for item in os.environ.get("HARNESS_DOCS_GATE_ONLY", "").split(",")
+    if item.strip()
+}
+
+
+def _gated(server: str, tool: str) -> bool:
+    return not _GATE_ONLY or f"{server}.{tool}" in _GATE_ONLY
 `;
 
 	const redirect = `${shared}
@@ -432,7 +452,7 @@ _DOCS_DELIVERED: set = set()
 def _docs_first(server: str, tool: str, path: str) -> None:
     """Point at the app's documentation once, before an API's first real call."""
     key = (server, tool)
-    if key in _DOCS_DELIVERED:
+    if key in _DOCS_DELIVERED or not _gated(server, tool):
         return
     _DOCS_DELIVERED.add(key)
     name = path or f"{server}.{tool}"
@@ -480,7 +500,7 @@ def _neighbours(pkg: str, tool: str) -> list[str]:
 def _docs_first(server: str, tool: str, doc: str, path: str) -> None:
     """Deliver an API's own documentation once, before its first real call."""
     key = (server, tool)
-    if key in _DOCS_DELIVERED:
+    if key in _DOCS_DELIVERED or not _gated(server, tool):
         return
     _DOCS_DELIVERED.add(key)
     name = path or f"{server}.{tool}"

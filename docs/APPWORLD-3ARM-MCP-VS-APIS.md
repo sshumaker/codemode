@@ -224,3 +224,34 @@ threw a TDZ `ReferenceError` immediately after printing a correct table.
   signal is ~$0.05/task against ~27% noise, diluted by a large arm-invariant
   user-simulator cost. It structurally cannot discriminate the arms. Not worth the
   spend for this thesis.
+
+## 8. Prompt parity, measured (not assumed)
+
+All three arms receive the **byte-identical** shared base block — verified by
+`basePromptDigest` matching across codemode/vanilla/claude-code on the same task,
+and pinned by `bench/test/appworld-fairness.test.mjs` ("the runner passes
+--system-prompt exactly once, from buildBase") for both runners.
+
+Claude Code is invoked with `--system-prompt <basePrompt>`, which **replaces** its
+built-in product prompt, plus `--bare` (no CLAUDE.md discovery, no hooks, no
+auto-memory). So cc does not get its product prompt stacked on top of ours.
+
+**How much does cc still inject?** Measured directly with two probes rather than
+inferred from the ctx0 gap:
+
+| component | tokens | probe |
+|---|---|---|
+| cc's own scaffolding | **138** | empty system prompt, no MCP, no tools |
+| `Read`+`Edit` tool schemas | 857 | (probe with tools) 995 − 138 |
+| `mcp__appworld__` prefix × 469 tools | ~3,455 | remainder |
+| **total** | **4,450** | = cc ctx0 105,570 − vanilla 101,120 |
+
+Two conclusions:
+1. **cc injects 138 tokens of its own.** There is no hidden product prompt, so its
+   grounding/verification propensity cannot be attributed to unseen instructions.
+   (An earlier draft of the morning report guessed "~2k of residual scaffolding".
+   Wrong by ~15x — measured, not inferred, is the rule.)
+2. **~78% of cc's context premium is our own MCP naming**, not its harness. The
+   `mcp__appworld__<app>__<api>` prefix costs ~7.4 tokens x 469 tools on every
+   turn. That is an artifact of the MCP surface, worth separating from arm
+   behaviour when comparing cost.

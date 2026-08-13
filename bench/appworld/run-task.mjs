@@ -37,7 +37,7 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFi
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
-import { buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
+import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
@@ -141,11 +141,32 @@ function parseDocsGate() {
 }
 const docsGate = parseDocsGate();
 const navTools = argv.includes("--nav-tools");
+/**
+ * --base-prompt=v1|v2 — which shared base prompt every arm receives.
+ *
+ * Arm-neutral by construction: this selects the string all three arms are given, so
+ * a v2 run is only interpretable if every arm on the task is on v2. It lands in the
+ * runId for the same reason the codemode variants do — a v2 run that overwrote the
+ * v1 baseline it is being compared against would destroy the comparison.
+ */
+const basePromptVersion = (() => {
+	const i = argv.findIndex((a) => a === "--base-prompt" || a.startsWith("--base-prompt="));
+	if (i < 0) return "v1";
+	const value = argv[i].includes("=") ? argv[i].split("=").slice(1).join("=") : argv[i + 1];
+	if (!BASE_PROMPTS[value]) {
+		console.error(`unknown --base-prompt: ${value} (have ${Object.keys(BASE_PROMPTS).join("|")})`);
+		process.exit(2);
+	}
+	return value;
+})();
 if ((docsGate !== "off" || navTools) && arm !== "codemode") {
 	console.error(`--docs-gate/--nav-tools apply to the codemode arm only, got arm=${arm}`);
 	process.exit(2);
 }
-const variantSuffix = `${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}`;
+const variantSuffix =
+	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}` +
+	// v1 contributes nothing, so every already-reported baseline keeps its runId.
+	`${basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`}`;
 const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}${variantSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
 const runDir = join(ROOT, ".run/appworld", runId);
 
@@ -313,7 +334,7 @@ const appsBlock = Object.entries(facts.appDescriptions)
 
 // One base prompt, byte-identical across arms. Digested into meta.json so a
 // divergence between two runs is detectable rather than something to be trusted.
-const basePrompt = buildBase({ supervisor: supervisorName, apps: appsBlock });
+const basePrompt = buildBase({ supervisor: supervisorName, apps: appsBlock, version: basePromptVersion });
 
 function preambleFor() {
 	const ctx = { toolCount: toolDefs.length, serverCount: catalogue.length };
@@ -389,7 +410,7 @@ writeFileSync(
 			runId,
 			arm,
 			residency,
-			variants: { docsGate, navTools },
+			variants: { docsGate, navTools, basePromptVersion },
 			// The two halves, separately, so "was the base identical?" is a diff and
 			// not an argument.
 			basePrompt,
@@ -430,7 +451,7 @@ const meta = {
 	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
 	// Which opt-in codemode variants were on. A run compared against another must
 	// be able to say which condition it was in without re-reading the api/ tree.
-	variants: { docsGate, navTools },
+	variants: { docsGate, navTools, basePromptVersion },
 	basePromptDigest: digest(basePrompt),
 	preambleChars: preamble.length,
 	toolCount: toolList.length,
@@ -505,6 +526,11 @@ async function main() {
 			// and an env var that failed to propagate would silently produce a
 			// gate-off run wearing a gate-on label.
 			...(docsGate === "off" ? {} : { HARNESS_DOCS_GATE: docsGate }),
+			// Optional narrowing, passed straight through from the environment so a
+			// targeted gate needs no new flag: HARNESS_DOCS_GATE_ONLY=supervisor.complete_task
+			...(process.env.HARNESS_DOCS_GATE_ONLY
+				? { HARNESS_DOCS_GATE_ONLY: process.env.HARNESS_DOCS_GATE_ONLY }
+				: {}),
 			...(predicted ? { HARNESS_TOOL_SUBSET: predicted.names.join(",") } : {}),
 			// AppWorld is entirely local, so there is no legitimate egress. A dead
 			// proxy for everything except the world and the model API is what stops an

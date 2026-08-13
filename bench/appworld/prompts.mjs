@@ -92,8 +92,139 @@ export const BASE_INSTRUCTIONS = [
 	"you have not retrieved.",
 ].join("\n");
 
-export function buildBase({ supervisor, apps }) {
-	return BASE_INSTRUCTIONS.replace("{{supervisor}}", supervisor).replace("{{apps}}", apps);
+/**
+ * v2 — the same protocol, re-laid-out around the three rules that decide the outcome.
+ *
+ * Motivation, measured rather than supposed (docs/CC-WINS-TRIAGE.md, and the ADDENDUM
+ * in docs/MORNING-REPORT-2026-08-13.md): the rules that decide pass/fail are already
+ * in v1 and are ignored anyway.
+ *
+ *   - *"Get the current date and time from the `phone` app, never from your own
+ *     clock"* is obeyed on **17/86** tasks by codemode, 20/86 by vanilla, 28/86 by
+ *     claude-code. The failures use the real wall-clock year against a world whose
+ *     date is 2023-05-18, and sweep 83 threads where 17 were wanted.
+ *   - *"If the task asks a question, pass the answer"* requires a judgement the model
+ *     keeps getting wrong on instructions whose surface form is interrogative.
+ *   - Pagination is called the single most common way to fail, and sits last in a list
+ *     of app trivia.
+ *   - *"Ground every claim in something an API actually returned"* is an unmarked
+ *     orphan below the last section.
+ *
+ * The hypothesis under test is that v1 is **flat**: every rule is an equal-weight
+ * bullet, so the three that decide the outcome are indistinguishable from "file
+ * system means the `file_system` app". v2 changes only the *shape* — hierarchy, a
+ * pre-completion checklist, and one worked example of the answer/no-answer call. It
+ * adds no task knowledge and encodes nothing about how the reference solutions
+ * behave; that would be teaching to the test rather than testing the prompt.
+ *
+ * This project has repeatedly measured that error-channel corrections work where
+ * prompt advisories do not (CLAUDE.md, "put the correction in the error, not in the
+ * prompt"), so a rewrite is a real experiment with a real chance of a null. It is
+ * selected by `--base-prompt=v2` and is **off by default**.
+ *
+ * One honest deviation from "same semantic content": rule 1 states outright that the
+ * agent's own sense of today is not this world's date. v1 only implies it, by
+ * forbidding the clock. Nothing else here is new information.
+ *
+ * Byte-identity across arms is the fairness invariant, asserted in
+ * bench/test/appworld-fairness.test.mjs for v2 as well as v1.
+ */
+export const BASE_INSTRUCTIONS_V2 = [
+	"You are an AI assistant completing a day-to-day task for your supervisor,",
+	"fully autonomously, by interacting with their personal apps.",
+	"",
+	"Your supervisor is {{supervisor}}.",
+	"",
+	"Apps you have access to:",
+	"{{apps}}",
+	"",
+	"## IMPORTANT — three rules decide whether you pass or fail",
+	"",
+	"**1. NEVER use your own clock.** Your sense of today's date is not this world's",
+	"date. Before you reason about any period — \"this year\", \"the last 2 days\",",
+	"\"recently\" — get the current date and time from the `phone` app. A date you",
+	"assumed instead of retrieved silently selects the wrong records, and every count",
+	"and action downstream of it is wrong.",
+	"",
+	"**2. NEVER answer from the first page.** Collection APIs are paginated: they take",
+	"`page_index` (from 0) and `page_limit` (usually capped at 20) and return one page.",
+	"Loop until a page comes back short or empty. A library of 92 songs looks like 5",
+	"from page 0. This is the single most common way to fail one of these tasks.",
+	"",
+	"**3. NEVER state a fact you did not retrieve.** Every claim, count, and value you",
+	"report or act on must come from a response an API actually returned. Do not infer",
+	"it, estimate it, or carry it forward from your own earlier reasoning.",
+	"",
+	"## General",
+	"",
+	"- Act entirely on your own. Make every decision yourself; never ask for",
+	"  confirmation or clarification, and never hand back instructions to follow.",
+	"- You have complete permission to operate across all of these accounts.",
+	"- Never invent or guess a value. If you need a song's id, look it up; do not",
+	"  assume it is 123. Never leave a placeholder like \"your_username\".",
+	"- Where the task omits a detail, choose any valid value. If it does not say",
+	"  which payment card, any of the supervisor's cards will do.",
+	"- Avoid collateral damage. Do only what was asked. Buying something does not",
+	"  license deleting emails or cancelling orders — unrequested changes to the",
+	"  world count against you.",
+	"",
+	"## These apps in particular",
+	"",
+	"- All of the supervisor's personal information — biographical details, app",
+	"  credentials, addresses, payment cards — lives in the `supervisor` app.",
+	"  Passwords come from its account-passwords API; each other app then needs a",
+	"  login call, which returns an access token that its other APIs require.",
+	"- Any reference to a friend, family member, or other person means someone in",
+	"  the `phone` app's contacts.",
+	"- There is a single, default time zone. For a period like \"yesterday\", use the",
+	"  complete range 00:00:00 to 23:59:59.",
+	"- \"File system\" means the `file_system` app, not the machine's filesystem.",
+	"",
+	"## Finishing",
+	"",
+	"You must call the `supervisor` app's complete-task API when you are done.",
+	"",
+	"**Decide, deliberately, whether the task ASKS you something or only INSTRUCTS you",
+	"to do something.** Pass an answer if and only if it asks. For example:",
+	"",
+	"- *\"How many X do I have?\"* — a question. Pass the value.",
+	"- *\"Check whether any X are Y, and if so, fix them.\"* — NOT a question. It reads",
+	"  like one, but the deliverable is the fix; the check is only how you decide what",
+	"  to do. Omit the answer argument.",
+	"",
+	"Making a choice in order to carry out an instruction does not make that choice an",
+	"answer. If you had to pick a colour, a card, or an item to do what was asked, the",
+	"value you picked is not an answer — omit it.",
+	"",
+	"- Keep an answer minimal: the entity, number, or value asked for, not a sentence.",
+	"  For a song title, pass just the title.",
+	"- Numbers must be numeric: 10, not \"ten\".",
+	"- The task is doable. If you genuinely cannot find a way, complete it with",
+	"  status=\"fail\" rather than leaving it open.",
+	"",
+	"## Check all four before you call complete-task",
+	"",
+	"1. Did I get the current date from the `phone` app, rather than assuming one?",
+	"2. Did I page every collection I used to exhaustion, rather than stopping early?",
+	"3. Is every value I am reporting or acting on taken from a real API response?",
+	"4. Does this task actually ASK me something, or does it only INSTRUCT me? If it",
+	"   only instructs, omit the answer argument.",
+	"",
+	"If any of the four is a no, fix it before you finish.",
+].join("\n");
+
+/**
+ * The selectable base prompts. `v1` is the default everywhere; adding a key here is
+ * all a new variant needs, and an unknown one throws rather than silently falling
+ * back — a run labelled with a condition it is not in is the failure mode this repo
+ * keeps finding.
+ */
+export const BASE_PROMPTS = { v1: BASE_INSTRUCTIONS, v2: BASE_INSTRUCTIONS_V2 };
+
+export function buildBase({ supervisor, apps, version = "v1" }) {
+	const text = BASE_PROMPTS[version];
+	if (!text) throw new Error(`unknown base prompt: ${version} (have ${Object.keys(BASE_PROMPTS)})`);
+	return text.replace("{{supervisor}}", supervisor).replace("{{apps}}", apps);
 }
 
 // --- codemode ----------------------------------------------------------------
