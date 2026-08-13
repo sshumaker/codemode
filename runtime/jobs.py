@@ -455,6 +455,86 @@ class Job:
         return self._store._read_log(rec)
 
 
+class Subagent(Job):
+    """
+    A job that is a child agent (see subagents.py).
+
+    Everything a Job does, plus the three things that are only meaningful for a
+    child: what it answered, what it cost, and where its trajectory is. All of them
+    are read from files the child wrote, so they survive the parent's kernel exactly
+    as the job record does — and a partial result (a child stopped at its turn cap)
+    is readable rather than discarded.
+
+    Lives here rather than in subagents.py so that `jobs.get(name)` can return it
+    without jobs.py importing the module that imports jobs.py.
+    """
+
+    __slots__ = ()
+
+    def _meta(self) -> dict:
+        rec = self._store._read(self.name) or {}
+        path = (rec.get("meta") or {}).get("meta_path")
+        try:
+            with open(path) as fh:
+                return json.load(fh)
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _spec(self) -> dict:
+        return (self._store._read(self.name) or {}).get("meta") or {}
+
+    def __repr__(self) -> str:
+        rec = self._store._refresh(self._store._read(self.name)) or {"state": "missing"}
+        meta = self._meta()
+        extra = f" {meta['turns']} turns ${meta['cost']:.4f}" if meta.get("turns") else ""
+        return f"<Subagent {self.name} {rec.get('state')}{extra}>"
+
+    @property
+    def result(self) -> str:
+        """
+        The child's final text — the answer, without the job log around it.
+
+        Empty until the child has produced one. A child killed at a cap still writes
+        whatever it had said, so this is worth reading even when `.ok` is False.
+        """
+        path = self._spec().get("result")
+        try:
+            with open(path) as fh:
+                return fh.read()
+        except (OSError, TypeError):
+            return ""
+
+    @property
+    def transcript(self) -> str:
+        """Path to the child's full JSON stream. Read it when the answer surprises you."""
+        return self._spec().get("transcript", "")
+
+    @property
+    def turns(self) -> Optional[int]:
+        return self._meta().get("turns")
+
+    @property
+    def cost(self) -> Optional[float]:
+        return self._meta().get("cost")
+
+    @property
+    def tool_calls(self) -> Optional[int]:
+        return self._meta().get("toolCalls")
+
+    @property
+    def model(self) -> str:
+        return self._spec().get("model", "")
+
+    @property
+    def tools(self) -> str:
+        return self._spec().get("tools", "")
+
+    @property
+    def prompt(self) -> str:
+        """What the child was asked. The whole input side of the handoff."""
+        return self._spec().get("prompt", "")
+
+
 class Tombstone(Job):
     """
     A handle to a job that is gone.
@@ -617,7 +697,16 @@ class JobStore:
         for f in names:
             if f.endswith(".json"):
                 rec = self._read(f[:-5])
-                if rec:
+                # `started_at` is written by submit() and by nothing else, so it is
+                # what distinguishes a job record from any other JSON that happens to
+                # share the directory. Without this check a sibling file — the first
+                # one written was a subagent's `<name>.meta.json` — is read back as a
+                # job named "<name>.meta", and manifest() raises KeyError while
+                # listing it. That takes out the manifest, jobs.list() and the
+                # prelude's startup announcement at once, for a file that is not a
+                # job at all. Skipping is right: a record missing the field submit
+                # always writes is not a job, whoever wrote it.
+                if rec and "started_at" in rec:
                     out.append(rec)
         return out
 
@@ -657,6 +746,12 @@ class JobStore:
             rec["state"] = "done"
             rec["reason"] = "completed" if rec.get("exit_code") == 0 else "exited non-zero"
             rec["finished_at"] = self._now()
+            # Also on the way out, not only while running. Otherwise the byte count
+            # freezes at whatever the last refresh saw — and a job never observed
+            # while running is reported as "0 bytes" forever, which reads as "it
+            # produced nothing" about a job that produced everything. Visible the
+            # moment subagents made the log worth reading.
+            rec["events"] = self._log_bytes(rec)
             rec["output_tail"] = self._read_log(rec)[-4000:]
             self._write(rec)
             return rec
@@ -710,6 +805,8 @@ class JobStore:
         expect: str = "once",
         cwd: Optional[str] = None,
         strict: bool = True,
+        kind: str = "job",
+        meta: Optional[dict] = None,
     ) -> Job:
         """
         Start work that outlives this cell and this kernel.
@@ -717,6 +814,11 @@ class JobStore:
         `payload` must be a shell command or a script path — data, never a callable.
         `name` is required: it is what appears in `jobs.list()`, the manifest and the
         wake event, and an unnamed job makes all three unreadable (§5).
+
+        `kind` and `meta` are for callers built ON this surface — `spawn()` submits a
+        subagent as `kind="subagent"` with the child's paths in `meta`, which is what
+        makes a subagent a job rather than a parallel mechanism. Both are recorded
+        verbatim and are not part of the agent-facing surface.
         """
         if callable(payload):
             raise TypeError(
@@ -786,6 +888,8 @@ class JobStore:
             "lint": [c for c, _ in problems],
             "events": 0,
             "silent": False,
+            "kind": kind,
+            "meta": meta or {},
         }
         # Claim the name on disk BEFORE anything can be running under it.
         #
@@ -834,7 +938,13 @@ class JobStore:
     def _handle(self, name: str) -> Job:
         handle = self._handles.get(name)
         if handle is None or isinstance(handle, Tombstone):
-            handle = Job(name, self)
+            # The record decides which handle, so a job submitted by spawn() comes
+            # back as a Subagent in a FRESH kernel too — the recovery path is a file
+            # read, and it would be a poor kind of durability if the recovered handle
+            # were missing .result.
+            rec = self._read(name) or {}
+            cls = Subagent if rec.get("kind") == "subagent" else Job
+            handle = cls(name, self)
             self._handles[name] = handle
         return handle
 
@@ -975,6 +1085,12 @@ class JobStore:
             else:
                 bits.append(f"{elapsed}s")
             bits.append(f"{rec.get('events', 0)} bytes")
+            if rec.get("kind") == "subagent":
+                # Which line is a child agent, and what it was told to do. A manifest
+                # that listed a subagent as an anonymous command would make the one
+                # question worth asking about it — "what is it doing?" — cost a turn.
+                task = (rec.get("meta") or {}).get("prompt", "").strip().replace("\n", " ")
+                bits.append(f"subagent: {task[:60]}" + ("…" if len(task) > 60 else ""))
             if rec.get("silent"):
                 bits.append("⚠ never fired")
             if rec.get("reason"):
@@ -1209,6 +1325,7 @@ def manifest() -> str:
 #   python3 runtime/jobs.py --docs     -> the api/ listing, same text as jobs.help()
 
 if __name__ == "__main__":
+    import os as _os
     import sys as _sys
 
     if "--spawn" in _sys.argv:
@@ -1225,6 +1342,29 @@ if __name__ == "__main__":
         raise SystemExit(0 if job else 1)
     if "--prompt" in _sys.argv:
         print(PROMPT)
+        # Subagents are jobs, so their guidance ships with the jobs guidance rather
+        # than through a second channel a harness would have to remember to wire.
+        # Imported here rather than at module scope: subagents.py imports this
+        # module, and the prelude must be able to load jobs with no subagent support
+        # present at all.
+        #
+        # OPT-IN, and that direction is deliberate. This CLI runs on the HOST, where
+        # subagents.py is always importable, while the prelude runs wherever the
+        # harness staged the runtime — and `bench/terminal/prime_agent.py` and
+        # `bench/tac/run-task.mjs` stage jobs.py and kernel-prelude.py and nothing
+        # else. Defaulting to on would therefore have told those agents about a
+        # `spawn` that is not bound in their kernel, which is the worst of the three
+        # possible states: guidance for a capability that does not exist is followed,
+        # and the agent cannot tell whether it misread. Absent-but-unadvertised is
+        # merely a missed opportunity. One variable governs both channels.
+        if (_os.environ.get("HARNESS_SUBAGENTS") == "1") or "--subagents" in _sys.argv:
+            try:
+                import subagents as _sub
+
+                print()
+                print(_sub.PROMPT)
+            except Exception as exc:  # never let an optional section break the prompt
+                print(f"[jobs] subagent guidance unavailable ({exc})", file=_sys.stderr)
     elif "--docs" in _sys.argv:
         print(f"# jobs\n\nAvailable in every cell as `jobs`; no import needed.\n\n```\n{HELP}\n```")
     else:

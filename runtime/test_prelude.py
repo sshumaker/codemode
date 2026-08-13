@@ -15,6 +15,7 @@ namespace.
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -341,7 +342,9 @@ class TestStartupAnnouncement(PreludeBase):
         # variable that silently re-points across a kernel death is the hazard the
         # lookup design exists to avoid.
         self.assertNotIn("build", ip.user_ns)
-        self.assertEqual(set(ip.user_ns) - {"jobs"}, set())
+        # `spawn` and `Agent` are machinery too, on the same footing as `jobs`: a
+        # function and a class, not a handle to durable state.
+        self.assertEqual(set(ip.user_ns) - {"jobs", "spawn", "Agent"}, set())
 
     def test_running_count_is_reported(self):
         self.store.submit("a", name="a")
@@ -424,6 +427,111 @@ class TestKernelIoIsNotGuarded(GuardBase):
         mod = self.arm()
         labels = [g[0] for g in mod._METHOD_GUARDS] if mod._METHOD_GUARDS else []
         self.assertNotIn("threading", str(mod._METHOD_GUARDS), "Event.wait must not be guarded")
+
+
+class TestSubagentBinding(PreludeBase):
+    """
+    `spawn` is bound only when the harness asked for it — and the resident guidance
+    is gated on the same variable, so the two cannot disagree. An agent told it has
+    `spawn` and handed a NameError is worse off than one never told: it follows the
+    guidance and cannot tell whether it misread.
+    """
+
+    def with_flag(self, value):
+        import builtins
+
+        had_spawn = hasattr(builtins, "spawn")
+        saved = os.environ.get("HARNESS_SUBAGENTS")
+        if value is None:
+            os.environ.pop("HARNESS_SUBAGENTS", None)
+        else:
+            os.environ["HARNESS_SUBAGENTS"] = value
+        for name in ("spawn", "Agent"):
+            if hasattr(builtins, name):
+                delattr(builtins, name)
+        try:
+            ip = FakeIPython()
+            load_prelude(namespace_holder=ip)
+            return ip, hasattr(builtins, "spawn"), had_spawn
+        finally:
+            if saved is None:
+                os.environ.pop("HARNESS_SUBAGENTS", None)
+            else:
+                os.environ["HARNESS_SUBAGENTS"] = saved
+            for name in ("spawn", "Agent"):
+                if hasattr(builtins, name):
+                    delattr(builtins, name)
+
+    def test_off_by_default(self):
+        ip, bound, _ = self.with_flag(None)
+        self.assertFalse(bound, "spawn was bound without the harness asking")
+        self.assertNotIn("spawn", ip.user_ns)
+
+    def test_bound_when_enabled(self):
+        import subagents as S
+
+        ip, bound, _ = self.with_flag("1")
+        self.assertTrue(bound, "HARNESS_SUBAGENTS=1 did not bind spawn")
+        self.assertIs(ip.user_ns.get("spawn"), S.spawn)
+        self.assertIs(ip.user_ns.get("Agent"), S.Agent)
+
+    def test_the_outcome_is_recorded_either_way(self):
+        # A missing `spawn` is otherwise indistinguishable from an agent that chose
+        # not to delegate — the ambiguity that cost four TAC runs.
+        marker = os.path.join(self.dir, "prelude-status.txt")
+        saved = os.environ.get("HARNESS_PRELUDE_MARKER")
+        os.environ["HARNESS_PRELUDE_MARKER"] = marker
+        try:
+            self.with_flag(None)
+            self.assertIn("SUBAGENTS", open(marker).read())
+        finally:
+            if saved is None:
+                os.environ.pop("HARNESS_PRELUDE_MARKER", None)
+            else:
+                os.environ["HARNESS_PRELUDE_MARKER"] = saved
+
+
+class TestSpawnIsNotRefusedByTheGuards(GuardBase):
+    """
+    The guards must not refuse the subagent they exist to point at.
+
+    `spawn()` reaches `subprocess.Popen(..., start_new_session=True)` through
+    `jobs._real_spawn`, and that is exactly the shape the ESCAPE guard refuses when
+    an agent writes it in a cell. The guard survives this only because it asks
+    whether the IMMEDIATE caller is a cell — jobs.py is not — so a well-meant change
+    to walk the whole stack instead would silently break every subagent while leaving
+    every other test green.
+
+    This file has agent-code semantics under GuardBase, so a stack-walking guard
+    WOULD fire here. That is the point: the test can only pass while the exemption
+    holds.
+    """
+
+    def test_a_child_can_be_spawned_from_agent_code(self):
+        import subagents as S
+
+        self.arm()
+        cli = os.path.join(self.dir, "cli.js")
+        open(cli, "w").close()
+        spawner = S.Subagents(
+            self.store,
+            env={"HARNESS_SUBAGENT_MODEL": "fake/model", "HARNESS_SUBAGENT_CLI": cli},
+            node="node", python="python3",
+        )
+        # No RuntimeError from the guards, and the job really was armed.
+        job = spawner.spawn("go and look", name="scout")
+        self.assertEqual(job.state, "running")
+        self.assertEqual(len(self.spawned), 1)
+        self.assertIn("subagent_run.py", self.spawned[0])
+
+    def test_the_guards_really_were_armed_while_that_happened(self):
+        # Without this the test above is vacuous: an inert guard table also lets
+        # spawn() through. The same detaching call, written HERE rather than reached
+        # through jobs.py, must still be refused.
+        self.arm()
+        with self.assertRaises(RuntimeError) as ctx:
+            subprocess.Popen(["true"], start_new_session=True)
+        self.assertIn("jobs.submit", str(ctx.exception))
 
 
 class TestGuardTable(GuardBase):

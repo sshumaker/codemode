@@ -699,6 +699,55 @@ def _keep_jobs_bound():
 _keep_jobs_bound()
 
 
+def _bind_subagents():
+    """
+    Make `spawn` available the way `jobs` is: no import, survives `%reset -f`.
+
+    A bare name, not `jobs.spawn`, because that is what docs/DESIGN.md §Subagents
+    specifies and what the resident prompt shows — and because the thing an agent
+    types without being taught is `spawn(...)`. It is bound in builtins for the same
+    reason `jobs` is: `%reset -f` clears the user namespace mid-session, and an agent
+    that hit a NameError there spent three cells rediscovering a name the runtime had
+    taken away from it.
+
+    OPT-IN, on the same `HARNESS_SUBAGENTS=1` that gates the resident guidance, so
+    the two can never disagree — an agent told it has `spawn` and given a NameError
+    is worse off than one never told, because it follows the guidance and cannot tell
+    whether it misread.
+
+    Failure-tolerant beyond that: a harness may set the flag and still stage `jobs.py`
+    without `subagents.py`. The kernel must come up regardless — the guards and
+    `jobs` are the load-bearing part, and a prelude that raised here would take down
+    the whole runtime for a feature the task may not need. So the outcome is RECORDED
+    rather than assumed: a missing `spawn` is otherwise indistinguishable from an
+    agent that chose not to delegate, which is exactly the ambiguity that cost four
+    TAC runs.
+    """
+    if os.environ.get("HARNESS_SUBAGENTS") != "1":
+        _record("SUBAGENTS", "off (set HARNESS_SUBAGENTS=1 to enable)")
+        return
+    import builtins
+
+    try:
+        import subagents
+    except Exception as exc:
+        _record("SUBAGENTS", f"not available: {type(exc).__name__}: {exc}")
+        return
+    builtins.spawn = subagents.spawn
+    builtins.Agent = subagents.Agent
+    ip = _shell()
+    if ip is not None:
+        try:
+            ip.user_ns.setdefault("spawn", subagents.spawn)
+            ip.user_ns.setdefault("Agent", subagents.Agent)
+        except Exception:
+            pass  # builtins is enough
+    _record("SUBAGENTS", f"spawn bound (depth={subagents._spawner().depth()})")
+
+
+_bind_subagents()
+
+
 def _render_wait_signal_cleanly():
     """
     Present the end-of-cell signal as control flow, not as a crash.

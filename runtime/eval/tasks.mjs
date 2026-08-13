@@ -10,7 +10,7 @@
  * network, no services, and a run costs seconds rather than minutes.
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
@@ -572,6 +572,82 @@ export const TASKS = {
 					name: "the stage ordering constraint was live",
 					ok: true,
 					detail: `${failedStarts} premature stage attempt(s)`,
+				},
+			];
+		},
+	},
+
+	/**
+	 * Subagents. A child agent is a job, so this is the same loop as `background` —
+	 * spawn, wait outside the kernel, collect — with a model process in place of a
+	 * shell command.
+	 *
+	 * Graded on the CHILD'S OWN ARTEFACTS, not on the parent's report. A parent that
+	 * read notes.txt itself and claimed a subagent did it would pass every
+	 * transcript-level check; the only thing that cannot be faked is the child's
+	 * transcript on disk, its spec, and the restricted tool set it actually ran with.
+	 * (CLAUDE.md: assert the observable effect — that the arm reached the transport —
+	 * not the absence of an error.)
+	 */
+	subagent: {
+		timeout: 420,
+		setup: (runDir) => {
+			writeFileSync(join(runDir, "notes.txt"),
+				["field notes", "", "the secret word is PERIWINKLE", "", "end of notes"].join("\n"));
+		},
+		prompt:
+			"Delegate this to a subagent rather than doing it yourself: read the file " +
+			"notes.txt in this directory and report the secret word it contains. Give the " +
+			"child only the read, grep and ls tools — it must not need a kernel. Then " +
+			"collect its answer and tell me the secret word.",
+		check: ({ summary, jobDir }) => {
+			const cells = summary.cellSources.join("\n");
+			// The child's own directory: <jobDir>/<name>.d/{spec,meta,stream}
+			const children = existsSync(jobDir)
+				? readdirSync(jobDir).filter((f) => f.endsWith(".d"))
+				: [];
+			const name = children[0]?.replace(/\.d$/, "") ?? "";
+			const read = (rel) => {
+				try {
+					return readFileSync(join(jobDir, rel), "utf8");
+				} catch {
+					return "";
+				}
+			};
+			const spec = name ? JSON.parse(read(`${name}.d/spec.json`) || "{}") : {};
+			const stream = name ? read(`${name}.d/stream.jsonl`) : "";
+			const meta = name ? JSON.parse(read(`${name}.d/meta.json`) || "{}") : {};
+			return [
+				{ name: "called spawn()", ok: /\bspawn\(/.test(cells) },
+				{ name: "waited outside the kernel", ok: summary.used.wait },
+				{ name: "a child was recorded", ok: Boolean(name), detail: name || "no <name>.d in the job dir" },
+				{
+					name: "the child ran with the RESTRICTED tool set",
+					ok: Boolean(spec.tools) && !spec.tools.split(",").includes("ipython"),
+					detail: spec.tools ? `tools=${spec.tools}` : "no spec.json",
+				},
+				{
+					name: "the child really ran (its own transcript)",
+					ok: stream.split("\n").filter((l) => l.startsWith("{")).length > 2,
+					detail: `${stream.split("\n").filter((l) => l.startsWith("{")).length} stream events`,
+				},
+				{
+					name: "the child found the word",
+					ok: /PERIWINKLE/.test(read(`${name}.result.txt`)),
+					detail: meta.turns ? `${meta.turns} turns, $${meta.cost}` : "no meta.json",
+				},
+				{
+					name: "the parent collected it",
+					ok: /jobs\.get\(|\.result\b/.test(cells),
+				},
+				{
+					name: "the parent reported the word",
+					ok: /PERIWINKLE/.test(summary.finalText ?? ""),
+					detail: summary.finalText ? "" : "no final text",
+				},
+				{
+					name: "did not block a cell with sleep",
+					ok: !summary.used.sleep,
 				},
 			];
 		},

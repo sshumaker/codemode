@@ -55,9 +55,18 @@ const runId = flag("run-id", `${taskName}__${Date.now()}`);
 const runDir = join(ROOT, ".run/jobs", runId);
 mkdirSync(runDir, { recursive: true });
 
+// Subagents are opt-in, in the guidance and in the kernel alike. The subagent task
+// needs them; --no-subagents turns them off for a run that should not have them.
+const subagents = !argv.includes("--no-subagents");
+
 /** Generated from the module, never transcribed — see jobs.py's __main__. */
 function emit(kind) {
-	const r = spawnSync("python3", [join(RUNTIME, "jobs.py"), `--${kind}`], { encoding: "utf8" });
+	// `--subagents` explicitly: the subagent section is opt-in, on the same flag that
+	// binds `spawn` in the kernel below, so the guidance and the capability cannot
+	// disagree. A harness that stages jobs.py WITHOUT subagents.py gets neither.
+	const args = [join(RUNTIME, "jobs.py"), `--${kind}`];
+	if (kind === "prompt" && subagents) args.push("--subagents");
+	const r = spawnSync("python3", args, { encoding: "utf8" });
 	if (r.status !== 0) throw new Error(`jobs.py --${kind} failed: ${r.stderr}`);
 	return r.stdout;
 }
@@ -163,7 +172,16 @@ if (sandboxed) {
 				network: {
 					// The kernel needs nothing off-box. Anything it reaches for is either a
 					// tool-surface bypass or an accident, and both are worth recording.
-					allowedDomains: [],
+					//
+					// EXCEPT a subagent. `spawn` starts a real model process as a child of
+					// the kernel, so it inherits this sandbox — and on Linux srt removes the
+					// network namespace entirely, so the child cannot reach the provider AT
+					// ALL. That surfaces inside the child as an API error, i.e. as a weak
+					// subagent rather than as a harness fault — measured: the first real
+					// smoke's child died on "Connection error" x3 while every mechanism
+					// check passed. So when subagents are ON, the provider domain (and
+					// only it) is allowed; with them off the list stays empty.
+					allowedDomains: subagents ? ["api.anthropic.com"] : [],
 					deniedDomains: [],
 					// ipykernel speaks ZMQ over loopback to the agent, so local binding has
 					// to stay open or the kernel cannot be reached at all.
@@ -225,6 +243,13 @@ const child = spawn(
 			HARNESS_JOB_DIR: jobDir,
 			HARNESS_JOB_CWD: runDir,
 			HARNESS_RUNTIME_DIR: RUNTIME,
+			// Subagents: the child runs the SAME model as the parent (DESIGN
+			// §Subagents), and the kernel has no other way to know what that is —
+			// the model is a CLI flag on a process the kernel is a child of, not an
+			// environment variable. `spawn` refuses rather than guessing, so this is
+			// what makes it usable at all. The CLI resolves from the repo checkout;
+			// naming it here means a run is reproducible from its own env dump.
+			...(subagents ? { HARNESS_SUBAGENTS: "1", HARNESS_SUBAGENT_MODEL: model, HARNESS_SUBAGENT_CLI: CLI } : {}),
 			...(argv.includes("--adopt-bg") || argv.includes("--adopt-quiet") ? { HARNESS_ADOPT_BACKGROUND: "1" } : {}),
 			...(argv.includes("--adopt-quiet") ? { HARNESS_ADOPT_QUIET: "1" } : {}),
 			// Read by the patched kernel spawn; absent means no sandbox.

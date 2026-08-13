@@ -698,7 +698,7 @@ class TestModuleSurface(Base):
             n for n in dir(J)
             if not n.startswith("_") and callable(getattr(J, n)) and getattr(J, n).__module__ == J.__name__
         }
-        public -= {"Job", "Tombstone", "JobStore", "JobError", "WaitSignal"}
+        public -= {"Job", "Subagent", "Tombstone", "JobStore", "JobError", "WaitSignal"}
         self.assertEqual(public, expected)
 
 

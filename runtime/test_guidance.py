@@ -218,9 +218,37 @@ class TestEmittedArtifacts(unittest.TestCase):
         )
 
     def test_prompt_flag_emits_exactly_the_prompt(self):
+        # Subagents are OFF by default here, and that direction is the point: this
+        # CLI runs on the host, where subagents.py always imports, while the kernel
+        # only has it if the harness staged it. Advertising a `spawn` that is not
+        # bound is worse than saying nothing — the agent follows the guidance and
+        # cannot tell whether it misread.
         r = self.run_cli("--prompt")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout.strip(), J.PROMPT.strip())
+        self.assertNotIn("spawn(", r.stdout)
+
+    def test_the_subagent_section_is_appended_when_asked_for(self):
+        # Both sections, each generated from its own module. Asserting on the exact
+        # concatenation is what keeps either from being transcribed by hand.
+        import subagents as S
+
+        r = self.run_cli("--prompt", "--subagents")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(),
+                         f"{J.PROMPT.strip()}\n\n{S.PROMPT.strip()}")
+
+    def test_the_environment_flag_enables_it_too(self):
+        # One variable governs both channels — this one and the prelude's binding —
+        # so the guidance and the capability cannot disagree.
+        import subprocess, sys, os
+
+        r = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "jobs.py"), "--prompt"],
+            capture_output=True, text=True,
+            env=dict(os.environ, HARNESS_SUBAGENTS="1"),
+        )
+        self.assertIn("spawn(prompt", r.stdout)
 
     def test_docs_flag_emits_the_help_text_once(self):
         # help() prints as a side effect AND returns; an earlier version interpolated
