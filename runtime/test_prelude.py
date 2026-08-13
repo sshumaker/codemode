@@ -526,6 +526,100 @@ class TestGuardTable(GuardBase):
         self.assertEqual(job.state, "running")
 
 
+class TestStdlibShadowing(PreludeBase):
+    """
+    A task cwd containing a stdlib-named file (train-bpe-tokenizer ships
+    /app/tokenize.py) must not break the kernel. Left alone, the shadowing file is
+    imported as `tokenize`, and the first traceback dies in `tokenize.open` (via
+    linecache) during prelude startup, so `jobs` never binds and the ON arm is
+    silently invalid. The prelude's `_unshadow_stdlib` forces the stdlib module.
+    """
+
+    def test_unshadow_restores_stdlib_tokenize(self):
+        import importlib
+        import linecache
+        import tokenize as real_tokenize
+
+        mod = load_prelude()
+        d = tempfile.mkdtemp(prefix="shadow-")
+        with open(os.path.join(d, "tokenize.py"), "w") as fh:
+            fh.write("HELLO = 1\n")  # a shadowing file with no `open`
+        saved_cwd = os.getcwd()
+        saved_path = list(sys.path)
+        saved_lc = linecache.tokenize
+        try:
+            os.chdir(d)
+            sys.path.insert(0, "")
+            sys.modules.pop("tokenize", None)
+            shadow = importlib.import_module("tokenize")  # the local one
+            self.assertFalse(hasattr(shadow, "open"), "shadow setup failed")
+            linecache.tokenize = shadow
+
+            mod._unshadow_stdlib()
+
+            self.assertTrue(hasattr(sys.modules["tokenize"], "open"),
+                            "stdlib tokenize was not restored")
+            self.assertTrue(hasattr(linecache.tokenize, "open"),
+                            "linecache still holds the shadowing tokenize")
+            # traceback formatting (linecache -> tokenize.open) must work now
+            try:
+                raise ValueError("boom")
+            except ValueError:
+                self.assertIn("ValueError: boom", traceback_format())
+        finally:
+            os.chdir(saved_cwd)
+            sys.path[:] = saved_path
+            sys.modules["tokenize"] = real_tokenize
+            linecache.tokenize = saved_lc
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_unshadow_leaves_sys_path_intact(self):
+        # The agent's own local imports must still work — the fix restores sys.path.
+        mod = load_prelude()
+        before = list(sys.path)
+        mod._unshadow_stdlib()
+        self.assertEqual(sys.path, before)
+
+    def test_sitecustomize_module_unshadows_on_import(self):
+        # runtime/harness_unshadow.py is staged as a .pth so it runs at interpreter
+        # startup — BEFORE IPython imports `executing` (`from tokenize import
+        # detect_encoding`), which the prelude's own copy is too late to prevent.
+        # Assert the module's function restores stdlib tokenize from a shadowed cwd.
+        import importlib
+        import linecache
+        import tokenize as real_tokenize
+
+        import harness_unshadow  # the staged module (runtime/ is on the test path)
+
+        d = tempfile.mkdtemp(prefix="shadow-")
+        with open(os.path.join(d, "tokenize.py"), "w") as fh:
+            fh.write("HELLO = 1\n")
+        saved_cwd, saved_path, saved_lc = os.getcwd(), list(sys.path), linecache.tokenize
+        try:
+            os.chdir(d)
+            sys.path.insert(0, "")
+            sys.modules.pop("tokenize", None)
+            shadow = importlib.import_module("tokenize")
+            self.assertFalse(hasattr(shadow, "open"), "shadow setup failed")
+            linecache.tokenize = shadow
+
+            harness_unshadow._unshadow_stdlib()
+
+            self.assertTrue(hasattr(sys.modules["tokenize"], "open"))
+            self.assertTrue(hasattr(linecache.tokenize, "open"))
+        finally:
+            os.chdir(saved_cwd)
+            sys.path[:] = saved_path
+            sys.modules["tokenize"] = real_tokenize
+            linecache.tokenize = saved_lc
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def traceback_format():
+    import traceback as _tb
+    return _tb.format_exc()
+
+
 class TestCellWatchdog(PreludeBase):
     """
     The backstop that teaches.

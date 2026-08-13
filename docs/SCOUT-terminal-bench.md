@@ -1171,16 +1171,28 @@ valid ON runs PASS, and with jobs ON their foreground compute is *shorter* than 
 (the runtime backgrounds it), so the surface is even further from 120s. The threshold
 is safe against this corpus.
 
-### A separate bug found — not the threshold: `/app/tokenize.py` breaks A0
+### A separate bug found — and FIXED: `/app/tokenize.py` breaks A0
 
 `train-bpe-tokenizer` **failed preflight ON** (`jobs_staging.bound = false`), not
 because of the watchdog but because the task ships `/app/tokenize.py`, which **shadows
-the stdlib `tokenize`** that IPython's `executing` imports at prelude startup
-(`ImportError: cannot import name 'detect_encoding' from 'tokenize'`). The jobs runtime
-never binds, so per A0 discipline the ON run is **invalid and excluded**, not counted
-as a regression. OFF is unaffected (jobs-off does not stage the prelude), so its 8.9s
-surface number stands. Worth a follow-up: the prelude/`executing` import of a stdlib
-module is fragile to any task whose cwd contains a same-named `.py`. Orthogonal to #24.
+the stdlib `tokenize`**. The exact chain: IPython imports `stack_data` → `executing`
+during shell init, and `executing/executing.py:42` does `from tokenize import
+detect_encoding` at import time — resolved against `/app/tokenize.py`, which lacks it
+→ `ImportError` → the kernel comes up with `jobs` unbound, silently invalid.
+
+**Fixed (#25).** The critical detail is *timing*: `executing` is imported during
+IPython init, BEFORE the startup file (`kernel-prelude.py`) runs — so the same fix
+inside the prelude is too late (verified: it stays NOT-BOUND). The fix runs at
+**interpreter startup** instead: `runtime/harness_unshadow.py` is staged into the
+kernel venv's site-packages next to a `.pth` (`import harness_unshadow`) that
+`_stage_jobs` installs, so it forces stdlib `tokenize` into `sys.modules` (cwd
+removed for the import, `sys.path` restored after) before anything imports
+`executing`. **E2E confirmed on the real container: `train-bpe-tokenizer` ON now
+reports `jobs_staging.bound = true` / `JOBS-BOUND`.** A prelude-level `_unshadow` is
+kept as defense-in-depth (catches the `linecache`/traceback case and re-shadowing for
+harnesses that stage the prelude but not the `.pth`). Tests: 3 in `test_prelude.py`
+(`TestStdlibShadowing`). OFF was always unaffected (jobs-off does not stage), so its
+8.9s surface number stands.
 
 ### Bottom line (#24 closed, aggressive)
 

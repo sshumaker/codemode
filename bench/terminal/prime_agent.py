@@ -322,6 +322,19 @@ class PrimeAgent(BaseAgent):
             [REPO / "runtime" / "jobs.py"], container_dir=RUNTIME_DIR)
         session.copy_to_container(
             [REPO / "runtime" / "kernel-prelude.py"], container_dir=RUNTIME_DIR)
+        # Unshadow stdlib at INTERPRETER STARTUP, before IPython imports `executing`
+        # (which does `from tokenize import detect_encoding` at import time). A task
+        # cwd that ships e.g. /app/tokenize.py otherwise breaks that import during
+        # shell init — before the startup file runs — so `jobs` never binds and the
+        # ON arm is silently invalid. Installed as a .pth in the kernel venv's
+        # site-packages so it runs earlier than any startup file could. See
+        # runtime/harness_unshadow.py. Measured on train-bpe-tokenizer.
+        session.copy_to_container(
+            [REPO / "runtime" / "harness_unshadow.py"], container_dir=RUNTIME_DIR)
+        self._exec(session, ["sh", "-c", (
+            f'SP=$({KERNEL_PYTHON} -c "import site; print(site.getsitepackages()[0])") '
+            f'&& cp {RUNTIME_DIR}/harness_unshadow.py "$SP/harness_unshadow.py" '
+            f'&& printf "import harness_unshadow\\n" > "$SP/_harness_unshadow.pth"')])
         self._exec(session, ["sh", "-c", (
             f"mv {RUNTIME_DIR}/kernel-prelude.py {RUNTIME_DIR}/kernel_prelude.py; "
             f"sed -i 's#/agent/harness#{RUNTIME_DIR}#' {RUNTIME_DIR}/kernel_prelude.py; "

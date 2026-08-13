@@ -31,6 +31,45 @@ import threading
 import time
 import traceback
 
+
+def _unshadow_stdlib():
+    """Guarantee stdlib `tokenize` wins over a task cwd that shadows it.
+
+    The kernel runs with '' (the task cwd) at sys.path[0]. A task whose working
+    directory contains a stdlib-named file — measured: train-bpe-tokenizer ships
+    `/app/tokenize.py` — makes `import tokenize` return that file, and the FIRST
+    traceback or source lookup dies in `tokenize.open` (called by `linecache`,
+    which every traceback formats through) with `AttributeError: module 'tokenize'
+    has no attribute 'open'`. That happens *during* prelude startup, so `jobs`
+    never binds and the whole ON arm is silently invalid — a plausible number, not
+    an error, which is the trap this project keeps hitting.
+
+    Force the stdlib module into sys.modules with the cwd entries removed for the
+    duration of the import, then restore sys.path untouched so the agent's own
+    local imports still work. linecache caches its own `tokenize` reference at
+    import, so repoint that too if it already grabbed the shadowing copy.
+
+    Runs first, before anything here can raise into a broken traceback formatter.
+    """
+    import importlib
+
+    cwd = os.getcwd()
+    saved = list(sys.path)
+    sys.path[:] = [p for p in sys.path if p not in ("", ".", cwd)]
+    try:
+        sys.modules.pop("tokenize", None)
+        std_tok = importlib.import_module("tokenize")
+        lc = sys.modules.get("linecache")
+        if lc is not None and getattr(lc, "tokenize", None) is not std_tok:
+            lc.tokenize = std_tok
+    except Exception:
+        pass  # never let the guard against a broken kernel break the kernel
+    finally:
+        sys.path[:] = saved
+
+
+_unshadow_stdlib()
+
 # This file's own path, or a sentinel.
 #
 # `__file__` is NOT defined when IPython executes a startup file directly, and the
