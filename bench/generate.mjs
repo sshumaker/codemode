@@ -73,6 +73,19 @@ function pyType(schema) {
 	if (schema.type === "array") {
 		return `list[${pyType(schema.items)}]`;
 	}
+	// anyOf / oneOf. Without this the union collapses to `Any` and the signature
+	// stops carrying what the schema knows -- measured on AppWorld's
+	// `supervisor.complete_task`, whose `answer` is anyOf[number,integer,string]
+	// and rendered as `Any`, the only untyped parameter in 3,125. The whole point
+	// of compiling MCP into Python is that the signature keeps the schema's
+	// information; a fallthrough that silently drops it defeats the exercise.
+	const variants = schema.anyOf ?? schema.oneOf;
+	if (Array.isArray(variants) && variants.length > 0) {
+		const parts = variants.filter((v) => v && v.type !== "null").map((v) => pyType(v));
+		const union = [...new Set(parts)].join(" | ") || "Any";
+		const nullable = variants.some((v) => v && v.type === "null");
+		return nullable ? `${union} | None` : union;
+	}
 	return PY_TYPES[schema.type] ?? "Any";
 }
 

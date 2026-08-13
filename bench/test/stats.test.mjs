@@ -13,7 +13,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { formatPaired, mean, pairedTest, sd, signTest, tTestP } from "../stats.mjs";
+import { formatPaired, formatProportions, mean, pairedTest, sd, signTest, tTestP, twoProportionZ } from "../stats.mjs";
 
 describe("the t distribution is the real one", () => {
 	// Against published two-sided critical values. A p-value routine that is merely
@@ -136,5 +136,62 @@ describe("sd is the sample sd", () => {
 	it("is undefined for a single observation rather than zero", () => {
 		// Zero would read as "no variance measured" when the truth is "not measurable".
 		assert.ok(Number.isNaN(sd([1])));
+	});
+});
+
+/**
+ * The two-proportion z, which the AppWorld variant comparisons are quoted against.
+ *
+ * Validated against numbers this project already published rather than against a
+ * textbook: docs/MORNING-REPORT-2026-08-13.md §B tests three variants against the
+ * 34/92 = 37.0% noise floor and reports z = +3.14, +0.74 and -0.50. A reimplementation
+ * that reproduces all three is the same class of check as running the real harness
+ * instead of a clone.
+ */
+describe("the two-proportion z reproduces the published variant table", () => {
+	const near = (a, b, tol = 0.005) => assert.ok(Math.abs(a - b) < tol, `${a} != ${b}`);
+
+	it("claude-code on the 46 codemode failures: 65.2% vs the 37.0% floor, z=+3.14", () => {
+		near(twoProportionZ(30, 46, 34, 92).z, 3.14);
+	});
+
+	it("gate=redirect: 43.5% vs the floor, z=+0.74 — inside one SE, i.e. no result", () => {
+		near(twoProportionZ(20, 46, 34, 92).z, 0.74);
+	});
+
+	it("nav-tools: 32.6% vs the floor, z=-0.50 — below the floor", () => {
+		near(twoProportionZ(15, 46, 34, 92).z, -0.5);
+	});
+
+	it("identical proportions give exactly zero, not a small number", () => {
+		// The degenerate case that matters: a statistic reporting an effect on identical
+		// inputs produces a plausible number rather than an error.
+		const r = twoProportionZ(10, 20, 10, 20);
+		assert.equal(r.z, 0);
+		assert.equal(r.diff, 0);
+		near(r.p, 1);
+	});
+
+	it("is symmetric under swapping the two groups", () => {
+		const a = twoProportionZ(30, 46, 34, 92);
+		const b = twoProportionZ(34, 92, 30, 46);
+		near(a.z, -b.z);
+		near(a.p, b.p);
+	});
+
+	it("p tracks z at the conventional thresholds", () => {
+		// A p-value routine that is merely monotonic looks right and misstates every
+		// threshold — the same trap the t-test tests above guard.
+		near(twoProportionZ(30, 46, 34, 92).p, 0.0017, 0.0005);
+		assert.ok(twoProportionZ(20, 46, 34, 92).p > 0.05);
+	});
+
+	it("formatProportions shows both denominators, because they differ", () => {
+		// The floor has two runs per task and a variant arm has one; a line that hid
+		// n=46 vs n=92 would read as a paired comparison, which it is not.
+		const line = formatProportions("cc vs floor", twoProportionZ(30, 46, 34, 92));
+		assert.match(line, /n=46/);
+		assert.match(line, /n=92/);
+		assert.match(line, /\+28\.3pp/);
 	});
 });

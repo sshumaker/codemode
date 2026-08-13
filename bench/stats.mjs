@@ -142,6 +142,54 @@ export function pairedTest(deltas) {
 	};
 }
 
+/** Abramowitz & Stegun 7.1.26 — plenty for a p-value. */
+function erf(x) {
+	const t = 1 / (1 + 0.3275911 * x);
+	const y =
+		1 -
+		((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+	return y;
+}
+
+/**
+ * Two-proportion z test, unpaired.
+ *
+ * The test for "did this variant beat the noise floor". The floor here is not a
+ * theoretical baseline — it is the *same* configuration re-run on the same tasks
+ * (34/92 = 37.0% on the 46 tasks codemode failed), so the comparison is variant-vs-
+ * itself and the only question is whether the difference exceeds run-to-run noise.
+ *
+ * Unpaired on purpose, and this is a real limitation worth stating whenever it is
+ * used: the floor has two runs per task and a variant arm typically has one, so there
+ * is no per-task pairing to exploit. That throws away the task-difficulty blocking
+ * that makes `pairedTest` powerful, which is precisely why a variant needs a large
+ * margin here before it means anything. A 6.5pp difference on n=46 vs n=92 is inside
+ * one standard error — that is not a weak result, it is no result.
+ *
+ * Pooled-variance form (the standard for testing p1 = p2).
+ */
+export function twoProportionZ(successes1, n1, successes2, n2) {
+	const p1 = successes1 / n1;
+	const p2 = successes2 / n2;
+	const pooled = (successes1 + successes2) / (n1 + n2);
+	const se = Math.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n2));
+	const z = se > 0 ? (p1 - p2) / se : Number.NaN;
+	// Two-sided.
+	const p = Number.isFinite(z) ? 2 * (1 - 0.5 * (1 + erf(Math.abs(z) / Math.SQRT2))) : Number.NaN;
+	return { p1, p2, diff: p1 - p2, pooled, se, z, p, n1, n2 };
+}
+
+/** One-line rendering of a two-proportion z. */
+export function formatProportions(label, r, { digits = 1 } = {}) {
+	const pct = (x) => `${(100 * x).toFixed(digits)}%`;
+	const stars = r.p < 0.001 ? "***" : r.p < 0.01 ? "**" : r.p < 0.05 ? "*" : "";
+	return (
+		`${label.padEnd(34)} ${pct(r.p1)} (n=${r.n1}) vs ${pct(r.p2)} (n=${r.n2})  ` +
+		`Δ=${r.diff >= 0 ? "+" : ""}${(100 * r.diff).toFixed(digits)}pp  ` +
+		`z=${Number.isFinite(r.z) ? r.z.toFixed(2) : "—"} p=${Number.isFinite(r.p) ? r.p.toFixed(4) : "—"}${stars}`
+	);
+}
+
 /** One-line rendering, with the sign test alongside because cost is skewed. */
 export function formatPaired(label, result, { unit = "$", digits = 3 } = {}) {
 	const f = (x) => (Number.isFinite(x) ? x.toFixed(digits) : "—");

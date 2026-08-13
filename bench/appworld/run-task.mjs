@@ -9,6 +9,7 @@
  *             --timeout 900  --max-cost 1.0  --run-id X  --force
  *             --docs-gate[=redirect|inline]  --nav-tools
  *                                     (codemode only; both default OFF)
+ *             --base-prompt=v1|v2     the shared base prompt (arm-neutral, default v1)
  *
  * Per-run artefacts under .run/appworld/<runId>/ — the answer to "could I
  * re-derive this verdict tomorrow, after the environment has been reset?":

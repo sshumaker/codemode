@@ -7,17 +7,19 @@
  * each of them was a bug that produced plausible output.
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { generate } from "../generate.mjs";
-import { BASE_INSTRUCTIONS, VANILLA_VARIANTS, VARIANTS, buildBase, buildClaudePreamble, buildPreamble, buildVanillaPreamble } from "../appworld/prompts.mjs";
+import { BASE_INSTRUCTIONS, BASE_PROMPTS, VANILLA_VARIANTS, VARIANTS, buildBase, buildClaudePreamble, buildPreamble, buildVanillaPreamble } from "../appworld/prompts.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const CATALOGUE = join(ROOT, "bench/data/appworld-schemas.json");
 const RUNNER = readFileSync(join(ROOT, "bench/appworld/run-task.mjs"), "utf8");
 const CLAUDE_RUNNER = readFileSync(join(ROOT, "bench/appworld/run-claude-code.mjs"), "utf8");
+const SWEEP_SRC = readFileSync(join(ROOT, "bench/appworld/sweep.mjs"), "utf8");
 const SERVER = readFileSync(join(ROOT, "bench/appworld/env-server.py"), "utf8");
 const haveCatalogue = existsSync(CATALOGUE);
 
@@ -45,6 +47,113 @@ describe("one base prompt, byte-identical across arms", () => {
 		// A preamble is appended; if an arm could replace the base, the matched pair
 		// required by docs/DESIGN.md is gone.
 		assert.match(RUNNER, /if \(preamble\) cliArgs\.push\("--append-system-prompt", preamble\)/);
+	});
+});
+
+/**
+ * Every selectable base prompt, not just the default one.
+ *
+ * `--base-prompt=v2` is arm-neutral by intent, and intent is what CLAUDE.md says is
+ * worth nothing: "a documented check is not an executed check". The invariant is that
+ * a *v2* run of codemode, vanilla and claude-code on one task all record the same
+ * `basePromptDigest`. Three ways that could break silently, each pinned below: a
+ * runner not threading the version into `buildBase`; the sweep handing the flag to
+ * some arms and not others; a v2 run reusing the v1 baseline's runId and overwriting
+ * the thing it is being compared against.
+ */
+describe("every base prompt version is byte-identical across arms", () => {
+	const digest = (s) => createHash("sha256").update(s).digest("hex").slice(0, 16);
+	const args = { supervisor: "X Y", apps: "  spotify — music" };
+
+	it("v1 is the default, so an unflagged run is the baseline", () => {
+		assert.equal(buildBase(args), buildBase({ ...args, version: "v1" }));
+		assert.equal(BASE_PROMPTS.v1, BASE_INSTRUCTIONS);
+	});
+
+	it("an unknown version throws instead of silently falling back to v1", () => {
+		// A run labelled with a condition it is not in is the failure this repo keeps
+		// finding — the L1-that-was-L4 and the b1-briefed-L1 arm, both of which produced
+		// plausible numbers under a false label.
+		assert.throws(() => buildBase({ ...args, version: "v3" }), /unknown base prompt/);
+	});
+
+	it("each version yields one digest, whichever arm asks for it", () => {
+		for (const version of Object.keys(BASE_PROMPTS)) {
+			// All three runners call the same `buildBase`; what this asserts is that the
+			// version is the *only* input besides the per-task substitutions, i.e. nothing
+			// arm-shaped can reach the string.
+			const digests = new Set([digest(buildBase({ ...args, version })), digest(buildBase({ ...args, version }))]);
+			assert.equal(digests.size, 1, `${version} is not stable`);
+		}
+	});
+
+	it("both runners thread the selected version into buildBase", () => {
+		for (const [label, src] of [["run-task", RUNNER], ["run-claude-code", CLAUDE_RUNNER]]) {
+			assert.match(src, /version: basePromptVersion/, `${label} builds the base prompt without the selected version`);
+			assert.match(src, /const basePromptVersion = \(\(\) => \{/, `${label} does not parse --base-prompt`);
+			assert.match(src, /if \(i < 0\) return "v1";/, `${label} does not default to v1`);
+		}
+	});
+
+	it("the sweep applies --base-prompt to every arm, never per-arm", () => {
+		// A per-arm base prompt is the 10x-length confound that already invalidated a
+		// result set in this project. The push must be guarded on the version only.
+		assert.match(SWEEP_SRC, /if \(basePromptVersion !== "v1"\) args\.push\(`--base-prompt=\$\{basePromptVersion\}`\);/);
+		assert.doesNotMatch(SWEEP_SRC, /arm === "\w+".*--base-prompt/, "sweep.mjs gates --base-prompt on the arm");
+	});
+
+	it("a non-default version lands in the runId, in all three id schemes", () => {
+		// runId collisions have twice overwritten already-reported runs here. v1 must
+		// contribute nothing, so existing baselines keep their names.
+		for (const [label, src] of [["run-task", RUNNER], ["run-claude-code", CLAUDE_RUNNER], ["sweep", SWEEP_SRC]]) {
+			assert.match(src, /basePromptVersion === "v1" \? "" : `__bp-\$\{basePromptVersion\}`/, `${label} runIds do not carry the base prompt version`);
+		}
+	});
+
+	it("no version leaks a tool-surface detail", () => {
+		// The same check the v1-only test above makes, over every version: the base is
+		// what makes the arms comparable, so a mention of code, files or schemas in it
+		// hands one arm guidance the others cannot use.
+		const forbidden = [/\bipython\b/i, /\bapi\/\b/, /json schema/i, /tool call/i, /function definition/i, /\bgrep\b/i];
+		for (const [version, text] of Object.entries(BASE_PROMPTS)) {
+			for (const pattern of forbidden) {
+				assert.equal(pattern.test(text), false, `${version} leaks a tool-surface detail: ${pattern}`);
+			}
+		}
+	});
+
+	it("no version carries MCP-Bench's economy pressure", () => {
+		for (const [version, text] of Object.entries(BASE_PROMPTS)) {
+			assert.equal(/ten to twenty|do not fetch broadly/i.test(text), false, `${version} imports q8's sampling advice`);
+		}
+	});
+
+	it("every version keeps the three outcome-deciding rules", () => {
+		// Not a topic check for its own sake: these three are the rules the corpus shows
+		// being ignored (date grounded from `phone` on 17/86 codemode runs), so a version
+		// that dropped one would be a different experiment under the same name.
+		for (const [version, text] of Object.entries(BASE_PROMPTS)) {
+			assert.match(text, /paginated/i, `${version} drops pagination`);
+			assert.match(text, /`phone` app/, `${version} drops the date-grounding rule`);
+			assert.match(text, /an API actually returned/, `${version} drops the grounding rule`);
+			assert.match(text, /complete-task API/, `${version} drops how to finish`);
+		}
+	});
+
+	it("v2 is the hierarchy rewrite it claims to be, not v1 with a new label", () => {
+		// The independent variable is *shape*: emphasis, a pre-completion checklist, and
+		// a worked example of the answer/no-answer call. If a later edit flattened it
+		// back, the measured v1-vs-v2 result would be attached to a prompt that no
+		// longer differs — so assert the shape, at the level the design specifies.
+		const v2 = BASE_PROMPTS.v2;
+		assert.match(v2, /^## IMPORTANT/m, "v2 has no marked top-level block");
+		assert.match(v2, /NEVER use your own clock/, "v2 does not promote the date rule");
+		assert.match(v2, /## Check all four before you call complete-task/, "v2 has no pre-completion checklist");
+		assert.match(v2, /NOT a question/, "v2 has no worked example of the answer/no-answer call");
+		// It is a shared prompt every arm pays for on every turn, so its size is part of
+		// the result. Bounded, not free: a rewrite that tripled the base would be
+		// measuring length as much as structure.
+		assert.ok(v2.length < BASE_INSTRUCTIONS.length * 2, `v2 is ${v2.length} chars against v1's ${BASE_INSTRUCTIONS.length}`);
 	});
 });
 

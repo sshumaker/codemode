@@ -321,6 +321,54 @@ describe("a variant run never overwrites the baseline it is compared against", (
 	});
 
 	it("the condition is recorded in meta.json, not inferred from the id", () => {
-		assert.match(RUNNER, /variants: \{ docsGate, navTools \}/);
+		// Field-wise, not the whole literal: `variants` accumulates conditions (the base
+		// prompt version joined it), and pinning the exact object made an unrelated
+		// addition look like a docs-gate regression.
+		assert.match(RUNNER, /variants: \{[^}]*\bdocsGate\b[^}]*\bnavTools\b[^}]*\}/);
+	});
+});
+
+describe("pyType: schema information must survive into the signature", () => {
+	it("anyOf collapses to a union, not Any", () => {
+		const t = normalizeTool({
+			name: "complete_task",
+			description: "Mark done.",
+			input_schema: {
+				type: "object",
+				properties: { answer: { anyOf: [{ type: "number" }, { type: "integer" }, { type: "string" }] } },
+			},
+		});
+		// Measured regression: this rendered `Any` — the only untyped parameter of
+		// 3,125 on AppWorld — because pyType had no anyOf/oneOf case.
+		assert.equal(t.params.find((p) => p.name === "answer").type, "float | int | str");
+	});
+
+	it("oneOf is handled the same way, and null makes it optional", () => {
+		const t = normalizeTool({
+			name: "x",
+			description: "d",
+			input_schema: {
+				type: "object",
+				properties: { v: { oneOf: [{ type: "string" }, { type: "null" }] } },
+			},
+		});
+		assert.equal(t.params.find((p) => p.name === "v").type, "str | None");
+	});
+
+	it("enum still wins over anyOf, and arrays still nest", () => {
+		const t = normalizeTool({
+			name: "y",
+			description: "d",
+			input_schema: {
+				type: "object",
+				properties: {
+					status: { type: "string", enum: ["success", "fail"] },
+					ids: { type: "array", items: { type: "integer" } },
+				},
+			},
+		});
+		const by = Object.fromEntries(t.params.map((p) => [p.name, p.type]));
+		assert.equal(by.status, 'Literal["success", "fail"]');
+		assert.equal(by.ids, "list[int]");
 	});
 });

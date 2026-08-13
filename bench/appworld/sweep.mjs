@@ -23,6 +23,11 @@
  *                          api/<pkg>/DOCS.md, `inline` puts the docstring and the
  *                          nearest siblings in the error
  *   --codemode-nav-tools   give codemode read/grep/find/ls as well as ipython
+ *
+ * Arm-neutral, and applied to every arm at once:
+ *   --base-prompt=v1|v2   which shared base prompt all arms receive (default v1).
+ *                         v2 is the hierarchy/checklist rewrite; see prompts.mjs.
+ *                         Lands in the runId as __bp-v2.
  * Each lands in the runId (__gate-<mode>, __nav), so a variant run never
  * overwrites the baseline run it is being compared against.
  *
@@ -43,6 +48,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { docsGateMode } from "../generate.mjs";
 import { pool } from "../pool.mjs";
+import { BASE_PROMPTS } from "./prompts.mjs";
 import { prewarm } from "./prewarm.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -88,6 +94,26 @@ function parseDocsGate() {
 }
 const codemodeDocsGate = parseDocsGate();
 const codemodeNavTools = has("codemode-nav-tools");
+/**
+ * --base-prompt=v1|v2 — the shared base prompt, applied to EVERY arm in the sweep.
+ *
+ * Unlike the codemode variants above this is not per-arm and must never become so:
+ * the base prompt being byte-identical across arms is the fairness invariant the
+ * whole three-arm comparison rests on, and a flag that could set it for one arm only
+ * would be a loaded gun pointed at that invariant. It is validated here as well as in
+ * the runners so a typo fails before 46 tasks run.
+ */
+const basePromptVersion = (() => {
+	const i = argv.findIndex((a) => a === "--base-prompt" || a.startsWith("--base-prompt="));
+	if (i < 0) return "v1";
+	const value = argv[i].includes("=") ? argv[i].split("=").slice(1).join("=") : argv[i + 1];
+	if (!BASE_PROMPTS[value]) {
+		console.error(`unknown --base-prompt: ${value} (have ${Object.keys(BASE_PROMPTS).join("|")})`);
+		process.exit(2);
+	}
+	return value;
+})();
+const basePromptSuffix = basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`;
 /**
  * The vanilla preamble must match the residency it is describing.
  *
@@ -172,7 +198,7 @@ for (const task of tasks ?? []) {
 				arm === "codemode"
 					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}`
 					: "";
-			const base = `${task}__${arm}__${residency}${suffix}${variantSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+			const base = `${task}__${arm}__${residency}${suffix}${variantSuffix}${basePromptSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 			cells.push({ task, arm, residency, vanillaPromptName, repeat: r, runId: repeat > 1 ? `${base}__r${r}` : base });
 		}
 	}
@@ -206,6 +232,8 @@ async function runCell(cell) {
 		if (codemodeNavTools) args.push("--nav-tools");
 	}
 	if (cell.arm === "vanilla") args.push("--vanilla-prompt", cell.vanillaPromptName);
+	// Every arm, unconditionally — see the comment on basePromptVersion.
+	if (basePromptVersion !== "v1") args.push(`--base-prompt=${basePromptVersion}`);
 	if (flag("max-cost")) args.push("--max-cost", flag("max-cost"));
 	if (flag("timeout")) args.push("--timeout", flag("timeout"));
 

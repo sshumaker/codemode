@@ -127,7 +127,42 @@ export const BASE_INSTRUCTIONS = [
  * forbidding the clock. Nothing else here is new information.
  *
  * Byte-identity across arms is the fairness invariant, asserted in
- * bench/test/appworld-fairness.test.mjs for v2 as well as v1.
+ * bench/test/appworld-fairness.test.mjs for v2 as well as v1, and confirmed live: a
+ * 3-arm v2 run of 277d81d_3 records basePromptDigest f59d62b343083ae6 for codemode,
+ * vanilla and claude-code alike.
+ *
+ * MEASURED — codemode, Opus 5, the 46 tasks baseline codemode failed, one rep each,
+ * against the noise floor (that same baseline re-run twice on those tasks, 34/92 =
+ * 37.0%; docs/MORNING-REPORT-2026-08-13.md §B). Size: 2,529 -> 3,960 chars (+57%).
+ *
+ *   pass rate            25/46 = 54.3% vs 37.0%   +17.4pp  two-proportion z=1.95 p=0.052
+ *   paired vs floor mean                          +0.174   t=2.70 p=0.0098, sign 16/19 p=0.004
+ *   grounded the date    80.4% vs 32.6%           +47.8pp  z=5.30  p<1e-6
+ *   over-answered         0.0% vs 13.0%           -13.0pp  z=-2.56 p=0.010
+ *   cost/task            $0.253 vs $0.225         +$0.027  t=2.68 p=0.010, sign 33/46 p=0.005
+ *
+ * 16 tasks improved, 3 regressed, 27 unchanged. **The behavioural effect is far
+ * larger and far surer than the score effect**: the date rule went from ignored to
+ * obeyed (z=5.3) and the over-answer bug — 6 of codemode's 46 failures — went to
+ * zero, all six of those tasks now passing with `answer` omitted. Score moves less
+ * because most remaining failures have causes v2 deliberately does not address
+ * (window semantics on a53a8fd_*, the WishListEntry grader trap on 9871968_1); those
+ * would need reference-fitting, which is out of bounds.
+ *
+ * Read the headline honestly: **the unpaired z is p=0.052, i.e. marginal.** The
+ * paired test is significant and is the better instrument here (task difficulty
+ * cancels), and the two agree in direction, but a variant whose primary test lands on
+ * the line is not "a win" — it is a real effect measured at the edge of this sample's
+ * power. It also costs 12% more per task, significantly.
+ *
+ * Two things this sample CANNOT tell you, both to be closed before v2 becomes the
+ * default:
+ *   - **Over-correction is untested.** Only 1 of these 46 tasks has a non-null ground
+ *     truth answer (11% of the corpus overall does), so "v2 never over-answers" is
+ *     measured while "v2 still answers when asked" is essentially not. Re-run on a
+ *     question-heavy slice before adopting.
+ *   - **Only codemode was measured.** The prompt is shared, so vanilla and
+ *     claude-code must be re-measured too — v1's date rule was ignored by all three.
  */
 export const BASE_INSTRUCTIONS_V2 = [
 	"You are an AI assistant completing a day-to-day task for your supervisor,",
