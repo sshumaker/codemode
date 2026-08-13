@@ -65,7 +65,24 @@ Required in both arms, sharing one implementation, so only the invocation
 surface differs:
 
 - `vanilla`: a `task(prompt)` tool returning text into the transcript.
-- `codemode`: `result = await spawn(prompt)` in the kernel, returning a value.
+- `codemode`: `spawn(prompt, name=...)` in the kernel, returning immediately.
+
+> **REVISED 2026-08-13.** This section originally specified
+> `result = await spawn(prompt)` — a blocking await. That is wrong and the jobs
+> runtime is why: a blocking await holds the single-threaded kernel for the
+> child's entire lifetime, which is the exact failure the runtime exists to
+> prevent, and the cell watchdog would now interrupt it at 120s. Subagents are
+> not a parallel mechanism to jobs; **they are jobs**:
+>
+> ```python
+> spawn("fix the failing tests", name="test-fixer")   # detached, file-backed
+> jobs.wait(wake_after=60)                            # last statement, ends turn
+> jobs.get("test-fixer").output                       # collect next turn
+> ```
+>
+> This inherits durability, kernel-death recovery, the manifest, the guards, the
+> watchdog and completion notifications — all already built and tested — and it
+> is still one module, so the representation claim below is unaffected.
 
 Same child model, step cap, token budget, and system prompt. **Fresh kernel per
 subagent, serializable handoff only** — sharing the parent namespace destroys
