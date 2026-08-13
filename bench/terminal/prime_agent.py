@@ -214,6 +214,16 @@ class PrimeAgent(BaseAgent):
             # timeout so the two can never drift out of sync.
             env["HARNESS_CELL_CEILING"] = str(
                 int(env["HARNESS_CELL_TIMEOUT_MS"]) // 1000)
+            # Early wedge-suspect trip (docs §8.4). The ceiling backstop above only
+            # fires at ~585s, so the mailman daemon-pipe wedge holds the kernel that
+            # whole span before it is taught. A true wedge blocks forever, so
+            # tripping at 120s is identical in correctness and cuts ~465s of dead
+            # kernel per wedge. 120s sits above the largest measured *legitimate*
+            # foreground compute (cartpole's ~72s train, §8.4) with headroom; longer
+            # real builds background themselves or finish foreground in <35s. The
+            # clamp in the prelude keeps this <= the ceiling backstop.
+            env["HARNESS_WEDGE_SUSPECT_SECONDS"] = os.environ.get(
+                "HARNESS_WEDGE_SUSPECT_SECONDS", "120")
         return env
 
     @staticmethod

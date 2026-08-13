@@ -1082,3 +1082,111 @@ cannot prevent it (the agent never submits it), and the ceiling watchdog makes t
 inevitable wedge *recoverable and taught* rather than a silent kill — a mitigation,
 not a cure. Both are honest, and neither is a score/cost win on a self-mitigating
 model like Opus.
+
+## 8.4 Tripping earlier — the aggressive wedge-suspect threshold (#24)
+
+§8.3 left the watchdog firing at ceiling−margin (585s): recoverable and taught, but
+the ~585s kernel hold is paid on *every* wedge. #24 asks whether it can trip earlier
+to cut that hold without false-positiving legitimately long *foreground* compute. The
+lead's framing decides the bias: a false positive costs **one re-run** and the
+interrupt correctly names `jobs.submit` — the right move for a long foreground command
+in a single-threaded kernel anyway; a true wedge blocks *forever*, so firing at 120s
+vs 585s is identical in correctness and saves ~465s of dead kernel. So the question is
+not "the safest threshold" but "the most aggressive one that clears the real
+foreground-compute surface."
+
+### The false-positive surface — measured, five compute-heavy tasks (codemode OFF, Opus 5)
+
+Per-cell wall-clock from `trajectory.jsonl` (`_t` is epoch seconds; end−start of each
+`ipython` tool call). Cells split three ways: a blocking `sleep`-poll (which the
+runtime *wants* to interrupt — a true positive, not a cost), a backgrounded build
+(`nohup`/`jobs.submit`, kernel not held), and **legitimate foreground compute** (the
+only thing an early trip could wrongly kill). Surface = the longest foreground-compute
+cell:
+
+| task | longest FG-compute cell | what it was | wedged? | OFF verdict |
+|---|---|---|---|---|
+| `cartpole-rl-training` (§8.2) | **72.4s** | `timeout 3000 python train.py` foreground | no | PASS |
+| `sqlite-with-gcov` | **50.2s** | `make -j$(nproc)` run **foreground** | no | PASS |
+| `compile-compcert` (§8.2) | 34.2s | apt install (build was backgrounded) | no | PASS |
+| `train-bpe-tokenizer` | 8.9s | BPE train (small corpus, fast) | no | PASS |
+| `gcc-compiler-optimization` | 5.9s | compile + `fib(40)`×5 in one script | no | PASS |
+
+**The largest legitimate foreground compute anyone ran was 72.4s** (cartpole's train).
+The nuance the classifier exposes: compcert's long holds (600s, 400s) were `sleep`-polls
+of a backgrounded build, *not* compute — interrupting those is desirable. And it is
+not true that Opus always backgrounds: **`sqlite` ran its `make -j` in the foreground
+(50.2s)** and still finished well under any plausible threshold. Every real build
+either backgrounds itself or finishes foreground in <75s.
+
+Oracle screens first (gradability): `gcc-compiler-optimization`, `sqlite-with-gcov`,
+`train-bpe-tokenizer` PASS; `build-cython-ext`, `build-stp` **fail the reference
+solution in this env** and were dropped (a REFERENCE-dirty tier, not an agent signal).
+
+### Decision: T = 120s, shipped aggressive
+
+120s sits **1.66× above the 72.4s maximum** and 4.9× below the 585s backstop. Per the
+lead's asymmetry it is the default: `HARNESS_WEDGE_SUSPECT_SECONDS=120`, set for the
+jobs-ON arm in `prime_agent.py`, read by the prelude watchdog which arms the SIGALRM at
+`min(suspect, ceiling−margin)` — the ceiling−margin trip is **kept as the hard
+backstop** and the suspect value can only clamp *down* to it, never up. `0` disables
+the early trip (pre-§8.4 behaviour). Implemented in `kernel-prelude.py`
+(`WEDGE_SUSPECT_SECONDS`, message reworded to distinguish an early suspect trip from
+the ceiling backstop while keeping the `held the kernel for` mark the detector keys
+on); three tests in `runtime/test_prelude.py`
+(`test_wedge_suspect_trips_early_and_arms_the_timer_at_the_suspect_value`,
+`_is_clamped_to_the_ceiling_backstop`, `_zero_leaves_the_ceiling_backstop_alone`).
+
+### Mailman before/after — the hold drops 585s → 120s (n=1 each, existence check)
+
+| | OFF `p8m-off` | ON+585-trip `p8m-on-fix` (§8.3) | ON+120-trip `p8m-on-fix2` |
+|---|---|---|---|
+| resolved | PASS | PASS | **PASS** |
+| wedged | True (bare kill) | taught @ **585.1s** | taught @ **120.2s** |
+| **kernel hold on the wedge** | ~600s | 585.1s | **120.2s** |
+| jobs adoption (cells) | 0 | 0 (found its own `/dev/null` fix) | **16** |
+| turns / wall-clock | 29 / 961s | 50 / 1165s | 37 / 1182s |
+| cost | $1.054 | $1.743 | $1.186 |
+
+The watchdog fired **once**, at 120.2s, on a genuine daemon-start block — the cell ran
+`su list -c "mailman start"` (starts the Mailman master runner in the foreground; the
+daemon holds the session, so the cell would have run to the ceiling). Confirmed a true
+wedge, not a false trip. The agent was taught and this time **adopted `jobs.submit`
+(16 cells)** rather than muddling, and the task still resolved. **The ~465s hold
+reduction is the win #24 asked for**, and it is deterministic — the watchdog trips at
+`fire_at` regardless of which cell blocks, so 585→120 is a clean mechanism comparison.
+(Wall-clock is unchanged because mailman's length is its ~37-turn recovery, not the one
+wedge; the point was never total time, it was dead kernel per wedge.)
+
+### Regression — the 120s trip false-positived nothing (`fp-off` vs `p8m-on-fix2`)
+
+| task | OFF | ON (120s live) | watchdog fired | longest FG-compute ON |
+|---|---|---|---|---|
+| `gcc-compiler-optimization` | PASS | **PASS** | no | 6.0s |
+| `sqlite-with-gcov` | PASS | **PASS** (jobs 0→8, backgrounded the build) | no | 2.0s |
+| `train-bpe-tokenizer` | PASS | **INVALID (A0 fail, see below)** | n/a | — |
+
+`compare-jobs.py`: **WEDGES OFF 0/3, ON 0/3.** No legitimate cell was interrupted; both
+valid ON runs PASS, and with jobs ON their foreground compute is *shorter* than OFF
+(the runtime backgrounds it), so the surface is even further from 120s. The threshold
+is safe against this corpus.
+
+### A separate bug found — not the threshold: `/app/tokenize.py` breaks A0
+
+`train-bpe-tokenizer` **failed preflight ON** (`jobs_staging.bound = false`), not
+because of the watchdog but because the task ships `/app/tokenize.py`, which **shadows
+the stdlib `tokenize`** that IPython's `executing` imports at prelude startup
+(`ImportError: cannot import name 'detect_encoding' from 'tokenize'`). The jobs runtime
+never binds, so per A0 discipline the ON run is **invalid and excluded**, not counted
+as a regression. OFF is unaffected (jobs-off does not stage the prelude), so its 8.9s
+surface number stands. Worth a follow-up: the prelude/`executing` import of a stdlib
+module is fragile to any task whose cwd contains a same-named `.py`. Orthogonal to #24.
+
+### Bottom line (#24 closed, aggressive)
+
+**Off 585s.** `HARNESS_WEDGE_SUSPECT_SECONDS=120` ships as the jobs-ON default. It cuts
+the mailman kernel hold from 585s to 120s (‑465s, taught, agent adopted `jobs.submit`,
+still PASS) and false-positives nothing across the measured foreground-compute surface
+(max legitimate foreground compute 72.4s, everything else backgrounded or <75s). The
+ceiling−margin trip remains the hard backstop beneath it. n=1 per cell — existence
+checks, not rates; all Opus 5.

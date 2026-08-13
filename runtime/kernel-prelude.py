@@ -712,10 +712,28 @@ _render_wait_signal_cleanly()
 # for this residue (§6). The gap was never that the backstop is missing — it is that
 # the harness kills the cell with a *bare* interrupt, which teaches nothing, so the
 # agent writes the same line again. This makes the backstop behave like every other
-# guard: fire just under the ceiling, interrupt the held cell, and name jobs.submit.
-# It is strictly better than today — the cell was already going to die at the ceiling
-# — so it adds no false positives, only a teaching moment where there was a silent
-# kill.
+# guard: interrupt the held cell and name jobs.submit.
+#
+# TWO trip points (docs §8.3, §8.4):
+#
+#   ceiling - margin  the HARD backstop. Fires just under the harness ceiling. A
+#                     cell that reaches this was going to be killed anyway, so it
+#                     adds no false positives — only a teaching moment where there
+#                     was a silent kill.
+#   WEDGE_SUSPECT     an AGGRESSIVE early trip. A true wedge blocks *forever*, so
+#                     interrupting it at 120s versus at the 585s backstop is
+#                     identical in correctness and saves the ~465s difference in
+#                     held kernel time — a cost paid on *every* real wedge (mailman's
+#                     daemon-pipe holds the kernel the full span otherwise, §8.3).
+#                     The asymmetry favours firing early: a false positive costs one
+#                     re-run, and the interrupt correctly names jobs.submit — which
+#                     is the right move for a genuinely long *foreground* command in
+#                     a single-threaded kernel anyway. Set from the measured
+#                     foreground-compute surface (§8.4): the longest legitimate
+#                     foreground compute observed was cartpole's ~72s train; every
+#                     real build (compcert, gcc, sqlite) was either backgrounded or
+#                     finished foreground in <35s. 0 = disabled, i.e. the ceiling
+#                     backstop is the only trip (the pre-§8.4 behaviour).
 #
 # SIGALRM, not a watchdog thread: the interrupt must land in the main thread where
 # the cell is blocked, and a thread cannot raise there. Armed only for the span of a
@@ -724,6 +742,9 @@ _render_wait_signal_cleanly()
 # unless the harness declares its ceiling, and on any platform without setitimer.
 CELL_CEILING = int(os.environ.get("HARNESS_CELL_CEILING", "0"))  # 0 = disabled
 CELL_CEILING_MARGIN = int(os.environ.get("HARNESS_CELL_CEILING_MARGIN", "15"))
+# Early wedge-suspect trip. Clamped to the ceiling backstop so it can never fire
+# later than it. 0 = disabled (ceiling backstop only).
+WEDGE_SUSPECT_SECONDS = int(os.environ.get("HARNESS_WEDGE_SUSPECT_SECONDS", "0"))
 _current_cell = {"src": ""}
 
 
@@ -741,7 +762,11 @@ def _install_cell_watchdog():
     if ip is None or not hasattr(ip, "events"):
         return
 
-    fire_at = max(1, CELL_CEILING - CELL_CEILING_MARGIN)
+    ceiling_trip = max(1, CELL_CEILING - CELL_CEILING_MARGIN)
+    fire_at = ceiling_trip
+    if WEDGE_SUSPECT_SECONDS > 0:
+        fire_at = max(1, min(WEDGE_SUSPECT_SECONDS, ceiling_trip))
+    early = fire_at < ceiling_trip
 
     def on_alarm(signum, frame):
         signal.setitimer(signal.ITIMER_REAL, 0)  # disarm first: no re-entry
@@ -750,11 +775,17 @@ def _install_cell_watchdog():
             if ln.strip() and not ln.strip().startswith("%%")
         ]
         suggestion = lines[0][:80] if lines else "your command"
+        tail = (
+            f"long enough to suspect it is blocked rather than computing"
+            if early else
+            f"so it was stopped just before the {CELL_CEILING}s ceiling"
+        )
         raise RuntimeError(_redirect(
-            f"this cell held the kernel for {fire_at}s without returning, so it was stopped "
-            f"just before the {CELL_CEILING}s ceiling. Something in it blocks the kernel — a "
-            f"server or daemon started in the foreground, a `| tail`/`| cat` reading a process "
-            f"that never closes its output, or a blocking read waiting on work that has not finished",
+            f"this cell held the kernel for {fire_at}s without returning, {tail}. Something in "
+            f"it blocks the kernel — a server or daemon started in the foreground, a "
+            f"`| tail`/`| cat` reading a process that never closes its output, or a blocking "
+            f"read waiting on work that has not finished. If it is real foreground work that "
+            f"needs this long, it belongs in a job so the kernel is not held",
             suggestion,
         ))
 

@@ -543,7 +543,8 @@ class TestCellWatchdog(PreludeBase):
         import signal
         self._orig_alarm = signal.getsignal(signal.SIGALRM)
         self._saved_env = {k: os.environ.get(k) for k in
-                           ("HARNESS_CELL_CEILING", "HARNESS_CELL_CEILING_MARGIN")}
+                           ("HARNESS_CELL_CEILING", "HARNESS_CELL_CEILING_MARGIN",
+                            "HARNESS_WEDGE_SUSPECT_SECONDS")}
 
     def tearDown(self):
         import signal
@@ -586,6 +587,70 @@ class TestCellWatchdog(PreludeBase):
         self.assertIn("jobs.help()", msg)
         self.assertIn("585s", msg)                        # 600 - 15
         self.assertIn("mailman --run-as-root start", msg)  # the agent's own line
+
+    def test_wedge_suspect_trips_early_and_arms_the_timer_at_the_suspect_value(self):
+        # docs §8.4: the aggressive early trip. With a suspect threshold below the
+        # ceiling backstop, both the ARMED timer and the alarm MESSAGE must use the
+        # suspect value, not the ~585s backstop — otherwise the kernel is held the
+        # full span before the agent is taught.
+        os.environ["HARNESS_CELL_CEILING"] = "600"
+        os.environ["HARNESS_CELL_CEILING_MARGIN"] = "15"
+        os.environ["HARNESS_WEDGE_SUSPECT_SECONDS"] = "120"
+        import signal
+        armed = []
+        real_setitimer = signal.setitimer
+        signal.setitimer = lambda which, secs, *a: armed.append(secs) or real_setitimer(which, 0)
+        try:
+            ip = FakeIPython()
+            mod = load_prelude(namespace_holder=ip)
+            arm = ip.events.callbacks["pre_run_cell"][0]
+
+            class Info:
+                raw_cell = "mailman start 2>&1 | tail -5"
+            arm(Info())
+            # The timer is armed at the suspect value, not 585.
+            self.assertIn(120, [round(s) for s in armed if s])
+            handler = signal.getsignal(signal.SIGALRM)
+            with self.assertRaises(RuntimeError) as ctx:
+                handler(signal.SIGALRM, None)
+        finally:
+            signal.setitimer = real_setitimer
+        msg = str(ctx.exception)
+        self.assertIn("120s", msg)
+        self.assertIn("jobs.submit", msg)
+        self.assertNotIn("585s", msg)
+        self.assertNotIn("600s ceiling", msg)  # not the backstop phrasing
+
+    def test_wedge_suspect_is_clamped_to_the_ceiling_backstop(self):
+        # A misconfigured suspect ABOVE the backstop must never delay the trip past
+        # the ceiling backstop — it clamps down to 585, never up.
+        os.environ["HARNESS_CELL_CEILING"] = "600"
+        os.environ["HARNESS_CELL_CEILING_MARGIN"] = "15"
+        os.environ["HARNESS_WEDGE_SUSPECT_SECONDS"] = "5000"
+        ip = FakeIPython()
+        mod = load_prelude(namespace_holder=ip)
+        mod._current_cell["src"] = "some_blocking_thing"
+        import signal
+        handler = signal.getsignal(signal.SIGALRM)
+        with self.assertRaises(RuntimeError) as ctx:
+            handler(signal.SIGALRM, None)
+        msg = str(ctx.exception)
+        self.assertIn("585s", msg)          # clamped to the backstop
+        self.assertNotIn("5000s", msg)
+
+    def test_wedge_suspect_zero_leaves_the_ceiling_backstop_alone(self):
+        # 0 = disabled: identical to the pre-§8.4 behaviour, trip at ceiling-margin.
+        os.environ["HARNESS_CELL_CEILING"] = "600"
+        os.environ["HARNESS_CELL_CEILING_MARGIN"] = "15"
+        os.environ["HARNESS_WEDGE_SUSPECT_SECONDS"] = "0"
+        ip = FakeIPython()
+        mod = load_prelude(namespace_holder=ip)
+        mod._current_cell["src"] = "daemon start | tail"
+        import signal
+        handler = signal.getsignal(signal.SIGALRM)
+        with self.assertRaises(RuntimeError) as ctx:
+            handler(signal.SIGALRM, None)
+        self.assertIn("585s", str(ctx.exception))
 
     def test_it_interrupts_a_genuinely_blocked_cell(self):
         # End to end: arm the real timer, block in select, and confirm the interrupt
