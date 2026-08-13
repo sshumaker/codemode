@@ -343,3 +343,48 @@ export function buildVanillaPreamble(variant, ctx) {
 	if (!spec) throw new Error(`unknown vanilla variant: ${variant} (have ${Object.keys(VANILLA_VARIANTS)})`);
 	return spec.build(ctx);
 }
+
+// --- claude-code -------------------------------------------------------------
+
+/**
+ * c1 — the real product, consuming AppWorld's own MCP server.
+ *
+ * Deliberately `b1` with the names re-rendered in MCP's wire form and nothing
+ * else changed. This arm is the same residency condition as vanilla L4 — Claude
+ * Code registers every MCP tool up front, so all 469 schemas are resident on turn
+ * one — and the same representation (JSON tool-calling). What differs is the
+ * *product*: a different harness, its own system prompt, its own tool loop.
+ *
+ * So the guidance has to be matched to b1 clause for clause, exactly as b1/b2/b3
+ * are matched to each other. If this preamble said anything b1 does not, a
+ * claude-code-vs-vanilla difference would be partly a prompt difference, and the
+ * one thing this arm exists to isolate — harness, not surface — would be
+ * confounded on its first run.
+ *
+ * The only content that is genuinely new is the tool-name prefix, which the agent
+ * cannot guess: Claude Code namespaces MCP tools as `mcp__<server>__<tool>`, and
+ * the server is registered as `appworld`.
+ */
+export const CLAUDE_VARIANTS = {
+	c1: {
+		note: "L4-equivalent: every MCP tool schema resident; matched to vanilla b1",
+		build: ({ toolCount, serverCount }) =>
+			[
+				"## Your tools",
+				"",
+				`${toolCount} functions are available to you, covering every API of the`,
+				`${serverCount} apps. They come from the \`appworld\` MCP server, so each is`,
+				"named `mcp__appworld__<app>__<api>` — `mcp__appworld__spotify__login` is the",
+				"Spotify app's login API. Their full parameter schemas are already in front",
+				"of you; you do not need to look anything up before calling.",
+				"",
+				...VANILLA_SHARED_GUIDANCE,
+			].join("\n"),
+	},
+};
+
+export function buildClaudePreamble(variant, ctx) {
+	const spec = CLAUDE_VARIANTS[variant];
+	if (!spec) throw new Error(`unknown claude-code variant: ${variant} (have ${Object.keys(CLAUDE_VARIANTS)})`);
+	return spec.build(ctx);
+}

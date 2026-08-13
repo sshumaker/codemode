@@ -12,11 +12,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { generate } from "../generate.mjs";
-import { BASE_INSTRUCTIONS, VANILLA_VARIANTS, VARIANTS, buildBase, buildPreamble, buildVanillaPreamble } from "../appworld/prompts.mjs";
+import { BASE_INSTRUCTIONS, VANILLA_VARIANTS, VARIANTS, buildBase, buildClaudePreamble, buildPreamble, buildVanillaPreamble } from "../appworld/prompts.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const CATALOGUE = join(ROOT, "bench/data/appworld-schemas.json");
 const RUNNER = readFileSync(join(ROOT, "bench/appworld/run-task.mjs"), "utf8");
+const CLAUDE_RUNNER = readFileSync(join(ROOT, "bench/appworld/run-claude-code.mjs"), "utf8");
 const SERVER = readFileSync(join(ROOT, "bench/appworld/env-server.py"), "utf8");
 const haveCatalogue = existsSync(CATALOGUE);
 
@@ -346,5 +347,102 @@ describe("the vanilla preamble matches the residency it describes", () => {
 		assert.match(SWEEP, /residency === "L1" \? "b2"/);
 		// …and the per-cell value must reach the runner, not a module-level constant.
 		assert.match(SWEEP, /"--vanilla-prompt", cell\.vanillaPromptName/);
+	});
+});
+
+/**
+ * The claude-code arm: the real product, consuming AppWorld's native MCP server.
+ *
+ * Every invariant here is one this arm could break silently, in a way that would
+ * still produce a number. It is the third arm's version of the checks above, plus
+ * two that only it can fail — reaching the world without going through MCP, and
+ * being graded on a world nobody bound.
+ */
+describe("claude-code arm", () => {
+	const ctx = { toolCount: 469, serverCount: 11 };
+
+	it("gets the same base prompt as every other arm, from buildBase", () => {
+		assert.match(CLAUDE_RUNNER, /const basePrompt = buildBase\(/);
+		assert.equal((CLAUDE_RUNNER.match(/"--system-prompt",/g) ?? []).length, 1);
+		assert.match(CLAUDE_RUNNER, /basePromptDigest: digest\(basePrompt\)/);
+	});
+
+	it("c1 carries vanilla's shared guidance byte-identically", () => {
+		// c1 is the same residency and the same representation as b1; the variable is
+		// the product. Any guidance here that b1 lacks would confound that on run one.
+		const shared = buildVanillaPreamble("b1", ctx).split("\n").slice(-4).join("\n");
+		assert.ok(buildClaudePreamble("c1", ctx).endsWith(shared), "c1 has drifted from the vanilla shared guidance");
+	});
+
+	it("c1 claims residency, because Claude Code registers every MCP tool up front", () => {
+		assert.match(buildClaudePreamble("c1", ctx), /already in front|do not need to look anything up/i);
+	});
+
+	it("c1 names the tools the way Claude Code actually namespaces them", () => {
+		// The one thing the agent cannot guess. A wrong prefix reads as a weak agent.
+		assert.match(buildClaudePreamble("c1", ctx), /mcp__appworld__<app>__<api>/);
+	});
+
+	it("gets no shell unless a run explicitly asks to measure the bypass", () => {
+		assert.match(CLAUDE_RUNNER, /const builtins = allowBash \? "Read,Edit,Bash" : "Read,Edit"/);
+	});
+
+	it("keeps the dead egress proxy the other arms run behind", () => {
+		assert.match(CLAUDE_RUNNER, /HARNESS_ALLOW_DIRECT_NET/);
+		assert.match(CLAUDE_RUNNER, /http_proxy: "http:\/\/127\.0\.0\.1:9"/);
+	});
+
+	it("runs Claude Code with CLAUDE.md discovery and hooks off", () => {
+		// The run directory lives inside this repo, whose CLAUDE.md describes the
+		// experiment the agent is a subject of. --bare is what stops it being read.
+		assert.match(CLAUDE_RUNNER, /"--bare"/);
+		assert.match(CLAUDE_RUNNER, /"--strict-mcp-config"/);
+	});
+
+	it("asserts the arm reached its own transport, rather than assuming the flag worked", () => {
+		// The MCP-Bench L1 lesson: 70 turns, 78 tool calls, 0 reaching the transport,
+		// under a label that said otherwise. A guard on residency did not catch it.
+		assert.match(CLAUDE_RUNNER, /status === "connected"/);
+		assert.match(CLAUDE_RUNNER, /mcpToolsAdvertised/);
+		assert.match(CLAUDE_RUNNER, /armViolation/);
+	});
+
+	it("counts turns and tokens per message, not per streamed block", () => {
+		// Claude Code emits one assistant event per content block, each repeating the
+		// message's usage: summing per event reported 29 turns for 8, and 2.2M
+		// cache-read tokens for 597k.
+		assert.match(CLAUDE_RUNNER, /!counted\.has\(message\.id\)/);
+		// …and output_tokens on those events is partial (27 streamed against 4,854
+		// actual), so the totals must come from the result event.
+		assert.match(CLAUDE_RUNNER, /summary\.output = usage\.output_tokens/);
+	});
+
+	it("logs every API call with its response, off the wire", () => {
+		// Upstream's MCP server does not log, and AppWorld's api_calls.jsonl records no
+		// response — so a verdict would not be re-derivable after the world is gone.
+		assert.match(CLAUDE_RUNNER, /startCallProxy/);
+		assert.match(CLAUDE_RUNNER, /env-calls\.jsonl/);
+		// Setup and grading must NOT go through the recorder, or the agent's call count
+		// silently includes the harness's own traffic.
+		assert.match(CLAUDE_RUNNER, /startEnvServer\(`http:\/\/127\.0\.0\.1:\$\{apisPort\}`\)/);
+		assert.match(CLAUDE_RUNNER, /buildMcpConfig\(`http:\/\/127\.0\.0\.1:\$\{proxyPort\}`\)/);
+	});
+
+	it("is graded by the same verifier, on a world bound through AppWorld's own remote mode", () => {
+		assert.match(CLAUDE_RUNNER, /"--remote-apis-url", apisUrl/);
+		assert.match(CLAUDE_RUNNER, /post\(envPort, "\/evaluate", \{\}\)/);
+		assert.match(SERVER, /remote_apis_url=args\.remote_apis_url/);
+	});
+
+	it("pins the venv interpreter into the MCP config", () => {
+		// build_mcp_config takes `command` from shutil.which("python"), which on this
+		// machine resolves to a python without appworld installed. The stdio server then
+		// dies on import and, because its stderr goes nowhere, the client hangs forever
+		// rather than failing.
+		assert.match(CLAUDE_RUNNER, /params\.command = PYTHON/);
+	});
+
+	it("asks for content_only, so the payload is not counted into context twice", () => {
+		assert.match(CLAUDE_RUNNER, /output_type='content_only'/);
 	});
 });

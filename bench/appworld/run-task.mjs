@@ -7,6 +7,8 @@
  *   arms      codemode | vanilla | notools
  *   options   --residency L0|L1|L2|L4  --prompt a1  --vanilla-prompt b1|b2
  *             --timeout 900  --max-cost 1.0  --run-id X  --force
+ *             --docs-gate[=redirect|inline]  --nav-tools
+ *                                     (codemode only; both default OFF)
  *
  * Per-run artefacts under .run/appworld/<runId>/ — the answer to "could I
  * re-derive this verdict tomorrow, after the environment has been reset?":
@@ -34,7 +36,7 @@ import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { generate, renderFullDocs, renderTocLines } from "../generate.mjs";
+import { docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
 import { buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -96,7 +98,55 @@ const maxCost = Number(flag("max-cost", 3.0));
 const promptName = flag("prompt", "a1");
 const vanillaPromptName = flag("vanilla-prompt", residency === "L1" ? "b2" : residency === "predicted" ? "b3" : "b1");
 const promptSuffix = arm === "codemode" ? `__${promptName}` : arm === "vanilla" ? `__${vanillaPromptName}` : "";
-const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
+
+/**
+ * Two opt-in codemode variants, both OFF by default and both A/B'd before they
+ * become anything.
+ *
+ * --docs-gate[=redirect|inline]
+ *              First use of an API is answered with documentation instead of a
+ *              result. Motivated by a measured loss: on 4242c97_1 the agent read
+ *              only api/INDEX.md, whose one-liner for `complete_task` reads "Mark
+ *              the currently active task as complete with the given answer", and
+ *              volunteered answer="navy blue" where the ground truth wanted none.
+ *              The file it never opened says to pass an answer only if the task
+ *              asks a question. A summary is where the task was lost.
+ *
+ *              `redirect` (the default, and the primary form) sends the agent to
+ *              api/<pkg>/DOCS.md and inlines nothing: the file carries the app's
+ *              conventions, its siblings and its structure, which a single
+ *              docstring cannot, and going to read a file is in-distribution
+ *              behaviour. It costs one extra turn, which is what the A/B prices.
+ *              `inline` is the alternate — docstring plus nearest siblings in the
+ *              message — so the two can be compared rather than assumed.
+ * --nav-tools  Adds prime's read/grep/find/ls to the codemode tool list, so
+ *              looking at the tree is not something that has to be spelled as a
+ *              shell escape inside a cell. NOT bash: a shell is an escape hatch
+ *              out of the surface under test, and 78% of vanilla's bash calls on
+ *              MCP-Bench were `curl` straight to the APIs its tools wrapped.
+ *
+ * Each appears in the runId, because a variant run that overwrites the run it is
+ * being compared against destroys the comparison — the runId-collision failure
+ * this file already guards against.
+ */
+function parseDocsGate() {
+	const i = argv.findIndex((a) => a === "--docs-gate" || a.startsWith("--docs-gate="));
+	if (i < 0) return "off";
+	// `--docs-gate=inline`, `--docs-gate inline`, and a bare `--docs-gate` (the
+	// primary form). An unknown mode throws rather than degrading to off: a run
+	// labelled with a mode it is not in is the failure this project keeps finding.
+	if (argv[i].includes("=")) return docsGateMode(argv[i].split("=").slice(1).join("="));
+	const next = argv[i + 1];
+	return docsGateMode(next && !next.startsWith("--") ? next : "redirect");
+}
+const docsGate = parseDocsGate();
+const navTools = argv.includes("--nav-tools");
+if ((docsGate !== "off" || navTools) && arm !== "codemode") {
+	console.error(`--docs-gate/--nav-tools apply to the codemode arm only, got arm=${arm}`);
+	process.exit(2);
+}
+const variantSuffix = `${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}`;
+const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}${variantSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
 const runDir = join(ROOT, ".run/appworld", runId);
 
 // Never silently overwrite a completed run. A runId scheme change once replaced
@@ -133,7 +183,7 @@ mark("startedAt");
 
 const catalogueRaw = readFileSync(CATALOGUE, "utf8");
 const { catalogue, appworldDataVersion, withResponseSchemas } = JSON.parse(catalogueRaw);
-const { toolDefs, tocLines, names, files, normalized } = generate(catalogue);
+const { toolDefs, tocLines, names, files, normalized } = generate(catalogue, { docsGate });
 
 if (arm === "codemode") {
 	for (const [rel, content] of Object.entries(files)) {
@@ -324,6 +374,10 @@ else if (arm === "vanilla") {
 	// under test. codemode keeps `%%bash` inside a cell, which is part of what
 	// "code as the action space" means; a separate bash tool is not.
 	toolList = ["ipython"];
+	// --nav-tools: read-only navigation of the api/ tree the arm already has.
+	// Still no bash, edit or write — the one-transport invariant is about egress,
+	// and none of these four can reach the network.
+	if (navTools) toolList = [...toolList, "read", "grep", "find", "ls"];
 }
 
 const digest = (s) => createHash("sha256").update(s).digest("hex").slice(0, 16);
@@ -335,6 +389,7 @@ writeFileSync(
 			runId,
 			arm,
 			residency,
+			variants: { docsGate, navTools },
 			// The two halves, separately, so "was the base identical?" is a diff and
 			// not an argument.
 			basePrompt,
@@ -373,6 +428,9 @@ const meta = {
 		withResponseSchemas,
 	},
 	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
+	// Which opt-in codemode variants were on. A run compared against another must
+	// be able to say which condition it was in without re-reading the api/ tree.
+	variants: { docsGate, navTools },
 	basePromptDigest: digest(basePrompt),
 	preambleChars: preamble.length,
 	toolCount: toolList.length,
@@ -442,6 +500,11 @@ async function main() {
 			HARNESS_MCP_SERVERS: catalogue.map((s) => s.server).join(","),
 			HARNESS_RUN_ID: runId,
 			HARNESS_RESIDENCY: residency,
+			// Provenance only. The gate itself is rendered into api/_client.py at
+			// generate time, not switched on here: the kernel is a grandchild process
+			// and an env var that failed to propagate would silently produce a
+			// gate-off run wearing a gate-on label.
+			...(docsGate === "off" ? {} : { HARNESS_DOCS_GATE: docsGate }),
 			...(predicted ? { HARNESS_TOOL_SUBSET: predicted.names.join(",") } : {}),
 			// AppWorld is entirely local, so there is no legitimate egress. A dead
 			// proxy for everything except the world and the model API is what stops an

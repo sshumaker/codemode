@@ -124,3 +124,55 @@ export function synthetic(count, server = "bulk") {
 		},
 	];
 }
+
+/**
+ * An app with enough APIs to trip the docs gate's neighbour bound (>20).
+ *
+ * Names deliberately share tokens the way a real app's do — `show_song_details`
+ * next to `show_song_library` and `create_playlist` — because the gate ranks
+ * siblings by shared name-tokens, and a fixture of unrelated names would let a
+ * broken ranking pass.
+ */
+export const wide = [
+	{
+		server: "wide",
+		tools: [
+			"show_song_details",
+			"show_song_library",
+			"show_song_reviews",
+			"show_song_lyrics",
+			"play_song",
+			"download_song",
+			"show_album_details",
+			"show_album_library",
+			"show_album_reviews",
+			"show_artist_details",
+			"show_artist_library",
+			"show_playlist_details",
+			"show_playlist_library",
+			"create_playlist",
+			"delete_playlist",
+			"update_playlist",
+			"show_queue",
+			"add_to_queue",
+			"clear_queue",
+			"login",
+			"logout",
+			"show_account",
+			"update_account",
+			"show_payment_cards",
+			"add_payment_card",
+		].map((name) => ({
+			name,
+			description: `${name.split("_").join(" ")} — one line about what it does.`,
+			inputSchema: {
+				type: "object",
+				properties: {
+					song_id: { type: "string", description: "Identifier." },
+					page_index: { type: "integer", description: "Page, from 0." },
+				},
+				required: ["song_id"],
+			},
+		})),
+	},
+];

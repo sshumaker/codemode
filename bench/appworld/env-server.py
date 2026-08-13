@@ -84,6 +84,22 @@ parser.add_argument("--arm", default="unknown")
 parser.add_argument("--experiment-name", default=None)
 parser.add_argument("--appworld-root", default=None)
 parser.add_argument(
+    "--remote-apis-url",
+    default=None,
+    help=(
+        "Bind this task's world to an already-running `appworld serve apis` instead of "
+        "holding the databases in this process. Required by the claude-code arm, whose "
+        "agent reaches the world through AppWorld's own MCP server — and an MCP server "
+        "is a separate process that can only share a world through the APIs server. "
+        "AppWorld's remote mode is exactly this: ApiCollection.setup() POSTs /dbs, which "
+        "points the APIs server at this task's databases (requester.py:374), and the MCP "
+        "server loads its ApiCollection with skip_setup=True against the same URL "
+        "(serve/_mcp.py:314) so it reads the world we bound rather than rebinding it. "
+        "Grading is unaffected: save_state()/evaluate() go through save_remote_dbs and "
+        "write the same on-disk dbs/ every other arm is graded from."
+    ),
+)
+parser.add_argument(
     "--max-api-calls-per-interaction",
     type=int,
     default=None,
@@ -256,6 +272,8 @@ def _open_world(ground_truth_mode: str) -> AppWorld:
         raise_on_failure=False,
         load_ground_truth=True,
         ground_truth_mode=ground_truth_mode,
+        # None keeps the in-process world every other arm uses.
+        remote_apis_url=args.remote_apis_url,
         **_extra,
     )
 
@@ -281,7 +299,10 @@ except Exception as exc:  # noqa: BLE001
     GROUND_TRUTH_MODE = "minimal"
 WORLD.__enter__()
 PHASES["world_ready"] = _REAL_TIME()
-log(f"[env-server] world ready: task={args.task_id} experiment={EXPERIMENT} ground_truth={GROUND_TRUTH_MODE}")
+log(
+    f"[env-server] world ready: task={args.task_id} experiment={EXPERIMENT} "
+    f"ground_truth={GROUND_TRUTH_MODE} apis={args.remote_apis_url or 'in-process'}"
+)
 
 
 def python_literal(value: object) -> str:
