@@ -126,3 +126,80 @@ The one-sentence version: **at full-suite scale, code-as-representation holds a
 directionally ahead on score but not significantly so (5W/2L/66T, p=0.45) at 5×
 codemode's cost; no prompt/tool variant we tried beat plain `off`; and the sharpest
 untested claim — subagents as one module vs nine tool schemas — is still unbuilt.**
+
+---
+
+# ADDENDUM (post-review) — the noise floor changes the conclusions
+
+Three corrections after Scott's review, each from an experiment the original report
+should have run first.
+
+## A. I introduced a selection bias; the numbers are re-split
+
+Running claude-code on "codemode's 46 failures" conditioned cc's corpus on codemode
+failing. Pooling that with the seeded ramp rigs the comparison. Split explicitly:
+
+**Unbiased — 73 tasks drawn by seed BEFORE any arm ran:**
+
+| arm | pass | paired |
+|---|---|---|
+| claude-code | 91.8% | cc vs codemode **4W/2L, sign p=0.69** |
+| codemode | 89.0% | codemode vs vanilla **4W/3L, sign p=1.00** |
+| vanilla | 87.7% | |
+
+Nothing significant. codemode and vanilla are dead even.
+
+**Enriched — 37 tasks selected because codemode failed (mechanism-hunting only,
+never scoring):** codemode 0/37 by construction, **vanilla 18/37 (49%), cc 25/37
+(68%)**. Codemode's failures are mostly NOT benchmark-ceiling — other arms solve
+them, so the missing quality is recoverable, not structural.
+
+## B. The noise floor: 37% of codemode's "failures" pass on re-run
+
+Baseline codemode, identical config, re-run x2 on the same 46 tasks it failed:
+**34/92 = 37% pass.** A third of every "failure" analysed in this report is
+flakiness. Tested against that floor:
+
+| arm/variant on the 46 | pass | vs floor | z | verdict |
+|---|---|---|---|---|
+| baseline re-run (floor) | 37.0% | — | — | — |
+| gate=redirect | 43.5% | +6.5pp | +0.74 | not significant, and costs 2.1x |
+| nav-tools | 32.6% | −4.3pp | −0.50 | not significant (below floor) |
+| **claude-code** | **65.2%** | **+28.3pp** | **+3.14** | **SIGNIFICANT** |
+
+Consequences:
+1. **Score at this scale is noise-dominated.** With a 37% re-pass rate the 4W/2L
+   and 22-vs-21 splits are unreadable. Cost (4x, t=-25.8, n=432) is the only
+   endpoint that survives.
+2. **`off` is confirmed the best config — now on hard tasks, not an underpowered
+   tie.** Neither variant beats a plain re-run. The gate's apparent +6.5pp is
+   inside one SE and costs 2.1x.
+3. **claude-code's edge on codemode-hard tasks is real** (~3 SE), and it is the one
+   quality signal in the whole dataset that survives the noise floor.
+
+## C. What the trace triage found (docs/CC-WINS-TRIAGE.md)
+
+- **3 of the 5 cc "wins" were tasks vanilla also failed** — so neither residency nor
+  representation explains them (wall-clock year vs in-world date; "last 2 days"
+  ambiguity). The vanilla control did the whole job; charging them to codemode would
+  have been the mis-diagnosis the /diagnose-run-fail skill exists to prevent.
+- The two that survive the control are **the same bug twice**: codemode passes
+  `answer=` on a non-question because at L0 it never opened `complete_task.py`.
+  **6 of codemode's 46 failures**, fixable in ~5 lines of the shared base prompt.
+- **Nothing on the punch list is a capability Claude Code has that we lack.** Items
+  1-4 are our own bugs/affordances. cc verifies more, thinks slightly more, costs 4x.
+- Where we lead: the jobs runtime (durable background work surviving kernel death)
+  and the cell watchdog — both untested here because AppWorld tasks are ~9 turns.
+
+## D. Where this leaves the thesis
+
+- **Cost: replicated and robust.** 4.0-4.7x, full suite, t=-25.8.
+- **Quality: no representation effect detectable at this horizon** — and with a 37%
+  noise floor, AppWorld cannot detect one. Chasing score here is spending against
+  noise.
+- **The open question moved.** It is no longer "does code beat tool-calling on
+  AppWorld" but "does the REPL's context formulation hold over hundreds of turns
+  where a tool-calling arm must compact and lose information". That is
+  terminal-bench, plus subagents (#34) and the context-management affordance work
+  (#35 category D) — where codemode currently UNDER-uses its own advantage
+  (re-fetching data it already holds; 32% duplicate calls on hard tasks).
