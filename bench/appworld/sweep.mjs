@@ -23,11 +23,22 @@
  *                          api/<pkg>/DOCS.md, `inline` puts the docstring and the
  *                          nearest siblings in the error
  *   --codemode-nav-tools   give codemode read/grep/find/ls as well as ipython
+ *   --codemode-api-layout[=consolidated]
+ *                          one module per app (api/gmail.py) instead of one file
+ *                          per method; call sites are identical in both
+ *   --codemode-validate-args
+ *                          check every call's arguments against the source MCP
+ *                          schema inside the agent's process, before the request
+ *                          is sent; a violation raises ArgumentError naming the
+ *                          argument and never reaches the server
  *
  * Arm-neutral, and applied to every arm at once:
  *   --base-prompt=v1|v2   which shared base prompt all arms receive (default v1).
  *                         v2 is the hierarchy/checklist rewrite; see prompts.mjs.
  *                         Lands in the runId as __bp-v2.
+ *   --catalogue <path>    the shared tool catalogue every arm is rendered from,
+ *                         e.g. an enriched one from bench/enrich-catalogue.mjs.
+ *                         Lands in the runId as __cat-<name>.
  * Each lands in the runId (__gate-<mode>, __nav), so a variant run never
  * overwrites the baseline run it is being compared against.
  *
@@ -44,9 +55,9 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { docsGateMode } from "../generate.mjs";
+import { apiLayout, docsGateMode } from "../generate.mjs";
 import { pool } from "../pool.mjs";
 import { BASE_PROMPTS } from "./prompts.mjs";
 import { prewarm } from "./prewarm.mjs";
@@ -94,6 +105,34 @@ function parseDocsGate() {
 }
 const codemodeDocsGate = parseDocsGate();
 const codemodeNavTools = has("codemode-nav-tools");
+const codemodeValidateArgs = has("codemode-validate-args");
+/**
+ * --codemode-api-layout[=consolidated] — one module per app instead of one file per
+ * method. Validated here as well as in the runner so a typo fails before 46 tasks run.
+ */
+const codemodeApiLayout = (() => {
+	const i = argv.findIndex((a) => a === "--codemode-api-layout" || a.startsWith("--codemode-api-layout="));
+	if (i < 0) return "per-method";
+	if (argv[i].includes("=")) return apiLayout(argv[i].split("=").slice(1).join("="));
+	const next = argv[i + 1];
+	return apiLayout(next && !next.startsWith("--") ? next : "consolidated");
+})();
+/**
+ * The shared catalogue, applied to EVERY arm — never per-arm, for the reason
+ * --base-prompt is never per-arm: one authored description rendered into four
+ * containers is the fairness mechanism, and a flag that could hand one arm better
+ * schemas than another would be aimed straight at it.
+ */
+const DEFAULT_CATALOGUE = "bench/data/appworld-schemas.json";
+const cataloguePath = flag("catalogue", DEFAULT_CATALOGUE);
+if (!existsSync(resolve(ROOT, cataloguePath))) {
+	console.error(`no such catalogue: ${cataloguePath}`);
+	process.exit(2);
+}
+const catalogueSuffix =
+	cataloguePath === DEFAULT_CATALOGUE
+		? ""
+		: `__cat-${cataloguePath.split("/").pop().replace(/\.json$/, "").replace(/[^a-z0-9]+/gi, "-")}`;
 /**
  * --base-prompt=v1|v2 — the shared base prompt, applied to EVERY arm in the sweep.
  *
@@ -196,9 +235,9 @@ for (const task of tasks ?? []) {
 			// look for a run that was written under a different name.
 			const variantSuffix =
 				arm === "codemode"
-					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}`
+					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}${codemodeValidateArgs ? "__val" : ""}${codemodeApiLayout === "per-method" ? "" : `__layout-${codemodeApiLayout}`}`
 					: "";
-			const base = `${task}__${arm}__${residency}${suffix}${variantSuffix}${basePromptSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
+			const base = `${task}__${arm}__${residency}${suffix}${variantSuffix}${basePromptSuffix}${catalogueSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 			cells.push({ task, arm, residency, vanillaPromptName, repeat: r, runId: repeat > 1 ? `${base}__r${r}` : base });
 		}
 	}
@@ -230,7 +269,11 @@ async function runCell(cell) {
 		args.push("--prompt", promptName);
 		if (codemodeDocsGate !== "off") args.push(`--docs-gate=${codemodeDocsGate}`);
 		if (codemodeNavTools) args.push("--nav-tools");
+		if (codemodeValidateArgs) args.push("--validate-args");
+		if (codemodeApiLayout !== "per-method") args.push(`--api-layout=${codemodeApiLayout}`);
 	}
+	// Every arm, unconditionally — see the comment on cataloguePath.
+	if (cataloguePath !== DEFAULT_CATALOGUE) args.push("--catalogue", cataloguePath);
 	if (cell.arm === "vanilla") args.push("--vanilla-prompt", cell.vanillaPromptName);
 	// Every arm, unconditionally — see the comment on basePromptVersion.
 	if (basePromptVersion !== "v1") args.push(`--base-prompt=${basePromptVersion}`);
@@ -300,6 +343,12 @@ function report() {
 				`turns ${mean((r) => r.turns).toFixed(1)}  ` +
 				`toolCalls ${mean((r) => r.toolCalls).toFixed(1)}  ` +
 				`apiCalls ${mean((r) => r.apiCalls).toFixed(1)}  ` +
+			// Only meaningful under --codemode-validate-args, and zero elsewhere. The
+			// count is the whole claim of that variant: a correction delivered at the
+			// call site rather than a round trip later.
+			(codemodeValidateArgs && arm === "codemode"
+				? `argErrs ${mean((r) => (r.argumentErrors ?? []).length).toFixed(2)}  `
+				: "") +
 				`ctx0 ${mean((r) => r.firstTurnPromptTokens).toFixed(0)}  ` +
 				`$${mean((r) => r.cost).toFixed(4)}  ` +
 				`${mean((r) => (r.wallMs ?? 0) / 1000).toFixed(0)}s`,

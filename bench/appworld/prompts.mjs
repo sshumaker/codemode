@@ -280,7 +280,7 @@ export function buildBase({ supervisor, apps, version = "v1" }) {
 export const VARIANTS = {
 	a1: {
 		note: "baseline: discovery + async + persistent kernel, no economy pressure",
-		build: ({ toolCount, serverCount }) =>
+		build: ({ toolCount, serverCount, apiLayout = "per-method" }) =>
 			[
 				"## Your tools",
 				"",
@@ -289,9 +289,20 @@ export const VARIANTS = {
 				"Nothing is listed in this prompt — you find what you need by looking.",
 				"",
 				"  cat api/INDEX.md                    # the apps, and how many APIs each has",
-				"  cat api/<app>/INDEX.md              # one line per API in that app",
-				"  grep -ril '<keyword>' api/          # search every API's documentation",
-				"  cat api/<app>/<api>.py              # full parameter documentation",
+				// The ONLY thing --api-layout changes in this prompt: which files exist
+				// and therefore which ones to open. Everything below — async, the
+				// persistent kernel, the call-site example — is byte-identical, so the
+				// A/B measures the shape of the tree rather than a reworded prompt.
+				...(apiLayout === "consolidated"
+					? [
+							"  grep -ril '<keyword>' api/          # search every API's documentation",
+							"  cat api/<app>.py                    # one app: every API, with full parameter docs",
+						]
+					: [
+							"  cat api/<app>/INDEX.md              # one line per API in that app",
+							"  grep -ril '<keyword>' api/          # search every API's documentation",
+							"  cat api/<app>/<api>.py              # full parameter documentation",
+						]),
 				"",
 				"Call one from a cell. They are all `async`:",
 				"",

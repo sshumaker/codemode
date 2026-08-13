@@ -104,6 +104,54 @@ export const adversarial = [
 	},
 ];
 
+/**
+ * Every constraint keyword the runtime validator claims to enforce, once each.
+ *
+ * Shaped after what AppWorld's own function-calling schemas actually carry —
+ * `minimum`/`maximum` on pagination, `minLength` on names, `format: email`,
+ * `enum` on a handful of string parameters, `exclusiveMinimum` on amounts — plus
+ * the keywords a real MCP server ships that AppWorld does not (`pattern`,
+ * `maxItems`, `anyOf`, a nested object) so the validator is exercised beyond one
+ * benchmark's dialect.
+ *
+ * The bool/int cases are deliberate: Python's `bool` is an `int` subclass, so a
+ * naive isinstance check lets `page_limit=True` through and `verified=1` through,
+ * and both are rejected downstream.
+ */
+export const constrained = [
+	{
+		server: "strict",
+		tools: [
+			{
+				name: "search",
+				description: "Search the catalogue.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						email: { type: "string", format: "email", description: "Who is searching." },
+						name: { type: "string", minLength: 1, maxLength: 8, description: "Display name." },
+						sort_by: { type: "string", enum: ["+price", "-price", "+rating"], description: "Sort order." },
+						page_index: { type: "integer", minimum: 0, description: "Page, from 0." },
+						page_limit: { type: "integer", minimum: 1, maximum: 20, description: "Page size." },
+						amount: { type: "number", exclusiveMinimum: 0.0, description: "Minimum price." },
+						verified: { type: "boolean", description: "Only verified sellers." },
+						code: { type: "string", pattern: "^[A-Z]{3}-[0-9]{4}$", description: "Coupon code." },
+						tags: { type: "array", items: { type: "string" }, maxItems: 3, description: "Tags." },
+						filters: {
+							type: "object",
+							properties: { seller: { type: "integer" }, region: { type: "string", enum: ["us", "eu"] } },
+							required: ["seller"],
+							description: "Structured filters.",
+						},
+						answer: { anyOf: [{ type: "number" }, { type: "string" }], description: "Free-form answer." },
+					},
+					required: ["email"],
+				},
+			},
+		],
+	},
+];
+
 /** A catalogue of `count` synthetic tools, for residency scaling measurements. */
 export function synthetic(count, server = "bulk") {
 	return [

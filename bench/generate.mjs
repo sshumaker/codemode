@@ -65,8 +65,16 @@ function pyType(schema) {
 		const literals = schema.enum.map((v) => JSON.stringify(v)).join(", ");
 		return `Literal[${literals}]`;
 	}
+	// A single permitted value is a Literal, same as a one-member enum. Rendering it
+	// `str` would drop the only thing the schema actually says about the parameter.
+	if ("const" in schema) return `Literal[${JSON.stringify(schema.const)}]`;
 	if (Array.isArray(schema.type)) {
-		const parts = schema.type.filter((t) => t !== "null").map((t) => PY_TYPES[t] ?? "Any");
+		// `items` still applies when "array" arrives inside a type union, so recurse
+		// rather than flattening to a bare `list` — the same information loss the
+		// anyOf fallthrough below was fixed for.
+		const parts = schema.type
+			.filter((t) => t !== "null")
+			.map((t) => (t === "array" ? `list[${pyType(schema.items)}]` : (PY_TYPES[t] ?? "Any")));
 		const union = [...new Set(parts)].join(" | ") || "Any";
 		return schema.type.includes("null") ? `${union} | None` : union;
 	}
@@ -219,6 +227,319 @@ export function renderFullDocs(tools, { server, heading = true }) {
 	return lines.join("\n");
 }
 
+// --- runtime argument validation ---------------------------------------------
+
+/**
+ * The per-tool schemas shipped alongside the tree, for `_client` to validate against.
+ *
+ * Data-driven rather than codegen'd per function on purpose: a `if not isinstance(...)`
+ * ladder inlined into 469 modules is 469 places for the generator to be subtly wrong,
+ * and it would put a *translation* of the schema between the benchmark and the arm.
+ * This file is the schema itself, so a validation verdict is re-derivable from it.
+ *
+ * `description` is stripped from every level. Validation needs constraints, not prose,
+ * and leaving the prose in would make `_schemas.json` a shadow documentation surface —
+ * one `cat` away from the whole catalogue, which is exactly the residency the L0 label
+ * claims is absent. The docstrings in the .py files remain the only documentation.
+ */
+const PROSE_KEYWORDS = new Set(["description", "title", "$comment"]);
+/**
+ * Keywords whose value is a map of NAME -> schema. Their keys are parameter names,
+ * not schema keywords.
+ *
+ * Load-bearing, and found the hard way: without this, a parameter literally named
+ * `description` was deleted from the table — `splitwise.record_expense`,
+ * `todoist.create_task` and 31 others — so the validator reported the agent's
+ * perfectly legal `description="..."` as an *unknown argument*. Measured in a live
+ * run: the agent obeyed the correction, dropped the argument, and the call went
+ * through without it. A validation bug that produces a plausible-looking error and
+ * a plausible-looking recovery, which is this project's recurring failure shape.
+ */
+const SCHEMA_MAPS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
+/** Keywords whose value is DATA, not a schema. Rewriting these would change meaning. */
+const DATA_KEYWORDS = new Set(["enum", "const", "default", "examples"]);
+
+function stripProse(node) {
+	if (Array.isArray(node)) return node.map(stripProse);
+	if (!node || typeof node !== "object") return node;
+	const out = {};
+	for (const [k, v] of Object.entries(node)) {
+		if (PROSE_KEYWORDS.has(k)) continue;
+		if (DATA_KEYWORDS.has(k)) {
+			// An enum member that happens to be an object is a VALUE the argument is
+			// compared against; stripping a key out of it would silently change which
+			// arguments compare equal.
+			out[k] = v;
+		} else if (SCHEMA_MAPS.has(k) && v && typeof v === "object" && !Array.isArray(v)) {
+			out[k] = Object.fromEntries(Object.entries(v).map(([name, schema]) => [name, stripProse(schema)]));
+		} else {
+			out[k] = stripProse(v);
+		}
+	}
+	return out;
+}
+
+/**
+ * `{ packages: {<server>: <pyPackage>}, tools: {<server>: {<tool>: <inputSchema>}} }`
+ *
+ * Keyed by the RAW identifiers, because those are what `_client.call` is handed; a
+ * table keyed by the python names would silently miss every tool whose name needed
+ * mangling, i.e. validation would quietly do nothing for exactly the tools most
+ * likely to be called wrong.
+ *
+ * `packages` exists so the error can name the *import path* the agent types rather
+ * than the wire name. On AppWorld the two coincide, but a real MCP server called
+ * "Math MCP" would otherwise be reported as `api.Math MCP.add` — a correction that
+ * cannot be pasted back into a cell.
+ */
+export function renderSchemas(normalized) {
+	const packages = {};
+	const tools = {};
+	for (const { server, pyServer, tools: list } of normalized) {
+		packages[server] = pyServer ?? pyPackage(server);
+		tools[server] = Object.fromEntries(list.map((t) => [t.name, stripProse(t.schema)]));
+	}
+	return `${JSON.stringify({ packages, tools }, null, 1)}\n`;
+}
+
+/**
+ * The validator, rendered into `_client.py` only when the arm asked for it.
+ *
+ * Why this is worth building at all, and why it is not a mirror of what the
+ * tool-calling arm already gets for free:
+ *
+ *   A JSON tool-calling harness has argument validation, but the PROVIDER does it,
+ *   after the model has emitted the call, and the correction arrives as a tool error
+ *   one round trip later. Generated code validates AT THE CALL SITE, inside the
+ *   agent's own process, before anything leaves it — so the correction lands in the
+ *   error channel of the cell that made the mistake. That channel is the one this
+ *   project has measured to work: runs that hit a guard adopted the primitive on the
+ *   very next cell, where a prompt advertising the same rule did not (CLAUDE.md,
+ *   "put the correction in the error, not in the prompt").
+ *
+ *   It also recovers the one real cost of the search_tools/describe_tool/call_tool
+ *   pattern several MCP harnesses ship: the provider validates `call_tool`'s schema,
+ *   not the inner tool's, so argument validation is lost entirely. Here it is not.
+ *
+ * Stdlib only, like the rest of the transport: the kernel is a bare uv-managed
+ * environment and an ImportError would silently disable the whole arm.
+ */
+function renderValidator() {
+	return `
+_SCHEMAS_PATH = os.path.join(os.path.dirname(__file__), "_schemas.json")
+_SCHEMAS: dict | None = None
+
+
+class ArgumentError(McpError, TypeError):
+    """An argument does not satisfy its API's declared input schema.
+
+    Subclasses TypeError as well as McpError so that the idiom already in the
+    model's head — \`except TypeError\` around a call with a guessed argument —
+    catches it, rather than requiring a bespoke exception to be learned first.
+    """
+
+
+# JSON Schema type -> the Python types that satisfy it. \`bool\` is deliberately
+# NOT accepted for integer/number and \`int\` not for boolean: Python's bool is an
+# int subclass, so a naive isinstance check would let \`limit=True\` through and
+# let \`verified=1\` through, and both are rejected by the servers downstream.
+_JSON_TYPES = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list, tuple),
+    "object": (dict,),
+    "null": (type(None),),
+}
+
+_EMAIL = re.compile(r"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$")
+
+
+def _brief(value: object, limit: int = 80) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _type_matches(value: object, name: str) -> bool:
+    allowed = _JSON_TYPES.get(name)
+    if allowed is None:  # a type this validator does not model: do not invent a verdict
+        return True
+    if isinstance(value, bool) and name in ("integer", "number"):
+        return False
+    if not isinstance(value, bool) and name == "boolean":
+        return False
+    return isinstance(value, allowed)
+
+
+def _check(value: object, schema: dict, path: str) -> str | None:
+    """Return a description of the first violation, or None if the value is valid."""
+    if not isinstance(schema, dict) or not schema:
+        return None
+
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if variants:
+        if any(_check(value, v, path) is None for v in variants):
+            return None
+        shapes = ", ".join(str(v.get("type", "?")) for v in variants)
+        return f"{path}={_brief(value)} matches none of the allowed shapes ({shapes})"
+
+    declared = schema.get("type")
+    if declared is not None:
+        names = declared if isinstance(declared, list) else [declared]
+        if not any(_type_matches(value, n) for n in names):
+            return (
+                f"{path} must be {' or '.join(names)}, got {type(value).__name__} "
+                f"({_brief(value)})"
+            )
+
+    if "const" in schema and value != schema["const"]:
+        return f"{path} must be exactly {schema['const']!r}, got {_brief(value)}"
+    if "enum" in schema and value not in schema["enum"]:
+        allowed = ", ".join(repr(v) for v in schema["enum"])
+        return f"{path}={_brief(value)} is not one of the allowed values: {allowed}"
+
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            return f"{path} must be at least {schema['minLength']} characters, got {len(value)}"
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            return f"{path} must be at most {schema['maxLength']} characters, got {len(value)}"
+        pattern = schema.get("pattern")
+        if pattern is not None and re.search(pattern, value) is None:
+            return f"{path}={_brief(value)} does not match the required pattern {pattern!r}"
+        # Only formats this validator actually implements are enforced. An
+        # unimplemented format must not produce a verdict either way.
+        if schema.get("format") == "email" and _EMAIL.match(value) is None:
+            return f"{path}={_brief(value)} is not an email address"
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        for key, ok, word in (
+            ("minimum", lambda v, b: v >= b, ">="),
+            ("maximum", lambda v, b: v <= b, "<="),
+            ("exclusiveMinimum", lambda v, b: v > b, ">"),
+            ("exclusiveMaximum", lambda v, b: v < b, "<"),
+        ):
+            if key in schema and not ok(value, schema[key]):
+                return f"{path} must be {word} {schema[key]}, got {value!r}"
+
+    if isinstance(value, (list, tuple)):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            return f"{path} must have at least {schema['minItems']} items, got {len(value)}"
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            return f"{path} must have at most {schema['maxItems']} items, got {len(value)}"
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for i, item in enumerate(value):
+                problem = _check(item, items, f"{path}[{i}]")
+                if problem:
+                    return problem
+
+    if isinstance(value, dict):
+        properties = schema.get("properties") or {}
+        for key, spec in properties.items():
+            if key in value:
+                problem = _check(value[key], spec, f"{path}.{key}")
+                if problem:
+                    return problem
+        for key in schema.get("required", []):
+            if key not in value:
+                return f"{path} is missing the required key {key!r}"
+    return None
+
+
+def _table() -> dict:
+    global _SCHEMAS
+    if _SCHEMAS is None:
+        try:
+            with open(_SCHEMAS_PATH) as handle:
+                _SCHEMAS = json.load(handle)
+        except Exception:  # noqa: BLE001 - a missing table must not break every call
+            _SCHEMAS = {"packages": {}, "tools": {}}
+    return _SCHEMAS
+
+
+def _schema_for(server: str, tool: str) -> dict | None:
+    return ((_table().get("tools") or {}).get(server) or {}).get(tool)
+
+
+def _validate(server: str, tool: str, args: dict) -> None:
+    """Check args against the API's own schema before anything leaves this process.
+
+    Raised here rather than surfaced by the server (or, for a tool-calling arm, by
+    the provider one round trip later) so the correction reaches the agent in the
+    error channel of the cell that made the mistake.
+    """
+    schema = _schema_for(server, tool)
+    if not schema:
+        return
+    properties = schema.get("properties") or {}
+    # The import path the agent types, not the wire name: a server called "Math MCP"
+    # is imported as api.math_mcp, and a correction naming "api.Math MCP.add" cannot
+    # be pasted back into a cell.
+    call = f"api.{(_table().get('packages') or {}).get(server, server)}.{tool}"
+
+    for name in schema.get("required", []):
+        if name not in args:
+            known = ", ".join(sorted(properties)) or "none"
+            raise ArgumentError(
+                f"{call}: missing required argument {name!r}. Parameters: {known}"
+            )
+
+    if properties and schema.get("additionalProperties") is not True:
+        for name in args:
+            if name not in properties:
+                known = ", ".join(sorted(properties)) or "none"
+                raise ArgumentError(
+                    f"{call}: unknown argument {name!r}. Parameters: {known}"
+                )
+
+    for name, value in args.items():
+        spec = properties.get(name)
+        if not spec:
+            continue
+        problem = _check(value, spec, name)
+        if problem:
+            raise ArgumentError(f"{call}: {problem}\\n  schema for {name}: {json.dumps(spec)}")
+
+`;
+}
+
+// --- api tree layout ---------------------------------------------------------
+
+/**
+ * How the generated tree is arranged on disk.
+ *
+ * per-method    api/<app>/<api>.py — one file per API, plus a per-app INDEX.md.
+ * consolidated  api/<app>.py — one module per app, every API in it, full docstrings.
+ *
+ * The flag exists because the per-method tree is a shape the model has never seen.
+ * No API reference and no SDK is one file per method: `stripe.py`, a boto3 service
+ * module, a REST reference page — all are one page per service or resource. Reading
+ * the documentation for an app is a 48-file operation in the per-method tree and a
+ * single `cat` in the consolidated one, and the measured behaviour at L0 is that the
+ * agent reads the INDEX one-liners and stops. Both dissected AppWorld failures came
+ * from a contract that only exists in a docstring nobody opened — `show_drafts`'s
+ * YYYY-MM-DD `min_created_at`, and `complete_task`'s answer-only-if-asked rule.
+ *
+ * This is CLAUDE.md's affordance rule applied to the tree itself: write down what
+ * you would reach for without the new thing, and get as close to it as possible.
+ * `cat api/gmail.py` is that; `cat api/gmail/show_drafts.py` × 48 is not.
+ *
+ * What it deliberately does NOT change is the call site. `import api.gmail` and
+ * `await api.gmail.show_drafts(...)` are identical in both layouts, so the contrast
+ * is the shape of the documentation and nothing else.
+ */
+export const API_LAYOUTS = ["per-method", "consolidated"];
+
+/** Normalize and validate a layout. A typo must not silently mean the default. */
+export function apiLayout(value) {
+	if (value === undefined || value === null) return "per-method";
+	if (!API_LAYOUTS.includes(value)) {
+		throw new Error(`unknown api layout: ${value} (have ${API_LAYOUTS.join("|")})`);
+	}
+	return value;
+}
+
 /**
  * The docs gate's three modes.
  *
@@ -260,7 +581,7 @@ export function docsGateMode(value) {
  * the prompt and the same fields the module docstrings carry. A second renderer
  * would be a second wording, and the drift would land inside the contrast.
  */
-export function renderAppDocs(tools, { server, pkg = pyPackage(server) }) {
+export function appConventions(tools, pkg) {
 	const withToken = tools.filter((t) => t.params.some((p) => p.name === "access_token")).length;
 	const paged = tools.filter((t) => t.params.some((p) => p.name === "page_index" || p.name === "page_limit")).length;
 	const hasLogin = tools.some((t) => t.pyName === "login");
@@ -278,6 +599,15 @@ export function renderAppDocs(tools, { server, pkg = pyPackage(server) }) {
 				" page comes back short or empty — the first page is not the answer.",
 		);
 	}
+	return conventions;
+}
+
+export function renderAppDocs(tools, { server, pkg = pyPackage(server) }) {
+	// Shared with the consolidated module's header rather than written twice: two
+	// statements of one app's conventions is the drift the single-authored-text rule
+	// exists to prevent, and this pair would drift across a layout flag where nobody
+	// is comparing them side by side.
+	const conventions = appConventions(tools, pkg);
 
 	return [
 		`# api.${pkg} — ${server}`,
@@ -317,12 +647,19 @@ export function renderNames(tools, { server, style = "python" } = {}) {
 }
 
 /**
- * codemode: one Python module per tool.
+ * One `async def`, with its docstring and its `_call` — the unit both layouts share.
  *
- * The docstring carries the server's description verbatim, so `grep`, `import`,
- * and `help()` all read the same text and cannot drift.
+ * Extracted so the two layouts cannot render a function two different ways. The
+ * whole claim of `--api-layout` is that it moves text between files and changes
+ * nothing an agent could call differently; a second copy of this renderer would
+ * make that claim false the first time one of them was edited.
+ *
+ * `pathLiteral` is the only thing that differs, and only when the docs gate is on:
+ * in per-method `__name__` already IS `api.<pkg>.<tool>`, while a consolidated
+ * module's `__name__` is just `api.<pkg>`, which would lose the tool half and make
+ * the gate fire once per APP instead of once per API.
  */
-export function renderToolModule(tool, { server, docsGate = "off" }) {
+function renderFunction(tool, { server, docsGate = "off", pathLiteral = "__name__" }) {
 	const mode = docsGateMode(docsGate);
 	const args = tool.params.map((p) => (p.required ? `${p.pyName}: ${p.type}` : `${p.pyName}: ${p.type} | None = None`));
 	const signatureLine = `async def ${tool.pyName}(${args.join(", ")}) -> Any:`;
@@ -347,10 +684,25 @@ export function renderToolModule(tool, { server, docsGate = "off" }) {
 	// `_doc` is passed only by the mode that shows a docstring, and it is read off
 	// `__doc__` at call time so the delivered text is the same object `help()`
 	// prints and the file contains. A second copy would drift.
-	const gateArgs = mode === "inline" ? `\n        _doc=${tool.pyName}.__doc__,\n        _path=__name__,` : mode === "redirect" ? "\n        _path=__name__," : "";
+	const gateArgs =
+		mode === "inline"
+			? `\n        _doc=${tool.pyName}.__doc__,\n        _path=${pathLiteral},`
+			: mode === "redirect"
+				? `\n        _path=${pathLiteral},`
+				: "";
 	const call = gateArgs
 		? `    return await _call(\n        "${server}",\n        "${tool.name}",\n        {${callArgs}},${gateArgs}\n    )`
 		: `    return await _call("${server}", "${tool.name}", {${callArgs}})`;
+	return [signatureLine, ...doc, call];
+}
+
+/**
+ * per-method: one Python module per tool.
+ *
+ * The docstring carries the server's description verbatim, so `grep`, `import`,
+ * and `help()` all read the same text and cannot drift.
+ */
+export function renderToolModule(tool, { server, docsGate = "off" }) {
 	return [
 		`"""${server}.${tool.name} — generated from the MCP schema. Do not edit."""`,
 		"",
@@ -360,9 +712,61 @@ export function renderToolModule(tool, { server, docsGate = "off" }) {
 		`from .._client import call as _call`,
 		"",
 		"",
-		signatureLine,
-		...doc,
-		call,
+		// `__name__` is already the import path (`api.<pkg>.<tool>`), so arming the
+		// gate needs no plumbing in this layout.
+		...renderFunction(tool, { server, docsGate, pathLiteral: "__name__" }),
+		"",
+	].join("\n");
+}
+
+/**
+ * consolidated: one Python module per APP, carrying every one of its APIs.
+ *
+ * The in-distribution shape — `stripe.py`, a boto3 service module, one reference
+ * page per service. `cat api/gmail.py` is a single natural read that delivers the
+ * whole app surface with full parameter documentation, where the per-method tree
+ * makes the same information a 48-file operation that the measured agent does not
+ * perform.
+ *
+ * The module docstring leads with the app's conventions for the same reason
+ * DOCS.md does: auth and pagination are the part no single function's docstring
+ * states, and both are derived from the schemas rather than asserted, so an app
+ * that does not work that way is not told that it does.
+ */
+export function renderAppModule(tools, { server, pkg = pyPackage(server), docsGate = "off" }) {
+	const conventions = appConventions(tools, pkg);
+	const header = [
+		`"""${server} — generated from the MCP schema. Do not edit.`,
+		"",
+		`${tools.length} API${tools.length === 1 ? "" : "s"}, all async, documented in full below.`,
+		`Call them as \`api.${pkg}.<name>(...)\`.`,
+		...(conventions.length > 0 ? ["", "Conventions:", ...conventions] : []),
+		'"""',
+	];
+	const body = [];
+	for (const tool of tools) {
+		body.push(
+			"",
+			"",
+			// A literal, not `__name__`: this module's `__name__` is only `api.<pkg>`,
+			// so `__name__` would lose the tool half and the gate would fire once per
+			// app instead of once per API.
+			...renderFunction(tool, { server, docsGate, pathLiteral: JSON.stringify(`api.${pkg}.${tool.pyName}`) }),
+		);
+	}
+	return [
+		...header,
+		"",
+		"from typing import Any, Literal",
+		"",
+		// `_client` is a sibling module here, not a parent package.
+		"from ._client import call as _call",
+		...body,
+		"",
+		"",
+		"__all__ = [",
+		...tools.map((t) => `    "${t.pyName}",`),
+		"]",
 		"",
 	].join("\n");
 }
@@ -408,8 +812,13 @@ export function renderServerInit(tools, { server }) {
  * Written with stdlib only: the kernel is a bare uv-managed environment and a
  * missing `requests` would silently disable the entire arm.
  */
-export function renderClient({ docsGate = "off" } = {}) {
+export function renderClient({ docsGate = "off", validateArgs = false, apiLayout: layout = "per-method" } = {}) {
 	const mode = docsGateMode(docsGate);
+	// Where the gate sends the agent, per layout. A pointer to a file that is not
+	// there is worse than no pointer: it costs a turn and teaches that the tree
+	// cannot be trusted. In consolidated the app module IS the documentation, so
+	// there is no DOCS.md to cite.
+	const docsTarget = apiLayout(layout) === "consolidated" ? "api/{pkg}.py" : "api/{pkg}/DOCS.md";
 	/**
 	 * The docs gate, rendered only when the arm asked for it, and only in the shape
 	 * that arm asked for.
@@ -471,7 +880,7 @@ def _docs_first(server: str, tool: str, path: str) -> None:
     name = path or f"{server}.{tool}"
     pkg = name.split(".")[-2] if "." in name else server
     raise DocsFirst(
-        f"First use of {name}. Before calling it, read api/{pkg}/DOCS.md — it"
+        f"First use of {name}. Before calling it, read ${docsTarget} — it"
         " documents this API, its siblings, and this app's conventions (auth,"
         " pagination, organization). Then re-issue your call."
     )
@@ -506,7 +915,7 @@ def _neighbours(pkg: str, tool: str) -> list[str]:
     lines = [siblings[k] for k in ranked[:_MAX_NEIGHBOURS]]
     rest = len(siblings) - len(lines)
     if rest > 0:
-        lines.append(f"and {rest} more — see api/{pkg}/DOCS.md")
+        lines.append(f"and {rest} more — see ${docsTarget}")
     return lines
 
 
@@ -525,13 +934,14 @@ def _docs_first(server: str, tool: str, doc: str, path: str) -> None:
     parts.append(
         f"Docs for {name} shown above (first use). Re-issue the call if it is still"
         " what you want.\\n"
-        f"If a neighbor fits better, read api/{pkg}/DOCS.md before proceeding."
+        f"If a neighbor fits better, read ${docsTarget} before proceeding."
     )
     raise DocsFirst("\\n\\n".join(parts))
 
 `;
 
 	const gate = mode === "redirect" ? redirect : mode === "inline" ? inline : "";
+	const validator = validateArgs ? renderValidator() : "";
 	return `"""Transport for the generated api/ modules. Do not edit.
 
 Every tool module calls \`_client.call\`, which forwards to the shared MCP proxy.
@@ -539,7 +949,7 @@ Every tool module calls \`_client.call\`, which forwards to the shared MCP proxy
 
 ${mode === "inline" ? "import inspect\n" : ""}import json
 import os
-import urllib.request
+${validateArgs ? "import re\n" : ""}import urllib.request
 
 _PROXY = os.environ.get("HARNESS_MCP_PROXY", "http://127.0.0.1:8765")
 
@@ -557,20 +967,27 @@ _TIMEOUT = 180
 class McpError(RuntimeError):
     """An MCP tool returned an error, or the server was unreachable."""
 
-${gate}
+${validator}${gate}
 async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: str | None = None, _path: str | None = None" : mode === "redirect" ? ", _path: str | None = None" : ""}) -> str:
     """Invoke an MCP tool and return its text result.
 
     Arguments whose value is None are dropped, so optional parameters left at
     their default are not sent as explicit nulls — several servers reject that.
 
-    Raises:${mode === "off" ? "" : "\n        DocsFirst: This is the first call to this API; read the message, then call again."}
+    Raises:${validateArgs ? "\n        ArgumentError: An argument does not satisfy this API's schema. Nothing was sent." : ""}${mode === "off" ? "" : "\n        DocsFirst: This is the first call to this API; read the message, then call again."}
         McpError: The server returned an error or could not be reached.
-    """${mode === "inline" ? "\n    if _path is not None:\n        _docs_first(server, tool, _doc, _path)" : mode === "redirect" ? "\n    if _path is not None:\n        _docs_first(server, tool, _path)" : ""}
+    """${mode === "inline" ? "\n    if _path is not None:\n        _docs_first(server, tool, _doc, _path)" : mode === "redirect" ? "\n    if _path is not None:\n        _docs_first(server, tool, _path)" : ""}${
+			validateArgs
+				? // Validate what is actually SENT, i.e. after the None-drop below, or every
+					// optional parameter left at its default would read as a null type violation
+					// — the generated wrappers pass all of them on every call.
+					'\n    sent = {k: v for k, v in (args or {}).items() if v is not None}\n    _validate(server, tool, sent)'
+				: ""
+		}
     payload = {
         "server": server,
         "tool": tool,
-        "args": {k: v for k, v in (args or {}).items() if v is not None},
+        "args": ${validateArgs ? "sent" : "{k: v for k, v in (args or {}).items() if v is not None}"},
         "meta": {"arm": "codemode", "runId": _RUN_ID},
     }
     request = urllib.request.Request(
@@ -592,7 +1009,7 @@ async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: 
 }
 
 /** codemode: the top-level index across servers. */
-export function renderRootIndex(catalogue, { docsGate = "off" } = {}) {
+export function renderRootIndex(catalogue, { docsGate = "off", validateArgs = false, apiLayout: layout = "per-method" } = {}) {
 	const total = catalogue.reduce((n, s) => n + s.tools.length, 0);
 	const mode = docsGateMode(docsGate);
 	// Announced, not sprung. An unexplained exception on a call the agent believes
@@ -605,16 +1022,31 @@ export function renderRootIndex(catalogue, { docsGate = "off" } = {}) {
 		redirect: ["The first call to any API returns a pointer to that app's DOCS.md instead", "of a result. Read that file, then re-issue the call.", ""],
 		inline: ["The first call to any API returns that API's documentation instead of a", "result. Read it, then re-issue the call.", ""],
 	}[mode];
+	// Announced for the same reason, and only when it is on: an unexplained
+	// exception on a call the agent believes is correct is a bug to work around,
+	// where a documented contract is a rule to satisfy.
+	const validation = validateArgs
+		? [
+				"Arguments are checked against each API's schema before the call is sent. A",
+				"violation raises `ArgumentError` naming the argument and what it allows, and",
+				"nothing reaches the server — fix the argument and call again.",
+				"",
+			]
+		: [];
 	return [
 		"# api",
 		"",
 		`${catalogue.length} servers, ${total} tools, all async.`,
 		"",
 		...announcement,
+		...validation,
 		"Find a tool:",
 		"  grep -ril '<keyword>' api/          # search every tool's documentation",
-		"  cat api/<package>/INDEX.md          # list one server's tools",
-		"  cat api/<package>/<tool>.py         # full parameter documentation",
+		// Per layout, and only the files that exist in it. The consolidated tree has
+		// no per-app INDEX.md because the module is the index.
+		...(apiLayout(layout) === "consolidated"
+			? ["  cat api/<package>.py                # one app: every API, with full parameter docs"]
+			: ["  cat api/<package>/INDEX.md          # list one server's tools", "  cat api/<package>/<tool>.py         # full parameter documentation"]),
 		"",
 		"Call one:",
 		"  import api.<package>",
@@ -634,11 +1066,15 @@ export function renderRootIndex(catalogue, { docsGate = "off" } = {}) {
  *
  * @param catalogue [{ server, tools: [rawMcpTool] }]
  * @param options.docsGate "off" | "redirect" | "inline" — see DOCS_GATE_MODES
+ * @param options.validateArgs render `_schemas.json` and check every call's
+ *        arguments against it before the request leaves the process
+ * @param options.apiLayout "per-method" | "consolidated" — see API_LAYOUTS
  * @returns { toolDefs, tocLines, names, files } — `files` is a path -> content
  *          map rooted at `api/`, written to disk by the caller.
  */
-export function generate(catalogue, { docsGate = "off" } = {}) {
+export function generate(catalogue, { docsGate = "off", validateArgs = false, apiLayout: layout = "per-method" } = {}) {
 	const gateMode = docsGateMode(docsGate);
+	const layoutMode = apiLayout(layout);
 	// Real MCP server names contain spaces ("OpenAPI Explorer", "Math MCP"), so
 	// the package directory needs its own identifier. The raw name is still what
 	// goes on the wire and what the TOC and tool defs display.
@@ -663,10 +1099,13 @@ export function generate(catalogue, { docsGate = "off" } = {}) {
 	// `__init__.py` at the root so `import api.<pkg>` resolves as a regular
 	// package rather than relying on namespace-package resolution.
 	const files = {
-		"INDEX.md": renderRootIndex(normalized, { docsGate: gateMode }),
+		"INDEX.md": renderRootIndex(normalized, { docsGate: gateMode, validateArgs, apiLayout: layoutMode }),
 		"__init__.py": '"""Generated MCP tool catalogue. See INDEX.md."""\n',
-		"_client.py": renderClient({ docsGate: gateMode }),
+		"_client.py": renderClient({ docsGate: gateMode, validateArgs, apiLayout: layoutMode }),
 	};
+	// Only when validation is on: an unused 469-schema file in the tree is one more
+	// hit in the agent's `grep -ril` and one more thing to read.
+	if (validateArgs) files["_schemas.json"] = renderSchemas(normalized);
 	// Only the mode that cites siblings pays for the table. Every extra file in
 	// the tree is one more line in the agent's `grep -ril`.
 	if (gateMode === "inline") files["_neighbours.json"] = renderNeighbours(normalized);
@@ -676,6 +1115,12 @@ export function generate(catalogue, { docsGate = "off" } = {}) {
 		tocLines.push(...renderTocLines(tools, { server }));
 		names.push(...renderNames(tools, { server }));
 
+		if (layoutMode === "consolidated") {
+			// One module, and nothing else: no per-app INDEX.md (the module is the
+			// index), no DOCS.md (the module is the documentation), no per-method files.
+			files[`${pyServer}.py`] = renderAppModule(tools, { server, pkg: pyServer, docsGate: gateMode });
+			continue;
+		}
 		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server, docsGate: gateMode });
 		files[`${pyServer}/__init__.py`] = renderServerInit(tools, { server });
 		// The redirect target. Both live modes render it: `redirect` sends the agent

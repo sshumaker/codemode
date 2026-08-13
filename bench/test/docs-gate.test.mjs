@@ -94,7 +94,9 @@ describe("the docs gate is off by default", () => {
 		assert.match(RUNNER, /const docsGate = parseDocsGate\(\)/);
 		assert.match(RUNNER, /if \(i < 0\) return "off"/);
 		assert.match(RUNNER, /const navTools = argv\.includes\("--nav-tools"\)/);
-		assert.match(RUNNER, /\(docsGate !== "off" \|\| navTools\) && arm !== "codemode"/);
+		// The list of codemode-only variants grows; the property being pinned is that
+		// each is refused on another arm rather than silently ignored.
+		assert.match(RUNNER, /\(docsGate !== "off" \|\| navTools[^)]*\) && arm !== "codemode"/);
 	});
 
 	it("a bare --docs-gate means the primary form, not the alternate", () => {
@@ -355,6 +357,30 @@ describe("pyType: schema information must survive into the signature", () => {
 		assert.equal(t.params.find((p) => p.name === "v").type, "str | None");
 	});
 
+	it("an array inside a type union keeps its item type", () => {
+		// `{"type": ["array", "null"]}` flattened to a bare `list`, dropping `items`
+		// — the same information loss the anyOf case above was fixed for, arriving
+		// through the other branch.
+		const t = normalizeTool({
+			name: "z",
+			description: "d",
+			input_schema: {
+				type: "object",
+				properties: { ids: { type: ["array", "null"], items: { type: "integer" } } },
+			},
+		});
+		assert.equal(t.params.find((p) => p.name === "ids").type, "list[int] | None");
+	});
+
+	it("a const is a one-member Literal, not its base type", () => {
+		const t = normalizeTool({
+			name: "w",
+			description: "d",
+			input_schema: { type: "object", properties: { kind: { type: "string", const: "issue" } } },
+		});
+		assert.equal(t.params.find((p) => p.name === "kind").type, 'Literal["issue"]');
+	});
+
 	it("enum still wins over anyOf, and arrays still nest", () => {
 		const t = normalizeTool({
 			name: "y",
@@ -370,5 +396,24 @@ describe("pyType: schema information must survive into the signature", () => {
 		const by = Object.fromEntries(t.params.map((p) => [p.name, p.type]));
 		assert.equal(by.status, 'Literal["success", "fail"]');
 		assert.equal(by.ids, "list[int]");
+	});
+
+	it("a non-string enum keeps its JSON values, not their reprs", () => {
+		// `Literal[1, 2]` and `Literal[True]` are what Python wants; a naive
+		// stringify would emit `Literal["1"]` and silently change the type.
+		const t = normalizeTool({
+			name: "v",
+			description: "d",
+			input_schema: {
+				type: "object",
+				properties: {
+					stars: { type: "integer", enum: [1, 2, 3] },
+					nested: { type: "array", items: { type: "array", items: { type: "string" } } },
+				},
+			},
+		});
+		const by = Object.fromEntries(t.params.map((p) => [p.name, p.type]));
+		assert.equal(by.stars, "Literal[1, 2, 3]");
+		assert.equal(by.nested, "list[list[str]]");
 	});
 });

@@ -7,8 +7,10 @@
  *   arms      codemode | vanilla | notools
  *   options   --residency L0|L1|L2|L4  --prompt a1  --vanilla-prompt b1|b2
  *             --timeout 900  --max-cost 1.0  --run-id X  --force
- *             --docs-gate[=redirect|inline]  --nav-tools
- *                                     (codemode only; both default OFF)
+ *             --docs-gate[=redirect|inline]  --nav-tools  --validate-args
+ *             --api-layout=per-method|consolidated
+ *                                     (codemode only; all default OFF/per-method)
+ *             --catalogue <path>      the shared tool catalogue (arm-neutral)
  *             --base-prompt=v1|v2     the shared base prompt (arm-neutral, default v1)
  *
  * Per-run artefacts under .run/appworld/<runId>/ — the answer to "could I
@@ -35,9 +37,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
+import { apiLayout, docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
 import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -45,7 +47,15 @@ const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
 const APPWORLD = join(ROOT, "vendor/appworld");
 const PYTHON = join(APPWORLD, ".venv/bin/python3");
 const ENV_SERVER = join(ROOT, "bench/appworld/env-server.py");
-const CATALOGUE = join(ROOT, "bench/data/appworld-schemas.json");
+/**
+ * The tool catalogue every arm is rendered from.
+ *
+ * Overridable with `--catalogue` so an enriched catalogue (bench/enrich-catalogue.mjs)
+ * can be swapped in — and deliberately NOT per-arm: this file is the single authored
+ * source all four containers are rendered from, so a flag that could give one arm
+ * better schemas than another would be aimed straight at the fairness invariant.
+ */
+const DEFAULT_CATALOGUE = "bench/data/appworld-schemas.json";
 // The vanilla arm's tool extension. Reused verbatim from the MCP-Bench arm: it
 // reads the same catalogue shape and POSTs to the same /call protocol, so the
 // AppWorld env-server is a drop-in for the MCP proxy. Not re-implemented.
@@ -58,6 +68,10 @@ const flag = (name, fallback) => {
 };
 const positional = argv.filter((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1].startsWith("--")));
 const [envFile, model, taskId, arm] = positional;
+const cataloguePath = flag("catalogue", DEFAULT_CATALOGUE);
+// `resolve`, not `join`: an absolute --catalogue path joined onto ROOT silently
+// becomes ROOT-relative and reads a file that is not the one that was asked for.
+const CATALOGUE = resolve(ROOT, cataloguePath);
 
 if (!envFile || !model || !taskId || !arm) {
 	console.error("usage: bench/appworld/run-task.mjs <env-file> <model> <task-id> <arm> [--residency L0|L1|L2|L4]");
@@ -143,6 +157,36 @@ function parseDocsGate() {
 const docsGate = parseDocsGate();
 const navTools = argv.includes("--nav-tools");
 /**
+ * --validate-args — check every call's arguments against the source MCP schema
+ * inside the agent's process, before the request is sent.
+ *
+ * Rendered into api/_client.py + api/_schemas.json at generate time for the same
+ * reason the docs gate is, and NOT read from the environment by the client: the
+ * kernel is a grandchild process, and an env var that failed to propagate would
+ * silently produce an unvalidated run wearing a validated label. `HARNESS_VALIDATE_ARGS=1`
+ * is accepted here, in the parent, as an equivalent way to ask for it — it selects
+ * what gets rendered, and lands in the runId either way.
+ */
+const validateArgs = argv.includes("--validate-args") || process.env.HARNESS_VALIDATE_ARGS === "1";
+/**
+ * --api-layout=per-method|consolidated — how the api/ tree is arranged on disk.
+ *
+ * `consolidated` is one module per app (`api/gmail.py`) instead of one file per
+ * method, which is the shape every real SDK and every API reference already has.
+ * The call site is identical in both, so this changes what it costs to READ the
+ * documentation and nothing else. See API_LAYOUTS in bench/generate.mjs.
+ */
+const layout = (() => {
+	const i = argv.findIndex((a) => a === "--api-layout" || a.startsWith("--api-layout="));
+	if (i < 0) return "per-method";
+	// A bare `--api-layout` means the non-default form; an unknown value throws
+	// rather than degrading, since a run labelled with a layout it is not in is the
+	// failure this file already guards against elsewhere.
+	if (argv[i].includes("=")) return apiLayout(argv[i].split("=").slice(1).join("="));
+	const next = argv[i + 1];
+	return apiLayout(next && !next.startsWith("--") ? next : "consolidated");
+})();
+/**
  * --base-prompt=v1|v2 — which shared base prompt every arm receives.
  *
  * Arm-neutral by construction: this selects the string all three arms are given, so
@@ -160,14 +204,19 @@ const basePromptVersion = (() => {
 	}
 	return value;
 })();
-if ((docsGate !== "off" || navTools) && arm !== "codemode") {
-	console.error(`--docs-gate/--nav-tools apply to the codemode arm only, got arm=${arm}`);
+if ((docsGate !== "off" || navTools || validateArgs || layout !== "per-method") && arm !== "codemode") {
+	console.error(`--docs-gate/--nav-tools/--validate-args/--api-layout apply to the codemode arm only, got arm=${arm}`);
 	process.exit(2);
 }
 const variantSuffix =
-	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}` +
+	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}${validateArgs ? "__val" : ""}` +
+	`${layout === "per-method" ? "" : `__layout-${layout}`}` +
 	// v1 contributes nothing, so every already-reported baseline keeps its runId.
-	`${basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`}`;
+	`${basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`}` +
+	// A different catalogue is a different experiment; without this an enriched run
+	// would overwrite the baseline run it is being compared against — the runId
+	// collision this file already guards against, arriving through a new door.
+	`${cataloguePath === DEFAULT_CATALOGUE ? "" : `__cat-${cataloguePath.split("/").pop().replace(/\.json$/, "").replace(/[^a-z0-9]+/gi, "-")}`}`;
 const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}${variantSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
 const runDir = join(ROOT, ".run/appworld", runId);
 
@@ -204,8 +253,8 @@ mark("startedAt");
 // --- catalogue ---------------------------------------------------------------
 
 const catalogueRaw = readFileSync(CATALOGUE, "utf8");
-const { catalogue, appworldDataVersion, withResponseSchemas } = JSON.parse(catalogueRaw);
-const { toolDefs, tocLines, names, files, normalized } = generate(catalogue, { docsGate });
+const { catalogue, appworldDataVersion, withResponseSchemas, enrichment } = JSON.parse(catalogueRaw);
+const { toolDefs, tocLines, names, files, normalized } = generate(catalogue, { docsGate, validateArgs, apiLayout: layout });
 
 if (arm === "codemode") {
 	for (const [rel, content] of Object.entries(files)) {
@@ -338,7 +387,9 @@ const appsBlock = Object.entries(facts.appDescriptions)
 const basePrompt = buildBase({ supervisor: supervisorName, apps: appsBlock, version: basePromptVersion });
 
 function preambleFor() {
-	const ctx = { toolCount: toolDefs.length, serverCount: catalogue.length };
+	// `apiLayout` reaches only the codemode preamble, and changes only the lines
+	// that say which files to open.
+	const ctx = { toolCount: toolDefs.length, serverCount: catalogue.length, apiLayout: layout };
 	if (arm === "notools") return "";
 	if (arm === "vanilla") {
 		if (residency === "predicted") {
@@ -411,7 +462,7 @@ writeFileSync(
 			runId,
 			arm,
 			residency,
-			variants: { docsGate, navTools, basePromptVersion },
+			variants: { docsGate, navTools, validateArgs, apiLayout: layout, basePromptVersion },
 			// The two halves, separately, so "was the base identical?" is a diff and
 			// not an argument.
 			basePrompt,
@@ -448,11 +499,15 @@ const meta = {
 		digest: digest(catalogueRaw),
 		appworldDataVersion,
 		withResponseSchemas,
+		path: cataloguePath,
+		// Present only on an enriched catalogue; provenance for the schemas the arm
+		// was actually rendered from, so a verdict is re-derivable from the run alone.
+		enrichment: enrichment ?? undefined,
 	},
 	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
 	// Which opt-in codemode variants were on. A run compared against another must
 	// be able to say which condition it was in without re-reading the api/ tree.
-	variants: { docsGate, navTools, basePromptVersion },
+	variants: { docsGate, navTools, validateArgs, apiLayout: layout, basePromptVersion },
 	basePromptDigest: digest(basePrompt),
 	preambleChars: preamble.length,
 	toolCount: toolList.length,
@@ -468,6 +523,8 @@ const summary = {
 	toolNames: [],
 	toolErrors: 0,
 	errorMessages: [],
+	// Populated only when --validate-args rendered a validator into the tree.
+	argumentErrors: [],
 	input: 0,
 	output: 0,
 	cacheRead: 0,
@@ -527,6 +584,9 @@ async function main() {
 			// and an env var that failed to propagate would silently produce a
 			// gate-off run wearing a gate-on label.
 			...(docsGate === "off" ? {} : { HARNESS_DOCS_GATE: docsGate }),
+			// Provenance only, for the same reason: validation is rendered into
+			// api/_client.py, not switched on by this variable.
+			...(validateArgs ? { HARNESS_VALIDATE_ARGS: "1" } : {}),
 			// Optional narrowing, passed straight through from the environment so a
 			// targeted gate needs no new flag: HARNESS_DOCS_GATE_ONLY=supervisor.complete_task
 			...(process.env.HARNESS_DOCS_GATE_ONLY
@@ -593,10 +653,25 @@ async function main() {
 			if (event.type === "tool_execution_start") {
 				summary.toolCalls++;
 				summary.toolNames.push(event.toolName);
-			} else if (event.type === "tool_execution_end" && event.isError) {
-				summary.toolErrors++;
+			} else if (event.type === "tool_execution_end") {
 				const text = (event.result?.content ?? []).map((c) => c.text ?? "").join(" ");
-				summary.errorMessages.push(text.slice(0, 300));
+				if (event.isError) {
+					summary.toolErrors++;
+					summary.errorMessages.push(text.slice(0, 300));
+				}
+				// Every ArgumentError the validator raised, with the turn it landed on and
+				// its full text. A count alone cannot answer the question the variant exists
+				// to answer — whether the correction in the error channel was acted on next
+				// cell — and CLAUDE.md's rule is to persist what a check saw, not only its
+				// verdict. Outside the isError branch on purpose: an exception the agent
+				// caught inside its own cell is still a correction that was delivered.
+				// `api.<app>.<api>:` is required, because the string "ArgumentError:" also
+				// appears in _client.call's own Raises docstring, which IPython prints in
+				// every traceback through it — counting those would inflate the number by
+				// one per unrelated failure.
+				for (const m of text.matchAll(/ArgumentError: (api\.[\w.]+: [^\n]+)/g)) {
+					summary.argumentErrors.push({ turn: summary.turns, message: m[1].slice(0, 400) });
+				}
 			} else if (event.type === "message_end" && event.message?.role === "assistant") {
 				const message = event.message;
 				const texts = (message.content ?? []).filter((c) => c.type === "text" && c.text);
@@ -748,6 +823,7 @@ async function main() {
 			`${summary.success === true ? "PASS" : "FAIL"} ${summary.passCount}/${summary.totalCount} tests, ` +
 			`${summary.turns} turns, ${summary.toolCalls} tool calls (${tally}), ${summary.apiCalls} api calls ` +
 			`(${summary.distinctApis} distinct, ${summary.duplicateCalls} dupes), ${summary.toolErrors} errors, ` +
+			`${validateArgs ? `${summary.argumentErrors.length} argErrs, ` : ""}` +
 			`$${summary.cost.toFixed(4)}, ${((summary.wallMs ?? 0) / 1000).toFixed(0)}s` +
 			`${summary.stopReason === "completed" ? "" : ` [${summary.stopReason.toUpperCase()}]`}`,
 	);
