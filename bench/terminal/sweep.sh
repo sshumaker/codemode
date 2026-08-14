@@ -32,6 +32,7 @@ MODEL="${PRIME_MODEL:-anthropic/claude-opus-5}"
 TASKS=""
 CONCURRENCY=2
 RUN_ID=""
+SRC_ROOT=""
 EXTRA=()
 
 while [[ $# -gt 0 ]]; do
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
     --tasks)       TASKS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     --run-id)      RUN_ID="$2"; shift 2 ;;
+    # Stage from a non-default source tree (e.g. the adapted cybench dataset at
+    # .run/cybench-generated). Empty -> original-tasks, so the default path and
+    # every existing caller are unchanged.
+    --src-root)    SRC_ROOT="$2"; shift 2 ;;
     *)             EXTRA+=("$1"); shift ;;
   esac
 done
@@ -53,7 +58,8 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$AGENT-$ARM-jobs$JOBS}"
 # Stage every requested task before running. Cheap, idempotent, and it is the
 # only thing standing between a typo'd task id and a trial that silently runs
 # against a stale mirror.
-"$TB/.venv/bin/python" "$ROOT/bench/terminal/stage-dataset.py" --tasks "$TASKS"
+"$TB/.venv/bin/python" "$ROOT/bench/terminal/stage-dataset.py" --tasks "$TASKS" \
+  ${SRC_ROOT:+--src-root "$SRC_ROOT"}
 
 TASK_ARGS=()
 IFS=',' read -ra IDS <<< "$TASKS"

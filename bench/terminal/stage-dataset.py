@@ -63,8 +63,8 @@ def patch_compose(text: str) -> tuple[str, dict]:
     return yaml.safe_dump(doc, sort_keys=False), doc
 
 
-def stage(task_id: str) -> dict:
-    src = SRC / task_id
+def stage(task_id: str, src_root: Path = SRC) -> dict:
+    src = src_root / task_id
     if not src.is_dir():
         raise SystemExit(f"no such task: {task_id}")
     dst = OUT / task_id
@@ -102,10 +102,21 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", help="comma-separated task ids")
     ap.add_argument("--all", action="store_true")
+    # Where the source task directories live. Defaults to terminal-bench's own
+    # `original-tasks`, so every existing caller (and the running campaign) is
+    # byte-for-byte unaffected. Cybench adapts its 40 CTF tasks into a different
+    # tree (`.run/cybench-generated`); point here to stage those instead. The
+    # rest of the pipeline is identical — a `client` service gets the /agent
+    # mount and nothing else is touched — so this is a source switch, not a
+    # second staging mechanism.
+    ap.add_argument("--src-root", default=None,
+                    help="directory of source task dirs (default: original-tasks)")
     args = ap.parse_args()
 
+    src_root = Path(args.src_root).resolve() if args.src_root else SRC
+
     if args.all:
-        ids = sorted(d.name for d in SRC.iterdir() if (d / "task.yaml").is_file())
+        ids = sorted(d.name for d in src_root.iterdir() if (d / "task.yaml").is_file())
     elif args.tasks:
         ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
     else:
@@ -116,7 +127,7 @@ def main() -> int:
     failed = []
     for t in ids:
         try:
-            manifest.append(stage(t))
+            manifest.append(stage(t, src_root))
         except Exception as e:  # a task whose compose we cannot patch is excluded,
             failed.append({"task_id": t, "error": str(e)})  # loudly, not silently
     (OUT / "stage-manifest.json").write_text(
