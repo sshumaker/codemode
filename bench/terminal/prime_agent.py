@@ -651,12 +651,25 @@ class PrimeAgent(BaseAgent):
                     s["toolCalls"] += 1
                     s["toolNames"].append(part.get("name") or "?")
                     args = part.get("arguments") or {}
-                    if isinstance(args.get("code"), str):
-                        # The cell source verbatim. Wait-behaviour analysis for
-                        # the jobs runtime (blocking sleeps, threads, poll loops)
-                        # is only possible if this is kept, and the environment
-                        # is gone by the time anyone asks.
-                        s["cells"].append(args["code"])
+                    # The executed source verbatim. Wait-behaviour analysis for
+                    # the jobs runtime (blocking sleeps, threads, poll loops)
+                    # is only possible if this is kept, and the environment
+                    # is gone by the time anyone asks.
+                    #
+                    # BOTH argument names, because the two arms do not share one.
+                    # codemode's `ipython` tool takes `code`; vanilla's `bash`
+                    # tool takes `command` (packages/coding-agent/src/core/tools/
+                    # bash.ts:25). Reading only `code` gave the vanilla arm an
+                    # empty `cells` list, so `blockingSleepCells`,
+                    # `daemonCells` and `threadCells` were all a structural 0 —
+                    # not "vanilla never blocks" but "we never looked". A metric
+                    # that can only report zero for one arm is the false-null
+                    # shape this repo keeps paying for.
+                    src = args.get("code")
+                    if not isinstance(src, str):
+                        src = args.get("command")
+                    if isinstance(src, str):
+                        s["cells"].append(src)
                 elif part.get("type") == "text" and part.get("text"):
                     s["finalText"] = part["text"]
 

@@ -320,6 +320,10 @@ export const VARIANTS = {
 							"again. Reading an app's file once covers ALL of that app's APIs, so this is",
 							"one read per app, not one per API. Read the app file before you plan the",
 							"calls — the defaults are in there, and a default decides what a call does.",
+							"",
+							"Reads and greps are independent of each other: issue ALL of them together in",
+							"a single turn (several read/grep calls at once), not one per turn. Batch the",
+							"reads for every app the task touches up front, then write your code.",
 						]
 					: apiLayout === "consolidated"
 						? [

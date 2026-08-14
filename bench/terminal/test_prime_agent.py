@@ -101,6 +101,24 @@ def test_cell_source_is_retained():
     assert "hello.txt" in _run(STREAM)["cells"][0]
 
 
+def test_vanilla_bash_command_is_retained_too():
+    """The vanilla arm's `bash` tool takes `command`, not `code`.
+
+    Reading only `code` left `cells` empty for every vanilla run, so
+    `blockingSleepCells` / `daemonCells` / `threadCells` were a structural zero
+    on that arm — which reads as "vanilla never blocks" and is really "nobody
+    looked". Same false-null shape as the L1 arm that advertised tools it could
+    never call.
+    """
+    events = json.loads(json.dumps(STREAM))
+    call = events[4]["message"]["content"][0]
+    call["name"] = "bash"
+    call["arguments"] = {"command": "nohup make -j8 > /tmp/b.log 2>&1 &\nsleep 120"}
+    s = _run(events)
+    assert s["toolNames"] == ["bash"]
+    assert s["cells"] and "sleep 120" in s["cells"][0]
+
+
 def test_tool_errors_and_kernel_restarts_are_observed():
     events = json.loads(json.dumps(STREAM))
     events[5]["message"]["isError"] = True
