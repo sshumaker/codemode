@@ -27,6 +27,8 @@
  *                          one module per app (api/gmail.py) instead of one file
  *                          per method; call sites are identical in both
  *   --codemode-validate-args
+ *   --codemode-read-gate   verified read-precondition on every API (implies
+ *                          --codemode-nav-tools + --codemode-api-layout=consolidated)
  *                          check every call's arguments against the source MCP
  *                          schema inside the agent's process, before the request
  *                          is sent; a violation raises ArgumentError naming the
@@ -106,6 +108,9 @@ function parseDocsGate() {
 const codemodeDocsGate = parseDocsGate();
 const codemodeNavTools = has("codemode-nav-tools");
 const codemodeValidateArgs = has("codemode-validate-args");
+// Refused here as well as in the runner, so an unsatisfiable combination fails
+// before 46 tasks run rather than 46 times.
+const codemodeReadGate = has("codemode-read-gate");
 /**
  * --codemode-api-layout[=consolidated] — one module per app instead of one file per
  * method. Validated here as well as in the runner so a typo fails before 46 tasks run.
@@ -117,6 +122,10 @@ const codemodeApiLayout = (() => {
 	const next = argv[i + 1];
 	return apiLayout(next && !next.startsWith("--") ? next : "consolidated");
 })();
+if (codemodeReadGate && (codemodeApiLayout !== "consolidated" || !codemodeNavTools)) {
+	console.error("--codemode-read-gate requires --codemode-api-layout=consolidated and --codemode-nav-tools");
+	process.exit(2);
+}
 /**
  * The shared catalogue, applied to EVERY arm — never per-arm, for the reason
  * --base-prompt is never per-arm: one authored description rendered into four
@@ -235,7 +244,7 @@ for (const task of tasks ?? []) {
 			// look for a run that was written under a different name.
 			const variantSuffix =
 				arm === "codemode"
-					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}${codemodeValidateArgs ? "__val" : ""}${codemodeApiLayout === "per-method" ? "" : `__layout-${codemodeApiLayout}`}`
+					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}${codemodeValidateArgs ? "__val" : ""}${codemodeReadGate ? "__rg" : ""}${codemodeApiLayout === "per-method" ? "" : `__layout-${codemodeApiLayout}`}`
 					: "";
 			const base = `${task}__${arm}__${residency}${suffix}${variantSuffix}${basePromptSuffix}${catalogueSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 			cells.push({ task, arm, residency, vanillaPromptName, repeat: r, runId: repeat > 1 ? `${base}__r${r}` : base });
@@ -270,6 +279,7 @@ async function runCell(cell) {
 		if (codemodeDocsGate !== "off") args.push(`--docs-gate=${codemodeDocsGate}`);
 		if (codemodeNavTools) args.push("--nav-tools");
 		if (codemodeValidateArgs) args.push("--validate-args");
+		if (codemodeReadGate) args.push("--read-gate");
 		if (codemodeApiLayout !== "per-method") args.push(`--api-layout=${codemodeApiLayout}`);
 	}
 	// Every arm, unconditionally — see the comment on cataloguePath.

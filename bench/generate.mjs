@@ -654,12 +654,12 @@ export function renderNames(tools, { server, style = "python" } = {}) {
  * nothing an agent could call differently; a second copy of this renderer would
  * make that claim false the first time one of them was edited.
  *
- * `pathLiteral` is the only thing that differs, and only when the docs gate is on:
+ * `pathLiteral` is the only thing that differs, and only when a gate is on:
  * in per-method `__name__` already IS `api.<pkg>.<tool>`, while a consolidated
  * module's `__name__` is just `api.<pkg>`, which would lose the tool half and make
  * the gate fire once per APP instead of once per API.
  */
-function renderFunction(tool, { server, docsGate = "off", pathLiteral = "__name__" }) {
+function renderFunction(tool, { server, docsGate = "off", readGate = false, pathLiteral = "__name__" }) {
 	const mode = docsGateMode(docsGate);
 	const args = tool.params.map((p) => (p.required ? `${p.pyName}: ${p.type}` : `${p.pyName}: ${p.type} | None = None`));
 	const signatureLine = `async def ${tool.pyName}(${args.join(", ")}) -> Any:`;
@@ -684,10 +684,13 @@ function renderFunction(tool, { server, docsGate = "off", pathLiteral = "__name_
 	// `_doc` is passed only by the mode that shows a docstring, and it is read off
 	// `__doc__` at call time so the delivered text is the same object `help()`
 	// prints and the file contains. A second copy would drift.
+	// Both gates are armed by `_path`; only `inline` also needs the docstring. The
+	// read gate resolves `_path` into an app module and a line span, so it needs the
+	// same literal for the same reason.
 	const gateArgs =
 		mode === "inline"
 			? `\n        _doc=${tool.pyName}.__doc__,\n        _path=${pathLiteral},`
-			: mode === "redirect"
+			: mode === "redirect" || readGate
 				? `\n        _path=${pathLiteral},`
 				: "";
 	const call = gateArgs
@@ -733,42 +736,65 @@ export function renderToolModule(tool, { server, docsGate = "off" }) {
  * states, and both are derived from the schemas rather than asserted, so an app
  * that does not work that way is not told that it does.
  */
-export function renderAppModule(tools, { server, pkg = pyPackage(server), docsGate = "off" }) {
+export function renderAppModule(tools, options) {
+	return renderAppModuleParts(tools, options).text;
+}
+
+/**
+ * The consolidated module AND the exact line span of every function in it.
+ *
+ * One renderer, two outputs, because the read gate's whole claim is that the span
+ * it cites is where the contract actually is. A second function that re-derived
+ * spans by parsing the emitted text — or worse, by counting docstring lines a
+ * second time — would be a second authority on one fact, and the first edit to
+ * either would make the citation point at the wrong place while still looking
+ * plausible. We emit the file, so the spans are exact by construction, and
+ * `bench/test/read-gate.test.mjs` re-checks them against the emitted text.
+ *
+ * A span runs from the `async def` line through the last line of its `return await
+ * _call(...)`, 1-based and inclusive — i.e. the signature, the whole docstring and
+ * the call. That is what "read this API's contract" means.
+ */
+export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), docsGate = "off", readGate = false }) {
 	const conventions = appConventions(tools, pkg);
-	const header = [
+	const lines = [
 		`"""${server} — generated from the MCP schema. Do not edit.`,
 		"",
 		`${tools.length} API${tools.length === 1 ? "" : "s"}, all async, documented in full below.`,
 		`Call them as \`api.${pkg}.<name>(...)\`.`,
 		...(conventions.length > 0 ? ["", "Conventions:", ...conventions] : []),
 		'"""',
-	];
-	const body = [];
-	for (const tool of tools) {
-		body.push(
-			"",
-			"",
-			// A literal, not `__name__`: this module's `__name__` is only `api.<pkg>`,
-			// so `__name__` would lose the tool half and the gate would fire once per
-			// app instead of once per API.
-			...renderFunction(tool, { server, docsGate, pathLiteral: JSON.stringify(`api.${pkg}.${tool.pyName}`) }),
-		);
-	}
-	return [
-		...header,
 		"",
 		"from typing import Any, Literal",
 		"",
 		// `_client` is a sibling module here, not a parent package.
 		"from ._client import call as _call",
-		...body,
-		"",
-		"",
-		"__all__ = [",
-		...tools.map((t) => `    "${t.pyName}",`),
-		"]",
-		"",
-	].join("\n");
+	];
+	// NOT `lines.length`: several elements of this array are themselves multi-line
+	// (the gated `_call` is one element carrying four newlines), so the array index
+	// and the file's line number diverge. Counting newlines is the only accounting
+	// that survives a renderer emitting a block as one string — which is exactly how
+	// the first version of this got `reply_to_email` wrong by two lines while
+	// producing an entirely plausible-looking span.
+	const lineCount = (parts) => parts.reduce((n, part) => n + part.split("\n").length, 0);
+	const lineMap = {};
+	for (const tool of tools) {
+		lines.push("", "");
+		const body = renderFunction(tool, {
+			server,
+			docsGate,
+			readGate,
+			// A literal, not `__name__`: this module's `__name__` is only `api.<pkg>`,
+			// so `__name__` would lose the tool half and the gate would fire once per
+			// app instead of once per API.
+			pathLiteral: JSON.stringify(`api.${pkg}.${tool.pyName}`),
+		});
+		const start = lineCount(lines) + 1;
+		lines.push(...body);
+		lineMap[tool.pyName] = [start, lineCount(lines)];
+	}
+	lines.push("", "", "__all__ = [", ...tools.map((t) => `    "${t.pyName}",`), "]", "");
+	return { text: lines.join("\n"), lineMap };
 }
 
 /** codemode: the per-server package index, one line per tool. */
@@ -812,8 +838,22 @@ export function renderServerInit(tools, { server }) {
  * Written with stdlib only: the kernel is a bare uv-managed environment and a
  * missing `requests` would silently disable the entire arm.
  */
-export function renderClient({ docsGate = "off", validateArgs = false, apiLayout: layout = "per-method" } = {}) {
+export function renderClient({ docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method" } = {}) {
 	const mode = docsGateMode(docsGate);
+	if (readGate && mode !== "off") {
+		// They are two answers to one question and they compose badly: the docs gate
+		// clears itself on the retry the read gate is about to refuse, so a run with
+		// both on would raise two different exceptions for one call and neither result
+		// would be attributable. The read gate REPLACES it — see READ_GATE.
+		throw new Error("--read-gate and --docs-gate are alternatives, not a stack; run one or the other");
+	}
+	if (readGate && apiLayout(layout) !== "consolidated") {
+		// The gate cites a line span in `api/<app>.py`. In per-method there is no such
+		// file and no span to cite, so the citation would be a lie and the gate would
+		// be unsatisfiable. Refuse rather than degrade to something weaker wearing the
+		// same label.
+		throw new Error("--read-gate requires --api-layout=consolidated (the line map is a property of that layout)");
+	}
 	// Where the gate sends the agent, per layout. A pointer to a file that is not
 	// there is worse than no pointer: it costs a turn and teaches that the tree
 	// cannot be trusted. In consolidated the app module IS the documentation, so
@@ -940,7 +980,122 @@ def _docs_first(server: str, tool: str, doc: str, path: str) -> None:
 
 `;
 
-	const gate = mode === "redirect" ? redirect : mode === "inline" ? inline : "";
+	/**
+	 * The read gate: a VERIFIED read-precondition, shaped like Claude Code's Edit tool.
+	 *
+	 * The docs gate above is *skippable by construction* — it marks the (server, tool)
+	 * pair delivered BEFORE it raises, so a retry proceeds whether or not anything was
+	 * read. That was a deliberate anti-deadlock choice and it was taken literally.
+	 * Measured on the `ce73d68` family (docs/CC-EDGE-TRACES.md): **zero of 12 codemode
+	 * configurations ever read `reply_to_email`'s contract before calling it**, the two
+	 * docs-gate configurations included. The contract they never read says
+	 * `email_addresses` defaults to "the sender", which on an outbox thread is the
+	 * supervisor themselves; 35 of 36 runs omitted it and every one of those failed.
+	 *
+	 * Edit refuses to write a file that has not been Read, the retry re-checks, and
+	 * models comply at essentially 100% because that loop is trained in. This is the
+	 * same precondition against the same vocabulary:
+	 *
+	 *   - armed per API, satisfied by a read WINDOW covering that API's lines in its
+	 *     app module — hence `consolidated`, where `api/<app>.py` has exact spans,
+	 *   - one read of an app module bulk-satisfies every API in it, so the tax is
+	 *     about one read per app per task rather than one per API,
+	 *   - NOTHING is recorded before the raise. The only state is the ledger, which
+	 *     only prime's `read` tool can append to, so there is no path through.
+	 *
+	 * `cat`, `help()` and in-cell `open()` deliberately do not satisfy it. The
+	 * affordance rule says match the idiom rather than invent one, and the model's
+	 * strongest habit here is the read tool — so the error names that tool.
+	 */
+	const readFirst = `
+class ReadFirst(McpError):
+    """An API was called before its contract was read."""
+
+
+_LINEMAP_PATH = os.path.join(os.path.dirname(__file__), "_linemap.json")
+# Written by bench/arms/read-ledger-extension.ts, in the agent's process, from
+# prime's own read-tool results. Overridable so the run directory owns it.
+_LEDGER_PATH = os.environ.get(
+    "HARNESS_READ_LEDGER"
+) or os.path.join(os.path.dirname(__file__), ".read-ledger.jsonl")
+_LINEMAP: dict | None = None
+
+
+def _linemap() -> dict:
+    """The generated span table. Read once — the file cannot change mid-run."""
+    global _LINEMAP
+    if _LINEMAP is None:
+        with open(_LINEMAP_PATH) as handle:
+            _LINEMAP = json.load(handle)
+    return _LINEMAP
+
+
+def _read_windows(pkg: str) -> list:
+    """Every line window prime's read tool has returned for api/<pkg>.py.
+
+    Re-read on every call and never cached: the ledger is appended to by the
+    agent process between cells, so a cached copy would make the first retry
+    after a read fail anyway and teach the agent that reading does not work.
+    """
+    windows = []
+    try:
+        with open(_LEDGER_PATH) as handle:
+            lines = handle.readlines()
+    except OSError:
+        return windows
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:  # a half-written final line; the next call will see it
+            continue
+        if entry.get("tool") != "read" or entry.get("pkg") != pkg or entry.get("isError"):
+            continue
+        start, end = entry.get("start"), entry.get("end")
+        if isinstance(start, int) and isinstance(end, int) and end >= start:
+            windows.append((start, end))
+    return windows
+
+
+def _covers(windows: list, span: list) -> bool:
+    """True when the UNION of read windows contains every line of span.
+
+    A union rather than "one window covers it": two reads that between them
+    delivered the whole section did deliver the whole section, and refusing that
+    would punish the paging the read tool's own truncation notice asks for.
+    """
+    line = span[0]
+    for start, end in sorted(windows):
+        if start > line:
+            break  # a gap the reads never closed
+        if end >= line:
+            line = end + 1
+        if line > span[1]:
+            return True
+    return line > span[1]
+
+
+def _read_first(server: str, tool: str, path: str) -> None:
+    """Refuse an API whose contract has not been read. No path through."""
+    parts = path.split(".")
+    pkg, name = (parts[-2], parts[-1]) if len(parts) >= 2 else (server, tool)
+    span = _linemap().get(pkg, {}).get(name)
+    if span is None:
+        return
+    if _covers(_read_windows(pkg), span):
+        return
+    raise ReadFirst(
+        f"{path} has not been read. Read api/{pkg}.py (this API is lines"
+        f" {span[0]}-{span[1]}) with the read tool, then re-issue the call.\\n"
+        f"One read of that file covers all {len(_linemap().get(pkg, {}))} APIs in"
+        f" api.{pkg}; cat, help() and open() inside a cell do not count."
+    )
+
+`;
+
+	const gate = readGate ? readFirst : mode === "redirect" ? redirect : mode === "inline" ? inline : "";
 	const validator = validateArgs ? renderValidator() : "";
 	return `"""Transport for the generated api/ modules. Do not edit.
 
@@ -968,15 +1123,15 @@ class McpError(RuntimeError):
     """An MCP tool returned an error, or the server was unreachable."""
 
 ${validator}${gate}
-async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: str | None = None, _path: str | None = None" : mode === "redirect" ? ", _path: str | None = None" : ""}) -> str:
+async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: str | None = None, _path: str | None = None" : mode === "redirect" || readGate ? ", _path: str | None = None" : ""}) -> str:
     """Invoke an MCP tool and return its text result.
 
     Arguments whose value is None are dropped, so optional parameters left at
     their default are not sent as explicit nulls — several servers reject that.
 
-    Raises:${validateArgs ? "\n        ArgumentError: An argument does not satisfy this API's schema. Nothing was sent." : ""}${mode === "off" ? "" : "\n        DocsFirst: This is the first call to this API; read the message, then call again."}
+    Raises:${validateArgs ? "\n        ArgumentError: An argument does not satisfy this API's schema. Nothing was sent." : ""}${mode === "off" ? "" : "\n        DocsFirst: This is the first call to this API; read the message, then call again."}${readGate ? "\n        ReadFirst: This API's contract has not been read. Read it, then call again." : ""}
         McpError: The server returned an error or could not be reached.
-    """${mode === "inline" ? "\n    if _path is not None:\n        _docs_first(server, tool, _doc, _path)" : mode === "redirect" ? "\n    if _path is not None:\n        _docs_first(server, tool, _path)" : ""}${
+    """${mode === "inline" ? "\n    if _path is not None:\n        _docs_first(server, tool, _doc, _path)" : mode === "redirect" ? "\n    if _path is not None:\n        _docs_first(server, tool, _path)" : readGate ? "\n    if _path is not None:\n        _read_first(server, tool, _path)" : ""}${
 			validateArgs
 				? // Validate what is actually SENT, i.e. after the None-drop below, or every
 					// optional parameter left at its default would read as a null type violation
@@ -1009,7 +1164,7 @@ async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: 
 }
 
 /** codemode: the top-level index across servers. */
-export function renderRootIndex(catalogue, { docsGate = "off", validateArgs = false, apiLayout: layout = "per-method" } = {}) {
+export function renderRootIndex(catalogue, { docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method" } = {}) {
 	const total = catalogue.reduce((n, s) => n + s.tools.length, 0);
 	const mode = docsGateMode(docsGate);
 	// Announced, not sprung. An unexplained exception on a call the agent believes
@@ -1022,6 +1177,18 @@ export function renderRootIndex(catalogue, { docsGate = "off", validateArgs = fa
 		redirect: ["The first call to any API returns a pointer to that app's DOCS.md instead", "of a result. Read that file, then re-issue the call.", ""],
 		inline: ["The first call to any API returns that API's documentation instead of a", "result. Read it, then re-issue the call.", ""],
 	}[mode];
+	// Announced, not sprung, for the same reason — and stated as the precondition it
+	// is rather than as a first-use hint, because unlike the docs gate this one
+	// cannot be cleared by retrying.
+	const readGateAnnouncement = readGate
+		? [
+				"Calling an API before you have read its contract raises `ReadFirst` and",
+				"nothing is sent. Use the `read` tool on `api/<app>.py` — one read covers",
+				"every API in that app — then issue the call. Retrying without reading",
+				"raises again.",
+				"",
+			]
+		: [];
 	// Announced for the same reason, and only when it is on: an unexplained
 	// exception on a call the agent believes is correct is a bug to work around,
 	// where a documented contract is a rule to satisfy.
@@ -1039,6 +1206,7 @@ export function renderRootIndex(catalogue, { docsGate = "off", validateArgs = fa
 		`${catalogue.length} servers, ${total} tools, all async.`,
 		"",
 		...announcement,
+		...readGateAnnouncement,
 		...validation,
 		"Find a tool:",
 		"  grep -ril '<keyword>' api/          # search every tool's documentation",
@@ -1069,10 +1237,11 @@ export function renderRootIndex(catalogue, { docsGate = "off", validateArgs = fa
  * @param options.validateArgs render `_schemas.json` and check every call's
  *        arguments against it before the request leaves the process
  * @param options.apiLayout "per-method" | "consolidated" — see API_LAYOUTS
+ * @param options.readGate render the verified read-precondition and `_linemap.json`
  * @returns { toolDefs, tocLines, names, files } — `files` is a path -> content
  *          map rooted at `api/`, written to disk by the caller.
  */
-export function generate(catalogue, { docsGate = "off", validateArgs = false, apiLayout: layout = "per-method" } = {}) {
+export function generate(catalogue, { docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method" } = {}) {
 	const gateMode = docsGateMode(docsGate);
 	const layoutMode = apiLayout(layout);
 	// Real MCP server names contain spaces ("OpenAPI Explorer", "Math MCP"), so
@@ -1099,10 +1268,16 @@ export function generate(catalogue, { docsGate = "off", validateArgs = false, ap
 	// `__init__.py` at the root so `import api.<pkg>` resolves as a regular
 	// package rather than relying on namespace-package resolution.
 	const files = {
-		"INDEX.md": renderRootIndex(normalized, { docsGate: gateMode, validateArgs, apiLayout: layoutMode }),
+		"INDEX.md": renderRootIndex(normalized, { docsGate: gateMode, readGate, validateArgs, apiLayout: layoutMode }),
 		"__init__.py": '"""Generated MCP tool catalogue. See INDEX.md."""\n',
-		"_client.py": renderClient({ docsGate: gateMode, validateArgs, apiLayout: layoutMode }),
+		// Throws on read-gate + docs-gate and on read-gate + per-method, before a
+		// single file is written. A tree that half-satisfies a label is the failure
+		// mode this project keeps rediscovering.
+		"_client.py": renderClient({ docsGate: gateMode, readGate, validateArgs, apiLayout: layoutMode }),
 	};
+	// Only when the gate is on: the map is the gate's evidence, and an unused span
+	// table in the tree is one more hit in the agent's `grep -ril`.
+	const lineMap = readGate ? {} : null;
 	// Only when validation is on: an unused 469-schema file in the tree is one more
 	// hit in the agent's `grep -ril` and one more thing to read.
 	if (validateArgs) files["_schemas.json"] = renderSchemas(normalized);
@@ -1118,7 +1293,9 @@ export function generate(catalogue, { docsGate = "off", validateArgs = false, ap
 		if (layoutMode === "consolidated") {
 			// One module, and nothing else: no per-app INDEX.md (the module is the
 			// index), no DOCS.md (the module is the documentation), no per-method files.
-			files[`${pyServer}.py`] = renderAppModule(tools, { server, pkg: pyServer, docsGate: gateMode });
+			const part = renderAppModuleParts(tools, { server, pkg: pyServer, docsGate: gateMode, readGate });
+			files[`${pyServer}.py`] = part.text;
+			if (lineMap) lineMap[pyServer] = part.lineMap;
 			continue;
 		}
 		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server, docsGate: gateMode });
@@ -1131,6 +1308,9 @@ export function generate(catalogue, { docsGate = "off", validateArgs = false, ap
 			files[`${pyServer}/${tool.pyName}.py`] = renderToolModule(tool, { server, docsGate: gateMode });
 		}
 	}
+
+	// Written last, so it can only ever describe modules that were actually rendered.
+	if (lineMap) files["_linemap.json"] = `${JSON.stringify(lineMap, null, 1)}\n`;
 
 	return { toolDefs, tocLines, names, files, normalized };
 }

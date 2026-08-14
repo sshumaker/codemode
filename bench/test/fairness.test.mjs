@@ -316,6 +316,94 @@ describe("every arm that has tools actually reaches the world", () => {
 });
 
 /**
+ * The same invariant one level down: a tool can be registered, advertised, callable,
+ * and still not *work*.
+ *
+ * Deferred registration produced an arm that could see tools and never call them.
+ * `--nav-tools` produced an arm that could call `grep` and always got an error:
+ * prime's grep and find shell out to `rg`/`fd`, resolve them under
+ * `<PRIME_AGENT_CODING_AGENT_DIR>/bin`, and `run-task.mjs` points that at a fresh
+ * per-run directory — so the binaries prime had already downloaded to
+ * `~/.prime/agent/bin` were invisible, and the fallback GitHub download is blocked
+ * by the arm's network sandbox.
+ *
+ * MEASURED before the fix: **50 grep calls across 62 `--nav-tools` runs, 50 failures**,
+ * every one `ripgrep (rg) is not available and could not be downloaded`. The agent
+ * fell back to hand-rolled `open()` scans, which read as a *model* reflex — the
+ * failure mode this repo keeps meeting, a plausible number instead of an error.
+ *
+ * So: assert the binary the runner will seed actually *executes on this machine*,
+ * and assert no recorded run advertised a navigation tool that failed for want of it.
+ */
+describe("advertised navigation tools actually execute", () => {
+	const rgPath = process.env.HARNESS_RG_PATH ?? join(process.env.HOME ?? "", ".prime/agent/bin/rg");
+	const fdPath = process.env.HARNESS_FD_PATH ?? join(process.env.HOME ?? "", ".prime/agent/bin/fd");
+
+	it("the runner seeds the per-run agent dir instead of trusting the download", () => {
+		const runner = readFileSync(join(ROOT, "bench/appworld/run-task.mjs"), "utf8");
+		// Seeded under the same agent-home the runner overrides, or prime cannot see it.
+		assert.match(runner, /join\(runDir, "agent-home", "bin"\)/);
+		assert.match(runner, /for \(const tool of \["rg", "fd"\]\)/);
+		// A missing source must be fatal. Silently continuing is the original bug.
+		assert.match(runner, /process\.exit\(1\)/);
+	});
+
+	it("the seed binaries run, rather than merely existing", async () => {
+		const { spawnSync } = await import("node:child_process");
+		for (const [name, path] of [
+			["rg", rgPath],
+			["fd", fdPath],
+		]) {
+			assert.ok(existsSync(path), `${name} seed source missing at ${path} — --nav-tools runs would advertise a dead tool`);
+			// `existsSync` certifies a path, not a program — the `find_spec` mistake.
+			// Only an exit code proves the thing the agent's tool shells out to works.
+			const probe = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 10_000 });
+			assert.equal(probe.status, 0, `${name} at ${path} did not execute: ${probe.error ?? probe.stderr}`);
+		}
+	});
+
+	it("no recorded nav-tools run failed for want of a navigation binary", async () => {
+		const RUNS = join(ROOT, ".run/appworld");
+		if (!existsSync(RUNS)) return;
+		const { readdirSync } = await import("node:fs");
+		const offenders = [];
+		let checked = 0;
+		let legacy = 0;
+		for (const dir of readdirSync(RUNS)) {
+			const path = join(RUNS, dir, "result.json");
+			if (!existsSync(path)) continue;
+			let run;
+			try {
+				run = JSON.parse(readFileSync(path, "utf8"));
+			} catch {
+				continue;
+			}
+			if (!run.variants?.navTools || !run.summary) continue;
+			const dead = (run.summary.errorMessages ?? []).filter((m) => /is not available and could not be downloaded/.test(m));
+			// Runs recorded before the seeding existed cannot satisfy this and are not
+			// a regression — they are the evidence for it. Asserting over them would
+			// leave the suite permanently red, which is how a check stops being read.
+			// `navToolBinaries` is written only by the seeding path, so it is exactly
+			// the "this run came from the fixed harness" discriminator.
+			if (!run.variants.navToolBinaries || Object.keys(run.variants.navToolBinaries).length === 0) {
+				if (dead.length > 0) legacy++;
+				continue;
+			}
+			checked++;
+			if (dead.length > 0) offenders.push(`${dir}: ${dead.length}x ${dead[0]}`);
+		}
+		if (legacy > 0) {
+			console.log(`      (${legacy} pre-seeding run(s) carry the dead-tool error; re-run before citing them)`);
+		}
+		assert.equal(
+			offenders.length,
+			0,
+			`${offenders.length} of ${checked} nav-tools run(s) advertised a tool that could not execute:\n  ${offenders.join("\n  ")}`,
+		);
+	});
+});
+
+/**
  * Invariants on the *analysis*, not on a run.
  *
  * The fifth instance tonight of a check producing a plausible number instead of an

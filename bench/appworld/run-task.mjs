@@ -8,7 +8,7 @@
  *   options   --residency L0|L1|L2|L4  --prompt a1  --vanilla-prompt b1|b2
  *             --timeout 900  --max-cost 1.0  --run-id X  --force
  *             --docs-gate[=redirect|inline]  --nav-tools  --validate-args
- *             --api-layout=per-method|consolidated
+ *             --api-layout=per-method|consolidated  --read-gate
  *                                     (codemode only; all default OFF/per-method)
  *             --catalogue <path>      the shared tool catalogue (arm-neutral)
  *             --base-prompt=v1|v2     the shared base prompt (arm-neutral, default v1)
@@ -36,7 +36,16 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	copyFileSync,
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { apiLayout, docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
@@ -60,6 +69,10 @@ const DEFAULT_CATALOGUE = "bench/data/appworld-schemas.json";
 // reads the same catalogue shape and POSTs to the same /call protocol, so the
 // AppWorld env-server is a drop-in for the MCP proxy. Not re-implemented.
 const EXTENSION = join(ROOT, "bench/arms/mcp-tools-extension.ts");
+// The codemode read-gate arm's ledger writer. The ONLY writer of the evidence the
+// gate in api/_client.py consults, so the precondition is verified rather than
+// advertised. See --read-gate below.
+const READ_LEDGER_EXTENSION = join(ROOT, "bench/arms/read-ledger-extension.ts");
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback) => {
@@ -157,6 +170,25 @@ function parseDocsGate() {
 const docsGate = parseDocsGate();
 const navTools = argv.includes("--nav-tools");
 /**
+ * --read-gate — a VERIFIED read-precondition on every API, in Edit's shape.
+ *
+ * The docs gate above is skippable by construction (marked-before-raise) and was
+ * measured being skipped: on the `ce73d68` family, zero of 12 codemode
+ * configurations ever read `reply_to_email`'s contract, the docs-gate ones
+ * included, and 35 of 36 runs then omitted the `email_addresses` argument whose
+ * default silently redirects the reply to the user themselves.
+ *
+ * This one cannot be cleared by retrying. The evidence is prime's own `read` tool,
+ * recorded by an extension into `api/.read-ledger.jsonl`; the gate in
+ * `api/_client.py` re-checks it on every call. See READ_GATE in bench/generate.mjs.
+ *
+ * Two hard requirements rather than silent coercion, because a run whose label
+ * over-claims is the failure this file guards against everywhere else:
+ *   --api-layout=consolidated  the cited line span is a property of that layout,
+ *   --nav-tools                without the read tool the gate is unsatisfiable.
+ */
+const readGate = argv.includes("--read-gate");
+/**
  * --validate-args — check every call's arguments against the source MCP schema
  * inside the agent's process, before the request is sent.
  *
@@ -204,12 +236,19 @@ const basePromptVersion = (() => {
 	}
 	return value;
 })();
-if ((docsGate !== "off" || navTools || validateArgs || layout !== "per-method") && arm !== "codemode") {
-	console.error(`--docs-gate/--nav-tools/--validate-args/--api-layout apply to the codemode arm only, got arm=${arm}`);
+if ((docsGate !== "off" || navTools || validateArgs || readGate || layout !== "per-method") && arm !== "codemode") {
+	console.error(`--docs-gate/--nav-tools/--validate-args/--read-gate/--api-layout apply to the codemode arm only, got arm=${arm}`);
+	process.exit(2);
+}
+if (readGate && (layout !== "consolidated" || !navTools)) {
+	// Refused, not coerced. Coercing would produce a run whose runId says `__rg` and
+	// whose tree cannot express the gate (per-method) or whose agent cannot satisfy
+	// it (no read tool) — a deadlock reported as a weak arm.
+	console.error("--read-gate requires --api-layout=consolidated and --nav-tools");
 	process.exit(2);
 }
 const variantSuffix =
-	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}${validateArgs ? "__val" : ""}` +
+	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}${validateArgs ? "__val" : ""}${readGate ? "__rg" : ""}` +
 	`${layout === "per-method" ? "" : `__layout-${layout}`}` +
 	// v1 contributes nothing, so every already-reported baseline keeps its runId.
 	`${basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`}` +
@@ -219,6 +258,10 @@ const variantSuffix =
 	`${cataloguePath === DEFAULT_CATALOGUE ? "" : `__cat-${cataloguePath.split("/").pop().replace(/\.json$/, "").replace(/[^a-z0-9]+/gi, "-")}`}`;
 const runId = flag("run-id", `${taskId}__${arm}__${residency}${promptSuffix}${variantSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`);
 const runDir = join(ROOT, ".run/appworld", runId);
+// Inside api/ so `--force`'s existing tree wipe clears it: a ledger that survived
+// a re-run would satisfy the gate with the PREVIOUS attempt's reads, which is the
+// `docker cp` staging bug from TAC arriving through a different door.
+const READ_LEDGER = join(runDir, "api", ".read-ledger.jsonl");
 
 // Never silently overwrite a completed run. A runId scheme change once replaced
 // two already-reported runs mid-experiment.
@@ -254,7 +297,7 @@ mark("startedAt");
 
 const catalogueRaw = readFileSync(CATALOGUE, "utf8");
 const { catalogue, appworldDataVersion, withResponseSchemas, enrichment } = JSON.parse(catalogueRaw);
-const { toolDefs, tocLines, names, files, normalized } = generate(catalogue, { docsGate, validateArgs, apiLayout: layout });
+const { toolDefs, tocLines, names, files, normalized } = generate(catalogue, { docsGate, readGate, validateArgs, apiLayout: layout });
 
 if (arm === "codemode") {
 	for (const [rel, content] of Object.entries(files)) {
@@ -389,7 +432,7 @@ const basePrompt = buildBase({ supervisor: supervisorName, apps: appsBlock, vers
 function preambleFor() {
 	// `apiLayout` reaches only the codemode preamble, and changes only the lines
 	// that say which files to open.
-	const ctx = { toolCount: toolDefs.length, serverCount: catalogue.length, apiLayout: layout };
+	const ctx = { toolCount: toolDefs.length, serverCount: catalogue.length, apiLayout: layout, readGate };
 	if (arm === "notools") return "";
 	if (arm === "vanilla") {
 		if (residency === "predicted") {
@@ -453,6 +496,57 @@ else if (arm === "vanilla") {
 	if (navTools) toolList = [...toolList, "read", "grep", "find", "ls"];
 }
 
+/**
+ * Seed `<agent-home>/bin` with the binaries prime's `grep` and `find` tools shell
+ * out to, or refuse to start.
+ *
+ * MEASURED: every one of the 50 `grep` calls across the first 62 `--nav-tools`
+ * runs returned `ripgrep (rg) is not available and could not be downloaded`. The
+ * arm was advertised four navigation tools and could execute two — the same class
+ * of bug as the deferred-registration "L1" that was really L4, and it produced a
+ * plausible number rather than an error: the agent fell back to hand-rolled
+ * `open()` scans, and the *arm* got blamed for the reflex.
+ *
+ * The cause is this file. `PRIME_AGENT_CODING_AGENT_DIR` is pointed at a fresh
+ * per-run `agent-home` for hermeticity, and prime resolves its managed binaries
+ * under `<agent dir>/bin` — so the copy it downloaded once into `~/.prime/agent/bin`
+ * is invisible to every run. It then falls through to a GitHub download, which the
+ * network-restricted arm blocks. `rg` additionally has no `systemBinaryNames`
+ * entry in prime's tools-manager, so a system `rg` would not be found either.
+ *
+ * Seeding the per-run dir keeps the hermeticity the override was for. A silent
+ * fall-through would recreate the original bug exactly, so a missing source is
+ * fatal and names the fix.
+ */
+const navToolBinaries = {};
+if (navTools) {
+	const seedBin = join(runDir, "agent-home", "bin");
+	mkdirSync(seedBin, { recursive: true });
+	for (const tool of ["rg", "fd"]) {
+		const source = process.env[`HARNESS_${tool.toUpperCase()}_PATH`] ?? join(process.env.HOME, ".prime/agent/bin", tool);
+		if (!existsSync(source)) {
+			console.error(
+				`--nav-tools needs a ${tool} binary at ${source}, and there is none.\n` +
+					`prime's grep/find tools shell out to it and cannot download one from inside\n` +
+					`this arm's network sandbox, so the tools would be advertised to the model and\n` +
+					`fail on every call. Point HARNESS_${tool.toUpperCase()}_PATH at a ${tool} binary, or run\n` +
+					`prime once outside the harness to populate ~/.prime/agent/bin.`,
+			);
+			process.exit(1);
+		}
+		const seeded = join(seedBin, tool);
+		copyFileSync(source, seeded);
+		// prime's getToolPath() only accepts a seeded binary if it actually runs
+		// (`commandWorks`), so the executable bit is load-bearing, not cosmetic.
+		chmodSync(seeded, 0o755);
+		// Provenance, and the discriminator the fairness test needs: runs recorded
+		// before this seeding existed are a different harness, and asserting the
+		// invariant against them would leave the suite permanently red instead of
+		// catching a regression.
+		navToolBinaries[tool] = source;
+	}
+}
+
 const digest = (s) => createHash("sha256").update(s).digest("hex").slice(0, 16);
 
 writeFileSync(
@@ -462,7 +556,7 @@ writeFileSync(
 			runId,
 			arm,
 			residency,
-			variants: { docsGate, navTools, validateArgs, apiLayout: layout, basePromptVersion },
+			variants: { docsGate, navTools, validateArgs, readGate, apiLayout: layout, basePromptVersion, navToolBinaries },
 			// The two halves, separately, so "was the base identical?" is a diff and
 			// not an argument.
 			basePrompt,
@@ -507,7 +601,7 @@ const meta = {
 	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
 	// Which opt-in codemode variants were on. A run compared against another must
 	// be able to say which condition it was in without re-reading the api/ tree.
-	variants: { docsGate, navTools, validateArgs, apiLayout: layout, basePromptVersion },
+	variants: { docsGate, navTools, validateArgs, readGate, apiLayout: layout, basePromptVersion, navToolBinaries },
 	basePromptDigest: digest(basePrompt),
 	preambleChars: preamble.length,
 	toolCount: toolList.length,
@@ -525,6 +619,10 @@ const summary = {
 	errorMessages: [],
 	// Populated only when --validate-args rendered a validator into the tree.
 	argumentErrors: [],
+	// Populated only under --read-gate: every refusal the gate issued, with the turn
+	// it landed on. A count alone cannot answer the question the variant exists to
+	// answer -- whether the correction was acted on next cell.
+	readFirstRaises: [],
 	input: 0,
 	output: 0,
 	cacheRead: 0,
@@ -559,6 +657,9 @@ async function main() {
 		basePrompt,
 	];
 	if (arm === "vanilla") cliArgs.push("--extension", EXTENSION);
+	// codemode is extension-free except under --read-gate, where one extension is the
+	// gate's evidence channel. Named explicitly rather than left to discovery.
+	else if (readGate) cliArgs.push("--extension", READ_LEDGER_EXTENSION);
 	else cliArgs.push("--no-extensions");
 	if (preamble) cliArgs.push("--append-system-prompt", preamble);
 	cliArgs.push(facts.instruction);
@@ -587,6 +688,11 @@ async function main() {
 			// Provenance only, for the same reason: validation is rendered into
 			// api/_client.py, not switched on by this variable.
 			...(validateArgs ? { HARNESS_VALIDATE_ARGS: "1" } : {}),
+			// NOT provenance: the extension needs somewhere to write, and the gate
+			// rendered into api/_client.py reads the same path. If it failed to
+			// propagate the extension would throw at load rather than silently produce
+			// a gate-on run with an empty ledger, which is why it is required there.
+			...(readGate ? { HARNESS_READ_LEDGER: READ_LEDGER } : {}),
 			// Optional narrowing, passed straight through from the environment so a
 			// targeted gate needs no new flag: HARNESS_DOCS_GATE_ONLY=supervisor.complete_task
 			...(process.env.HARNESS_DOCS_GATE_ONLY
@@ -671,6 +777,12 @@ async function main() {
 				// one per unrelated failure.
 				for (const m of text.matchAll(/ArgumentError: (api\.[\w.]+: [^\n]+)/g)) {
 					summary.argumentErrors.push({ turn: summary.turns, message: m[1].slice(0, 400) });
+				}
+				// Same treatment, same reason, for the read gate's refusals. Outside the
+				// isError branch on purpose: an exception the agent caught inside its own
+				// cell is still a refusal that was delivered.
+				for (const m of text.matchAll(/ReadFirst: (api\.[\w.]+ has not been read[^\n]*)/g)) {
+					summary.readFirstRaises.push({ turn: summary.turns, message: m[1].slice(0, 300) });
 				}
 			} else if (event.type === "message_end" && event.message?.role === "assistant") {
 				const message = event.message;
@@ -812,6 +924,58 @@ async function main() {
 	// Byte-identical repeats. Not deduplicated anywhere — read-only is not
 	// idempotent — but worth measuring, since it is the agent's judgement call.
 	summary.duplicateCalls = envCalls.length - new Set(envCalls.map((c) => c.code)).size;
+
+	/**
+	 * The read gate's own evidence, and the guard that it actually bound.
+	 *
+	 * "A documented check is not an executed check", and the sibling failure this is
+	 * modelled on is the deferred-registration one: a residency guard caught "the
+	 * schemas are still resident" and NOTHING caught "narrowing worked and execution
+	 * broke". Here the equivalent silent failure is a gate that never fires — an
+	 * extension that failed to load, or a ledger the client could not find — which
+	 * would produce an ordinary-looking run wearing an `__rg` label.
+	 *
+	 * So assert the observable effect in both directions: every app the arm reached
+	 * must have been read first, and the gate must have refused at least once.
+	 */
+	if (readGate) {
+		const ledger = existsSync(READ_LEDGER)
+			? readFileSync(READ_LEDGER, "utf8")
+					.split("\n")
+					.filter((l) => l.trim())
+					.map((l) => JSON.parse(l))
+			: [];
+		const reads = ledger.filter((e) => e.tool === "read" && !e.isError);
+		const firstCallAt = new Map();
+		for (const call of envCalls) {
+			const at = Number(call.t);
+			if (!firstCallAt.has(call.app) || at < firstCallAt.get(call.app)) firstCallAt.set(call.app, at);
+		}
+		const readAt = new Map();
+		for (const entry of reads) {
+			const at = Date.parse(entry.ts) / 1000;
+			if (!readAt.has(entry.pkg) || at < readAt.get(entry.pkg)) readAt.set(entry.pkg, at);
+		}
+		summary.readGate = {
+			reads: reads.length,
+			greps: ledger.filter((e) => e.tool === "grep").length,
+			appsRead: [...readAt.keys()].sort(),
+			appsCalled: [...firstCallAt.keys()].sort(),
+			raises: summary.readFirstRaises.length,
+			// Per app: did a read land before the first call to it? The gate makes this
+			// true by construction, which is exactly why it is worth checking.
+			readBeforeFirstCall: Object.fromEntries(
+				[...firstCallAt].map(([app, at]) => [app, readAt.has(app) && readAt.get(app) < at]),
+			),
+		};
+		const unread = [...firstCallAt.keys()].filter((app) => !readAt.has(app) || readAt.get(app) >= firstCallAt.get(app));
+		if (unread.length > 0) {
+			summary.readGateViolation = `called ${unread.join(",")} with no prior read — the gate did not bind, so this is not a read-gate run`;
+		} else if (reads.length === 0) {
+			summary.readGateViolation = "the ledger is empty — the extension did not load, so this is not a read-gate run";
+		}
+	}
+
 	summary.wallMs = phases.gradeEnd - phases.startedAt;
 	summary.phases = phases;
 
@@ -824,10 +988,18 @@ async function main() {
 			`${summary.turns} turns, ${summary.toolCalls} tool calls (${tally}), ${summary.apiCalls} api calls ` +
 			`(${summary.distinctApis} distinct, ${summary.duplicateCalls} dupes), ${summary.toolErrors} errors, ` +
 			`${validateArgs ? `${summary.argumentErrors.length} argErrs, ` : ""}` +
+			`${readGate ? `${summary.readFirstRaises.length} readFirst, ` : ""}` +
 			`$${summary.cost.toFixed(4)}, ${((summary.wallMs ?? 0) / 1000).toFixed(0)}s` +
 			`${summary.stopReason === "completed" ? "" : ` [${summary.stopReason.toUpperCase()}]`}`,
 	);
 	if (summary.residencyViolation) console.log(`  !! ${summary.residencyViolation}`);
+	if (summary.readGate) {
+		console.log(
+			`  read-gate: ${summary.readGate.raises} refusals, ${summary.readGate.reads} reads ` +
+				`(${summary.readGate.appsRead.join(",") || "none"}), ${summary.readGate.greps} greps`,
+		);
+	}
+	if (summary.readGateViolation) console.log(`  !! ${summary.readGateViolation}`);
 	console.log(`  answer: ${JSON.stringify(summary.committedAnswer)} vs gt ${JSON.stringify(summary.groundTruthAnswer)}`);
 	console.log(`  -> ${runDir}`);
 	process.exit(0);

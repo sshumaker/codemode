@@ -280,7 +280,7 @@ export function buildBase({ supervisor, apps, version = "v1" }) {
 export const VARIANTS = {
 	a1: {
 		note: "baseline: discovery + async + persistent kernel, no economy pressure",
-		build: ({ toolCount, serverCount, apiLayout = "per-method" }) =>
+		build: ({ toolCount, serverCount, apiLayout = "per-method", readGate = false }) =>
 			[
 				"## Your tools",
 				"",
@@ -288,21 +288,51 @@ export const VARIANTS = {
 				`functions across ${serverCount} apps, under \`api/\` in your working directory.`,
 				"Nothing is listed in this prompt — you find what you need by looking.",
 				"",
-				"  cat api/INDEX.md                    # the apps, and how many APIs each has",
-				// The ONLY thing --api-layout changes in this prompt: which files exist
-				// and therefore which ones to open. Everything below — async, the
+				// The ONLY thing --api-layout and --read-gate change in this prompt: which
+				// files exist and how you open them. Everything below — async, the
 				// persistent kernel, the call-site example — is byte-identical, so the
 				// A/B measures the shape of the tree rather than a reworded prompt.
-				...(apiLayout === "consolidated"
+				//
+				// The read-gate wording is in the `read`/`grep` TOOLS, never `cat`, and
+				// that is the whole design: the gate is satisfied by the read tool alone,
+				// so a prompt that taught `cat` would teach the one move that cannot
+				// clear it. Naming the tool the model already reaches for is the
+				// affordance rule (CLAUDE.md) applied to a precondition.
+				...(readGate
 					? [
-							"  grep -ril '<keyword>' api/          # search every API's documentation",
-							"  cat api/<app>.py                    # one app: every API, with full parameter docs",
+							"Start by using the `read` TOOL on api/INDEX.md. ALWAYS use the `read` and",
+							"`grep` TOOLS on these files. NEVER read or search one with Python (`open()`,",
+							"a comprehension over the source) or with `%%bash cat`/`head`/`grep` — those",
+							"strip the docstrings, and the docstring IS the contract:",
+							"",
+							"  read api/INDEX.md                   # the apps, and how many APIs each has",
+							"  grep '<keyword>' api/               # search every API's documentation",
+							"  read api/<app>.py                   # one app: every API, with full parameter docs",
+							"",
+							"`grep` is built on ripgrep: full regex, whole tree, file+line for every hit.",
+							"Locate first, then read only the part you need:",
+							"",
+							"  grep 'def reply_to_email' api/      # -> api/gmail.py:412",
+							"  read api/gmail.py offset=412 limit=60",
+							"",
+							"An API cannot be called until you have read its contract: calling one first",
+							"raises `ReadFirst` and sends nothing, and retrying without reading raises",
+							"again. Reading an app's file once covers ALL of that app's APIs, so this is",
+							"one read per app, not one per API. Read the app file before you plan the",
+							"calls — the defaults are in there, and a default decides what a call does.",
 						]
-					: [
-							"  cat api/<app>/INDEX.md              # one line per API in that app",
-							"  grep -ril '<keyword>' api/          # search every API's documentation",
-							"  cat api/<app>/<api>.py              # full parameter documentation",
-						]),
+					: apiLayout === "consolidated"
+						? [
+								"  cat api/INDEX.md                    # the apps, and how many APIs each has",
+								"  grep -ril '<keyword>' api/          # search every API's documentation",
+								"  cat api/<app>.py                    # one app: every API, with full parameter docs",
+							]
+						: [
+								"  cat api/INDEX.md                    # the apps, and how many APIs each has",
+								"  cat api/<app>/INDEX.md              # one line per API in that app",
+								"  grep -ril '<keyword>' api/          # search every API's documentation",
+								"  cat api/<app>/<api>.py              # full parameter documentation",
+							]),
 				"",
 				"Call one from a cell. They are all `async`:",
 				"",
