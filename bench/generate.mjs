@@ -126,6 +126,75 @@ export function normalizeTool(tool) {
 const firstLine = (text) => (text ?? "").trim().split("\n")[0]?.trim() ?? "";
 
 /**
+ * The required-default transform: an optional parameter that decides WHO a
+ * mutation lands on is rendered with no default, so it cannot be left out.
+ *
+ * Measured motivation, in full in `docs/CC-EDGE-TRACES.md` §M1 and in the header
+ * of `bench/required-defaults.mjs`: `gmail.reply_to_email.email_addresses`
+ * defaults to "the sender", which on an outbox thread is the user themselves.
+ * 35 of 36 codemode runs omitted it and every one failed. Making the schema
+ * visible did not fix it (L4 fails identically), and *proving the model read the
+ * sentence* did not fix it (the verified read-gate). Visible-and-optional loses;
+ * the untested condition is required.
+ *
+ * What the transform is allowed to be, stated as a constraint on this file: it
+ * changes the SIGNATURE and one docstring line, and nothing else. The call site,
+ * the transport, the arguments actually sent and the tree's layout are all
+ * untouched, so with the flag off the tree is byte-identical to the one every
+ * earlier run used — asserted in `bench/test/required-defaults.test.mjs`.
+ *
+ * The list itself is never authored here. It comes from a codegen-time
+ * classifier that sees schemas and docstrings only, and every entry carries the
+ * verbatim sentence that justifies it.
+ */
+export function requiredDefaultNote(param) {
+	if (!param?.requiredDefault) return null;
+	// Whitespace-collapsed, and `"""` removed so a quote can never terminate the
+	// docstring it is quoted inside. Backslashes go for the same reason: this text
+	// is emitted into a Python source file, and CLAUDE.md already records a run
+	// where an injected snippet's backslashes were mangled into a file that would
+	// not compile.
+	const quote = String(param.requiredDefault).replace(/\s+/g, " ").replace(/["\\]/g, "").trim().slice(0, 200);
+	return (
+		`Required here: the server-side default ('${quote}') resolves against` +
+		" runtime state, so you must choose explicitly."
+	);
+}
+
+/**
+ * Promote the listed parameters of one tool from optional to required.
+ *
+ * Copies rather than mutates: `normalizeTool` hands back the catalogue's own
+ * `inputSchema` object, so writing `required` through would edit the shared
+ * catalogue in memory and make a second `generate()` in the same process return
+ * something different from the first — a silent cross-run contamination in
+ * exactly the family this project keeps finding.
+ */
+function applyRequiredDefaults(tool, server, index) {
+	if (!index || index.size === 0) return tool;
+	const promoted = [];
+	const params = tool.params.map((p) => {
+		const quote = index.get(`${server}\u0000${tool.name}\u0000${p.name}`);
+		if (quote === undefined || p.required) return p;
+		promoted.push(p.name);
+		return { ...p, required: true, requiredDefault: quote };
+	});
+	if (promoted.length === 0) return tool;
+	// Required parameters must precede optional ones in a Python signature. The
+	// sort is stable, so the originally-required ones keep their order and the
+	// promoted ones follow in theirs.
+	params.sort((a, b) => Number(b.required) - Number(a.required));
+	return {
+		...tool,
+		params,
+		// The schema moves with the signature, so `--validate-args` enforces the same
+		// presence the signature does and `_schemas.json` cannot disagree with the
+		// module it sits next to.
+		schema: { ...tool.schema, required: [...new Set([...(tool.schema.required ?? []), ...promoted])] },
+	};
+}
+
+/**
  * `api.<pkg>.<tool>(required, optional?)` — the call an agent would type.
  *
  * One function because three renderers show this string (the server index, the
@@ -219,8 +288,12 @@ export function renderFullDocs(tools, { server, heading = true }) {
 		const description = (tool.description ?? "").trim();
 		if (description) for (const line of description.split("\n")) lines.push(`    ${line}`);
 		for (const p of tool.params) {
-			if (!p.description) continue;
-			lines.push(`      ${p.pyName}: ${p.description}${p.required ? "" : " (optional)"}`);
+			const required = requiredDefaultNote(p);
+			if (!p.description && !required) continue;
+			if (p.description) lines.push(`      ${p.pyName}: ${p.description}${p.required ? "" : " (optional)"}`);
+			// The same sentence the module docstring carries, from the same helper: the
+			// resident L4 text and the on-disk text must not be able to drift.
+			if (required) lines.push(`        ${required}`);
 		}
 		lines.push("");
 	}
@@ -674,6 +747,12 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
 			const note = p.description ? ` ${p.description}` : "";
 			const opt = p.required ? "" : " Optional.";
 			doc.push(`        ${p.pyName}:${note}${opt}`.trimEnd());
+			// One line, and only for a promoted parameter. Without it the signature
+			// says "required" while the description it sits beside still says the
+			// server has a default for it, and the agent is left to reconcile two
+			// contradictory statements about the same slot.
+			const required = requiredDefaultNote(p);
+			if (required) doc.push(`            ${required}`);
 		}
 	}
 	doc.push("", "    Returns:", "        The tool result as returned by the MCP server.", '    """');
@@ -1238,19 +1317,30 @@ export function renderRootIndex(catalogue, { docsGate = "off", readGate = false,
  *        arguments against it before the request leaves the process
  * @param options.apiLayout "per-method" | "consolidated" — see API_LAYOUTS
  * @param options.readGate render the verified read-precondition and `_linemap.json`
+ * @param options.requiredDefaults Map of `"<server>\0<tool>\0<param>"` -> evidence
+ *        quote, from bench/required-defaults.mjs. Those parameters render with no
+ *        default, so omitting one is a TypeError at the call site. See
+ *        `requiredDefaultNote`.
  * @returns { toolDefs, tocLines, names, files } — `files` is a path -> content
  *          map rooted at `api/`, written to disk by the caller.
  */
-export function generate(catalogue, { docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method" } = {}) {
+export function generate(
+	catalogue,
+	{ docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method", requiredDefaults = null } = {},
+) {
 	const gateMode = docsGateMode(docsGate);
 	const layoutMode = apiLayout(layout);
 	// Real MCP server names contain spaces ("OpenAPI Explorer", "Math MCP"), so
 	// the package directory needs its own identifier. The raw name is still what
 	// goes on the wire and what the TOC and tool defs display.
+	// Applied ONCE, here, immediately after normalization — so every container
+	// (the module, the L4 resident docs, the TOC, the vanilla tool defs, the
+	// validator's `_schemas.json`) is rendered from one promoted tool object and
+	// they cannot disagree about which parameters are required.
 	const normalized = catalogue.map((s) => ({
 		server: s.server,
 		pyServer: pyPackage(s.server),
-		tools: s.tools.map(normalizeTool),
+		tools: s.tools.map((t) => applyRequiredDefaults(normalizeTool(t), s.server, requiredDefaults)),
 	}));
 
 	const seen = new Map();

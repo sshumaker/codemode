@@ -1,0 +1,30 @@
+{
+ "model": "claude-opus-5",
+ "source": "bench/data/appworld-schemas.json",
+ "sourceDigest": "bfa5630ca80a2a61",
+ "trace": "bench/data/required-defaults-trace.jsonl",
+ "builtAt": "2026-08-14T15:47:49.629Z",
+ "stats": {
+  "tools": 469,
+  "mutating": 301,
+  "proposals": 22,
+  "accepted": 1,
+  "rejected": 21,
+  "failed": 0,
+  "inputTokens": 436058,
+  "outputTokens": 26639
+ },
+ "rejections": {
+  "evidence does not state what happens when it is omitted": 2,
+  "evidence states a literal default, not a runtime-resolved on": 12,
+  "not a mutation": 7
+ },
+ "entries": [
+  {
+   "app": "gmail",
+   "tool": "reply_to_email",
+   "param": "email_addresses",
+   "evidence_quote": "List of recipient email addresses. If passed, it'll reply to all recipients in the list, otherwise, to the sender."
+  }
+ ]
+}

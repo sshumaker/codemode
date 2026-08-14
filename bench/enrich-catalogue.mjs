@@ -132,7 +132,15 @@ function run(cmd, args, input) {
 	});
 }
 
-async function callModel(envFile, model, prompt) {
+/**
+ * One model call, returning `{ parsed, usage }`.
+ *
+ * Exported because `bench/required-defaults.mjs` is the same kind of pass — a
+ * codegen-time question asked of one tool's three public fields — and two
+ * spellings of "how this project calls the API" is the drift the
+ * single-authored-text rule exists to prevent.
+ */
+export async function callModel(envFile, model, prompt) {
 	const payload = JSON.stringify({
 		model,
 		max_tokens: 2000,

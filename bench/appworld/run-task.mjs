@@ -9,6 +9,8 @@
  *             --timeout 900  --max-cost 1.0  --run-id X  --force
  *             --docs-gate[=redirect|inline]  --nav-tools  --validate-args
  *             --api-layout=per-method|consolidated  --read-gate
+ *             --required-defaults     render the classifier's listed parameters
+ *                                     with no default (bench/required-defaults.mjs)
  *                                     (codemode only; all default OFF/per-method)
  *             --catalogue <path>      the shared tool catalogue (arm-neutral)
  *             --base-prompt=v1|v2     the shared base prompt (arm-neutral, default v1)
@@ -49,6 +51,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { apiLayout, docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
+import { loadRequiredDefaults } from "../required-defaults.mjs";
 import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -201,6 +204,38 @@ const readGate = argv.includes("--read-gate");
  */
 const validateArgs = argv.includes("--validate-args") || process.env.HARNESS_VALIDATE_ARGS === "1";
 /**
+ * --required-defaults — render the classifier's listed parameters with no default.
+ *
+ * The last untested cell of the `ce73d68` mechanism (docs/CC-EDGE-TRACES.md §M1).
+ * `gmail.reply_to_email.email_addresses` defaults to "the sender", which on an
+ * outbox thread is the user; 35 of 36 codemode runs omitted it and every one
+ * failed. Residency did not fix it, and neither did the verified read-gate, which
+ * PROVED the model had read that sentence and it omitted the argument anyway.
+ * Visible-and-optional loses. This makes the slot impossible to leave empty: the
+ * signature carries no default, so omission is a Python TypeError in the cell
+ * that made the mistake.
+ *
+ * The list is never authored by hand — `bench/required-defaults.mjs` derives it
+ * from schemas and docstrings only, and every entry carries the verbatim sentence
+ * that justifies it. Missing file is a hard failure rather than an empty index,
+ * because a `__reqd` run that transformed nothing is a label that over-claims.
+ */
+const requiredDefaultsFile = flag("required-defaults-file", "bench/data/appworld-required-defaults.json");
+const requiredDefaultsOn = argv.includes("--required-defaults");
+let requiredDefaults = null;
+if (requiredDefaultsOn) {
+	const path = resolve(ROOT, requiredDefaultsFile);
+	if (!existsSync(path)) {
+		console.error(`missing required-defaults list: ${path}\n  run: node bench/required-defaults.mjs <env-file>`);
+		process.exit(2);
+	}
+	requiredDefaults = loadRequiredDefaults(path);
+	if (requiredDefaults.size === 0) {
+		console.error(`${path} lists no parameters — a --required-defaults run would transform nothing`);
+		process.exit(2);
+	}
+}
+/**
  * --api-layout=per-method|consolidated — how the api/ tree is arranged on disk.
  *
  * `consolidated` is one module per app (`api/gmail.py`) instead of one file per
@@ -236,8 +271,10 @@ const basePromptVersion = (() => {
 	}
 	return value;
 })();
-if ((docsGate !== "off" || navTools || validateArgs || readGate || layout !== "per-method") && arm !== "codemode") {
-	console.error(`--docs-gate/--nav-tools/--validate-args/--read-gate/--api-layout apply to the codemode arm only, got arm=${arm}`);
+if ((docsGate !== "off" || navTools || validateArgs || readGate || requiredDefaultsOn || layout !== "per-method") && arm !== "codemode") {
+	console.error(
+		`--docs-gate/--nav-tools/--validate-args/--read-gate/--required-defaults/--api-layout apply to the codemode arm only, got arm=${arm}`,
+	);
 	process.exit(2);
 }
 if (readGate && (layout !== "consolidated" || !navTools)) {
@@ -248,7 +285,7 @@ if (readGate && (layout !== "consolidated" || !navTools)) {
 	process.exit(2);
 }
 const variantSuffix =
-	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}${validateArgs ? "__val" : ""}${readGate ? "__rg" : ""}` +
+	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}${validateArgs ? "__val" : ""}${readGate ? "__rg" : ""}${requiredDefaultsOn ? "__reqd" : ""}` +
 	`${layout === "per-method" ? "" : `__layout-${layout}`}` +
 	// v1 contributes nothing, so every already-reported baseline keeps its runId.
 	`${basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`}` +
@@ -297,7 +334,26 @@ mark("startedAt");
 
 const catalogueRaw = readFileSync(CATALOGUE, "utf8");
 const { catalogue, appworldDataVersion, withResponseSchemas, enrichment } = JSON.parse(catalogueRaw);
-const { toolDefs, tocLines, names, files, normalized } = generate(catalogue, { docsGate, readGate, validateArgs, apiLayout: layout });
+const { toolDefs, tocLines, names, files, normalized } = generate(catalogue, {
+	docsGate,
+	readGate,
+	validateArgs,
+	apiLayout: layout,
+	requiredDefaults,
+});
+// What the transform actually did to THIS catalogue, recorded before the run so
+// the artefacts answer "which parameters were promoted" without re-deriving it.
+// A listed parameter whose tool is not in the catalogue promotes nothing, and a
+// run that promoted nothing is not a `__reqd` run.
+const promoted = requiredDefaults
+	? normalized.flatMap(({ server, tools }) =>
+			tools.flatMap((t) => t.params.filter((p) => p.requiredDefault).map((p) => `${server}.${t.name}.${p.name}`)),
+		)
+	: [];
+if (requiredDefaultsOn && promoted.length === 0) {
+	console.error("--required-defaults promoted no parameter in this catalogue — the transform did not bind");
+	process.exit(2);
+}
 
 if (arm === "codemode") {
 	for (const [rel, content] of Object.entries(files)) {
@@ -556,7 +612,7 @@ writeFileSync(
 			runId,
 			arm,
 			residency,
-			variants: { docsGate, navTools, validateArgs, readGate, apiLayout: layout, basePromptVersion, navToolBinaries },
+			variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, apiLayout: layout, basePromptVersion, navToolBinaries },
 			// The two halves, separately, so "was the base identical?" is a diff and
 			// not an argument.
 			basePrompt,
@@ -601,7 +657,7 @@ const meta = {
 	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
 	// Which opt-in codemode variants were on. A run compared against another must
 	// be able to say which condition it was in without re-reading the api/ tree.
-	variants: { docsGate, navTools, validateArgs, readGate, apiLayout: layout, basePromptVersion, navToolBinaries },
+	variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, apiLayout: layout, basePromptVersion, navToolBinaries },
 	basePromptDigest: digest(basePrompt),
 	preambleChars: preamble.length,
 	toolCount: toolList.length,
@@ -976,6 +1032,52 @@ async function main() {
 		}
 	}
 
+	/**
+	 * The required-default transform's own evidence, read off the transport.
+	 *
+	 * Same reason the read gate has one: "a documented check is not an executed
+	 * check", and the silent failure here is a stale `api/` tree — a run whose
+	 * runId says `__reqd` and whose signatures still carry the default. That would
+	 * look exactly like a weak arm. So assert the observable effect: every call to
+	 * a promoted (app, api) MUST carry the promoted parameter, because there is no
+	 * longer a signature that permits otherwise.
+	 *
+	 * The VALUE is logged, not just the presence, because presence is guaranteed by
+	 * construction and the falsifier is about the value: an agent forced to fill the
+	 * slot could fill it with its own address, in which case the mechanism was never
+	 * representational and the transform fixes nothing.
+	 */
+	if (requiredDefaultsOn) {
+		const wanted = new Map();
+		for (const key of requiredDefaults.keys()) {
+			const [app, api, param] = key.split("\u0000");
+			wanted.set(`${app}.${api}`, [...(wanted.get(`${app}.${api}`) ?? []), param]);
+		}
+		const calls = [];
+		for (const call of envCalls) {
+			const params = wanted.get(`${call.app}.${call.api}`);
+			if (!params) continue;
+			for (const param of params) {
+				calls.push({ api: `${call.app}.${call.api}`, param, supplied: param in (call.args ?? {}), value: call.args?.[param] ?? null });
+			}
+		}
+		summary.requiredDefaults = { promoted: promoted.length, calls };
+		const omitted = calls.filter((c) => !c.supplied);
+		if (omitted.length > 0) {
+			// The tree is generated from the same object `promoted` was derived from and
+			// the run refuses to start if that is empty, so a stale signature is ruled
+			// out before the agent runs. What is left is the one escape Python allows:
+			// `email_addresses=None` is a legal call against a no-default parameter, and
+			// `_client` drops Nones before sending. That is a DELIBERATE choice of "no
+			// recipients" rather than an omission — but it reproduces the same bug, so it
+			// is reported as loudly as a broken transform would be.
+			summary.requiredDefaultsViolation =
+				`${omitted.length} call(s) to ${[...new Set(omitted.map((c) => c.api))].join(",")} reached the transport` +
+				" without a promoted parameter — the signature has no default for it, so the value was passed" +
+				" explicitly as None (--validate-args would refuse this; it was not on)";
+		}
+	}
+
 	summary.wallMs = phases.gradeEnd - phases.startedAt;
 	summary.phases = phases;
 
@@ -1000,6 +1102,14 @@ async function main() {
 		);
 	}
 	if (summary.readGateViolation) console.log(`  !! ${summary.readGateViolation}`);
+	if (summary.requiredDefaults) {
+		const { promoted: n, calls } = summary.requiredDefaults;
+		console.log(
+			`  required-defaults: ${n} params promoted, ${calls.length} call(s) to one` +
+				`${calls.map((c) => `\n    ${c.api}.${c.param} = ${JSON.stringify(c.value)}`).join("")}`,
+		);
+	}
+	if (summary.requiredDefaultsViolation) console.log(`  !! ${summary.requiredDefaultsViolation}`);
 	console.log(`  answer: ${JSON.stringify(summary.committedAnswer)} vs gt ${JSON.stringify(summary.groundTruthAnswer)}`);
 	console.log(`  -> ${runDir}`);
 	process.exit(0);

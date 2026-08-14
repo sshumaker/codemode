@@ -29,6 +29,13 @@
  *   --codemode-validate-args
  *   --codemode-read-gate   verified read-precondition on every API (implies
  *                          --codemode-nav-tools + --codemode-api-layout=consolidated)
+ *   --codemode-required-defaults
+ *                          the parameters bench/required-defaults.mjs listed — an
+ *                          optional argument of a MUTATING API whose documented
+ *                          default resolves against runtime state ("otherwise, to
+ *                          the sender") — render with no default, so omitting one
+ *                          is a TypeError at the call site rather than a silent
+ *                          redirect of who the call affects
  *                          check every call's arguments against the source MCP
  *                          schema inside the agent's process, before the request
  *                          is sent; a violation raises ArgumentError naming the
@@ -111,6 +118,12 @@ const codemodeValidateArgs = has("codemode-validate-args");
 // Refused here as well as in the runner, so an unsatisfiable combination fails
 // before 46 tasks run rather than 46 times.
 const codemodeReadGate = has("codemode-read-gate");
+/**
+ * --codemode-required-defaults — render the classifier's listed parameters with no
+ * default, so an optional argument that decides WHO a mutation lands on cannot be
+ * left out. See bench/required-defaults.mjs and docs/CC-EDGE-TRACES.md §M1.
+ */
+const codemodeRequiredDefaults = has("codemode-required-defaults");
 /**
  * --codemode-api-layout[=consolidated] — one module per app instead of one file per
  * method. Validated here as well as in the runner so a typo fails before 46 tasks run.
@@ -244,7 +257,7 @@ for (const task of tasks ?? []) {
 			// look for a run that was written under a different name.
 			const variantSuffix =
 				arm === "codemode"
-					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}${codemodeValidateArgs ? "__val" : ""}${codemodeReadGate ? "__rg" : ""}${codemodeApiLayout === "per-method" ? "" : `__layout-${codemodeApiLayout}`}`
+					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}${codemodeValidateArgs ? "__val" : ""}${codemodeReadGate ? "__rg" : ""}${codemodeRequiredDefaults ? "__reqd" : ""}${codemodeApiLayout === "per-method" ? "" : `__layout-${codemodeApiLayout}`}`
 					: "";
 			const base = `${task}__${arm}__${residency}${suffix}${variantSuffix}${basePromptSuffix}${catalogueSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 			cells.push({ task, arm, residency, vanillaPromptName, repeat: r, runId: repeat > 1 ? `${base}__r${r}` : base });
@@ -280,6 +293,7 @@ async function runCell(cell) {
 		if (codemodeNavTools) args.push("--nav-tools");
 		if (codemodeValidateArgs) args.push("--validate-args");
 		if (codemodeReadGate) args.push("--read-gate");
+		if (codemodeRequiredDefaults) args.push("--required-defaults");
 		if (codemodeApiLayout !== "per-method") args.push(`--api-layout=${codemodeApiLayout}`);
 	}
 	// Every arm, unconditionally — see the comment on cataloguePath.
