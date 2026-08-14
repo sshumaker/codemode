@@ -76,6 +76,13 @@ const EXTENSION = join(ROOT, "bench/arms/mcp-tools-extension.ts");
 // gate in api/_client.py consults, so the precondition is verified rather than
 // advertised. See --read-gate below.
 const READ_LEDGER_EXTENSION = join(ROOT, "bench/arms/read-ledger-extension.ts");
+/**
+ * The codemode `--bash` arm's guard. Registers no tool — it intercepts prime's own
+ * `bash` — and here it is doing one job the terminal-bench copy does not: refusing
+ * network egress, so that adding a shell does not open a second route to the world.
+ */
+const BASH_EXTENSION = join(ROOT, "bench/arms/bash-tool-extension.ts");
+const JOBS_PY = join(ROOT, "runtime/jobs.py");
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback) => {
@@ -192,6 +199,21 @@ const navTools = argv.includes("--nav-tools");
  */
 const readGate = argv.includes("--read-gate");
 /**
+ * --bash — give codemode a shell, guarded so it cannot become a second transport.
+ *
+ * `--nav-tools` above says why bash was withheld: 78% of vanilla's bash calls on
+ * MCP-Bench were `curl` straight to the APIs its tools wrapped, and here the world
+ * is reachable only through the env-server. That reason is about EGRESS, not about
+ * shells — so the honest form is not "no bash" but "bash that cannot reach the
+ * network", which is what bench/arms/bash-tool-extension.ts enforces and records.
+ *
+ * Opt-in, and in the runId, because this is a regression question: does adding the
+ * tool cost anything on a benchmark that is API work rather than shell work? A run
+ * that overwrote the no-bash baseline would destroy the comparison it exists to
+ * make.
+ */
+const bashTool = argv.includes("--bash");
+/**
  * --validate-args — check every call's arguments against the source MCP schema
  * inside the agent's process, before the request is sent.
  *
@@ -271,10 +293,17 @@ const basePromptVersion = (() => {
 	}
 	return value;
 })();
-if ((docsGate !== "off" || navTools || validateArgs || readGate || requiredDefaultsOn || layout !== "per-method") && arm !== "codemode") {
+if ((docsGate !== "off" || navTools || validateArgs || readGate || requiredDefaultsOn || bashTool || layout !== "per-method") && arm !== "codemode") {
 	console.error(
-		`--docs-gate/--nav-tools/--validate-args/--read-gate/--required-defaults/--api-layout apply to the codemode arm only, got arm=${arm}`,
+		`--docs-gate/--nav-tools/--validate-args/--read-gate/--required-defaults/--bash/--api-layout apply to the codemode arm only, got arm=${arm}`,
 	);
+	process.exit(2);
+}
+if (bashTool && !existsSync(JOBS_PY)) {
+	// Refused, not degraded. The guard's verdict comes from jobs.blocking_sleep, and
+	// a `__bash` run whose guard could not load is an unguarded shell wearing a
+	// guarded label — the exact failure this file guards against everywhere else.
+	console.error(`--bash needs the jobs runtime for its guard: ${JOBS_PY} is missing`);
 	process.exit(2);
 }
 if (readGate && (layout !== "consolidated" || !navTools)) {
@@ -285,7 +314,7 @@ if (readGate && (layout !== "consolidated" || !navTools)) {
 	process.exit(2);
 }
 const variantSuffix =
-	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}${validateArgs ? "__val" : ""}${readGate ? "__rg" : ""}${requiredDefaultsOn ? "__reqd" : ""}` +
+	`${docsGate === "off" ? "" : `__gate-${docsGate}`}${navTools ? "__nav" : ""}${validateArgs ? "__val" : ""}${readGate ? "__rg" : ""}${requiredDefaultsOn ? "__reqd" : ""}${bashTool ? "__bash" : ""}` +
 	`${layout === "per-method" ? "" : `__layout-${layout}`}` +
 	// v1 contributes nothing, so every already-reported baseline keeps its runId.
 	`${basePromptVersion === "v1" ? "" : `__bp-${basePromptVersion}`}` +
@@ -299,6 +328,11 @@ const runDir = join(ROOT, ".run/appworld", runId);
 // a re-run would satisfy the gate with the PREVIOUS attempt's reads, which is the
 // `docker cp` staging bug from TAC arriving through a different door.
 const READ_LEDGER = join(runDir, "api", ".read-ledger.jsonl");
+// Every bash command and its verdict. NOT inside api/, because it is the evidence
+// for "did the shell reach around the transport" and that question has to survive
+// a --force re-run's tree wipe being read afterwards; it is cleared explicitly
+// alongside the other append-only artefacts below.
+const BASH_LEDGER = join(runDir, "bash-calls.jsonl");
 
 // Never silently overwrite a completed run. A runId scheme change once replaced
 // two already-reported runs mid-experiment.
@@ -315,7 +349,7 @@ if (existsSync(join(runDir, "result.json")) && !argv.includes("--force")) {
 // actually made 61 with none. The duplicate count was the previous attempt. Same
 // family as the runId collision that once replaced two already-reported runs.
 if (existsSync(runDir)) {
-	for (const stale of ["env-calls.jsonl", "world-diff.json", "evaluation.json", "phases.json", "env-server.json", "trajectory.jsonl", "stream.jsonl", "env-server.log"]) {
+	for (const stale of ["env-calls.jsonl", "world-diff.json", "evaluation.json", "phases.json", "env-server.json", "trajectory.jsonl", "stream.jsonl", "env-server.log", "bash-calls.jsonl"]) {
 		rmSync(join(runDir, stale), { force: true });
 	}
 	for (const staleDir of ["appworld-output", "api", "agent-home"]) {
@@ -507,7 +541,22 @@ function preambleFor() {
 		}
 		throw new Error(`unsupported vanilla residency: ${residency}`);
 	}
-	const pointer = buildPreamble(promptName, ctx);
+	// Which tool for what. Three lines, added only when the tool is: guidance for a
+	// capability the arm does not have is the worst of the three states, because the
+	// agent follows it and cannot tell whether it misread.
+	//
+	// The second sentence is load-bearing and is the whole point of saying anything.
+	// A shell in a directory full of `api/*.py` invites `curl`, and here there is
+	// nothing at any URL — the guard refuses it, but a refusal costs a turn and the
+	// prompt is free.
+	const pointer =
+		buildPreamble(promptName, ctx) +
+		(bashTool
+			? "\n\nYou also have `bash`, for looking around the filesystem and for local commands. " +
+				"It cannot reach the network, and it does not need to: the only way to this environment " +
+				"is the `api` package inside `ipython`, and there is nothing at any URL. State lives in " +
+				"the kernel, so variables do not survive into a `bash` call."
+			: "");
 	if (residency === "L0") return pointer;
 	if (residency === "L1") return `${pointer}\n\nAvailable functions:\n${names.join("\n")}`;
 	if (residency === "L2") return `${pointer}\n\nAvailable functions:\n${tocLines.join("\n")}`;
@@ -550,6 +599,11 @@ else if (arm === "vanilla") {
 	// Still no bash, edit or write — the one-transport invariant is about egress,
 	// and none of these four can reach the network.
 	if (navTools) toolList = [...toolList, "read", "grep", "find", "ls"];
+	// --bash: prime's own bash, with the guard extension intercepting it. Named in
+	// --tools because the guard registers no tool of its own; without the name the
+	// builtin is filtered out and the extension would intercept a tool that is not
+	// there.
+	if (bashTool) toolList = [...toolList, "bash"];
 }
 
 /**
@@ -612,7 +666,7 @@ writeFileSync(
 			runId,
 			arm,
 			residency,
-			variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, apiLayout: layout, basePromptVersion, navToolBinaries },
+			variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, bash: bashTool, apiLayout: layout, basePromptVersion, navToolBinaries },
 			// The two halves, separately, so "was the base identical?" is a diff and
 			// not an argument.
 			basePrompt,
@@ -657,7 +711,7 @@ const meta = {
 	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
 	// Which opt-in codemode variants were on. A run compared against another must
 	// be able to say which condition it was in without re-reading the api/ tree.
-	variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, apiLayout: layout, basePromptVersion, navToolBinaries },
+	variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, bash: bashTool, apiLayout: layout, basePromptVersion, navToolBinaries },
 	basePromptDigest: digest(basePrompt),
 	preambleChars: preamble.length,
 	toolCount: toolList.length,
@@ -712,11 +766,16 @@ async function main() {
 		"--system-prompt",
 		basePrompt,
 	];
-	if (arm === "vanilla") cliArgs.push("--extension", EXTENSION);
-	// codemode is extension-free except under --read-gate, where one extension is the
-	// gate's evidence channel. Named explicitly rather than left to discovery.
-	else if (readGate) cliArgs.push("--extension", READ_LEDGER_EXTENSION);
-	else cliArgs.push("--no-extensions");
+	// codemode is extension-free by default. Two variants add exactly one each — the
+	// read gate's evidence channel, and the bash guard — and they compose. Named
+	// explicitly rather than left to discovery; `--no-extensions` otherwise, so
+	// nothing sitting on disk can join a run.
+	const extensions =
+		arm === "vanilla"
+			? [EXTENSION]
+			: [...(readGate ? [READ_LEDGER_EXTENSION] : []), ...(bashTool ? [BASH_EXTENSION] : [])];
+	if (extensions.length === 0) cliArgs.push("--no-extensions");
+	else for (const path of extensions) cliArgs.push("--extension", path);
 	if (preamble) cliArgs.push("--append-system-prompt", preamble);
 	cliArgs.push(facts.instruction);
 
@@ -749,6 +808,24 @@ async function main() {
 			// propagate the extension would throw at load rather than silently produce
 			// a gate-on run with an empty ledger, which is why it is required there.
 			...(readGate ? { HARNESS_READ_LEDGER: READ_LEDGER } : {}),
+			// The bash guard. Required rather than provenance for the same reason as
+			// the read ledger: the extension throws at load without them, so a
+			// variable that failed to propagate fails the run instead of silently
+			// producing an unguarded shell under a `__bash` label.
+			//
+			// NO_EGRESS is the AppWorld-specific half. terminal-bench sets neither,
+			// because there the machine IS the surface; here the world is reachable
+			// only through the env-server and a shell must not become a second route
+			// to it. There is deliberately no ceiling: AppWorld tasks are API work,
+			// nothing legitimately runs for minutes, and a wall-clock kill would be a
+			// treatment this regression is not trying to price.
+			...(bashTool
+				? {
+						HARNESS_JOBS_PY: JOBS_PY,
+						HARNESS_BASH_NO_EGRESS: "1",
+						HARNESS_BASH_LEDGER: BASH_LEDGER,
+					}
+				: {}),
 			// Optional narrowing, passed straight through from the environment so a
 			// targeted gate needs no new flag: HARNESS_DOCS_GATE_ONLY=supervisor.complete_task
 			...(process.env.HARNESS_DOCS_GATE_ONLY
@@ -982,6 +1059,48 @@ async function main() {
 	summary.duplicateCalls = envCalls.length - new Set(envCalls.map((c) => c.code)).size;
 
 	/**
+	 * The bash guard's own evidence, and the one-transport invariant it exists for.
+	 *
+	 * Two silent failures are possible and neither raises: the extension not loading
+	 * (an unguarded shell wearing a `__bash` label), and a network command getting
+	 * through (a second route to the world, which is the reason bash was withheld in
+	 * the first place). Both are answered from the ledger rather than from the
+	 * absence of an error, and the ledger records the command itself, so "did the
+	 * shell reach around the transport" is re-derivable after the world is reset.
+	 */
+	if (bashTool) {
+		const rows = existsSync(BASH_LEDGER)
+			? readFileSync(BASH_LEDGER, "utf8")
+					.split("\n")
+					.filter((l) => l.trim())
+					.map((l) => JSON.parse(l))
+			: [];
+		const calls = rows.filter((r) => r.phase === "call");
+		summary.bashGuard = {
+			loaded: rows.some((r) => r.phase === "loaded"),
+			calls: calls.length,
+			allowed: calls.filter((r) => r.verdict === "allowed").length,
+			refusedEgress: calls.filter((r) => r.verdict === "blocked-egress").length,
+			refusedBlocking: calls.filter((r) => r.verdict === "blocked-blocking").length,
+			checkerFailed: calls.filter((r) => r.verdict === "checker-failed").length,
+			commands: calls.map((r) => ({ verdict: r.verdict, command: String(r.command).slice(0, 200) })),
+		};
+		if (!summary.bashGuard.loaded) {
+			summary.bashGuardViolation = "the guard extension never loaded — this run had an unguarded shell, so it is not a --bash run";
+		} else {
+			// The invariant, asserted on what was ALLOWED rather than on what was
+			// refused: a refusal count of zero is the expected case on a benchmark
+			// that is API work, and would prove nothing either way.
+			const leaked = calls.filter((r) => r.verdict === "allowed" && /https?:\/\/|\b(curl|wget|nc|netcat|telnet|socat)\b/.test(String(r.command)));
+			if (leaked.length > 0) {
+				summary.bashGuardViolation =
+					`${leaked.length} network command(s) were allowed through the shell: ` +
+					`${leaked.map((r) => JSON.stringify(String(r.command).slice(0, 120))).join(", ")} — the one-transport invariant did not hold`;
+			}
+		}
+	}
+
+	/**
 	 * The read gate's own evidence, and the guard that it actually bound.
 	 *
 	 * "A documented check is not an executed check", and the sibling failure this is
@@ -1102,6 +1221,14 @@ async function main() {
 		);
 	}
 	if (summary.readGateViolation) console.log(`  !! ${summary.readGateViolation}`);
+	if (summary.bashGuard) {
+		const g = summary.bashGuard;
+		console.log(
+			`  bash: ${g.calls} call(s), ${g.allowed} allowed, ${g.refusedEgress} egress-refused, ` +
+				`${g.refusedBlocking} blocking-refused${g.loaded ? "" : " [GUARD NOT LOADED]"}`,
+		);
+	}
+	if (summary.bashGuardViolation) console.log(`  !! ${summary.bashGuardViolation}`);
 	if (summary.requiredDefaults) {
 		const { promoted: n, calls } = summary.requiredDefaults;
 		console.log(

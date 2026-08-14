@@ -29,6 +29,9 @@
  *   --codemode-validate-args
  *   --codemode-read-gate   verified read-precondition on every API (implies
  *                          --codemode-nav-tools + --codemode-api-layout=consolidated)
+ *   --codemode-bash        give codemode prime's bash, guarded: blocking commands
+ *                          are refused and network egress is refused, so a shell
+ *                          cannot become a second route to the world
  *   --codemode-required-defaults
  *                          the parameters bench/required-defaults.mjs listed — an
  *                          optional argument of a MUTATING API whose documented
@@ -124,6 +127,13 @@ const codemodeReadGate = has("codemode-read-gate");
  * left out. See bench/required-defaults.mjs and docs/CC-EDGE-TRACES.md §M1.
  */
 const codemodeRequiredDefaults = has("codemode-required-defaults");
+/**
+ * --codemode-bash — give codemode prime's `bash`, guarded so it cannot reach the
+ * network. See --bash in run-task.mjs: the reason bash was withheld here is EGRESS
+ * (78% of vanilla's bash calls on MCP-Bench were `curl` past its own tools), not
+ * shells, so the honest form is a shell that cannot leave the transport.
+ */
+const codemodeBash = has("codemode-bash");
 /**
  * --codemode-api-layout[=consolidated] — one module per app instead of one file per
  * method. Validated here as well as in the runner so a typo fails before 46 tasks run.
@@ -257,7 +267,7 @@ for (const task of tasks ?? []) {
 			// look for a run that was written under a different name.
 			const variantSuffix =
 				arm === "codemode"
-					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}${codemodeValidateArgs ? "__val" : ""}${codemodeReadGate ? "__rg" : ""}${codemodeRequiredDefaults ? "__reqd" : ""}${codemodeApiLayout === "per-method" ? "" : `__layout-${codemodeApiLayout}`}`
+					? `${codemodeDocsGate === "off" ? "" : `__gate-${codemodeDocsGate}`}${codemodeNavTools ? "__nav" : ""}${codemodeValidateArgs ? "__val" : ""}${codemodeReadGate ? "__rg" : ""}${codemodeRequiredDefaults ? "__reqd" : ""}${codemodeBash ? "__bash" : ""}${codemodeApiLayout === "per-method" ? "" : `__layout-${codemodeApiLayout}`}`
 					: "";
 			const base = `${task}__${arm}__${residency}${suffix}${variantSuffix}${basePromptSuffix}${catalogueSuffix}__${model.replace(/[^a-z0-9]/gi, "-")}`;
 			cells.push({ task, arm, residency, vanillaPromptName, repeat: r, runId: repeat > 1 ? `${base}__r${r}` : base });
@@ -294,6 +304,7 @@ async function runCell(cell) {
 		if (codemodeValidateArgs) args.push("--validate-args");
 		if (codemodeReadGate) args.push("--read-gate");
 		if (codemodeRequiredDefaults) args.push("--required-defaults");
+		if (codemodeBash) args.push("--bash");
 		if (codemodeApiLayout !== "per-method") args.push(`--api-layout=${codemodeApiLayout}`);
 	}
 	// Every arm, unconditionally — see the comment on cataloguePath.

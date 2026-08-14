@@ -13,10 +13,13 @@ reachable in a test that has to wait for them.
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 
 import jobs as J
+
+JOBS_PY = os.path.join(os.path.dirname(os.path.abspath(J.__file__)), "jobs.py")
 
 
 class FakeWorld:
@@ -693,6 +696,11 @@ class TestModuleSurface(Base):
             "submit", "wait", "get", "list", "kill", "manifest", "help",
             # operational / harness-facing
             "prune", "use_store", "parse_duration", "lint_condition", "blocking_sleep",
+            # the bash TOOL's guard, called out of process by
+            # bench/arms/bash-tool-extension.ts. Deliberate: the alternative was a
+            # TypeScript port of blocking_sleep, i.e. two implementations under one
+            # name, and the first divergence between them would have been invisible.
+            "check_blocking", "shell_job_redirect", "timeout_message",
         }
         public = {
             n for n in dir(J)
@@ -862,3 +870,71 @@ class TestEmptyStatesAreInformative(Base):
         text = self.store.manifest()
         self.assertIn("one", text)
         self.assertNotIn("pick-a-name", text, "advice must not crowd out the listing")
+
+
+# ---------------------------------------------------------------------------------
+# the same guard, reached from outside Python — the bash TOOL's route
+# ---------------------------------------------------------------------------------
+#
+# `_guard_shell_cells` calls blocking_sleep directly because it lives in the kernel.
+# A bash tool lives in the harness process, in TypeScript, and it is the same act:
+# a command that waits holds the agent's turn. Measured on compile-compcert — the
+# arm with a kernel handed a 30-minute build to jobs.submit and passed; the arms
+# that blocked on it failed. The CLI below is how the TypeScript side asks THIS
+# implementation rather than carrying a second copy of the rules.
+
+
+class TestBashGuardCLI(unittest.TestCase):
+    def _run(self, *args):
+        import subprocess as sp
+        out = sp.run([sys.executable, JOBS_PY, *args], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout
+
+    def test_check_blocking_agrees_with_blocking_sleep(self):
+        # Not "returns something sensible" — returns the SAME verdict as the function
+        # the kernel calls, which is the entire reason this CLI exists.
+        for command in ("sleep 300", "ls -la", "while true; do sleep 5; done",
+                        "(sleep 300; touch f) &", "make -j8"):
+            with self.subTest(command=command):
+                verdict = J.check_blocking(command, 30)
+                self.assertEqual(verdict["blocking"], J.blocking_sleep(command, 30) is not None)
+
+    def test_cli_returns_json_and_exits_zero_for_both_verdicts(self):
+        # Exit 0 whenever the CHECK succeeded. A non-zero exit is reserved for the
+        # checker itself failing, so the caller can tell "allowed" from "could not
+        # tell" — and it refuses to run rather than fail open.
+        blocked = json.loads(self._run("--check-blocking", "sleep 300"))
+        self.assertTrue(blocked["blocking"])
+        self.assertIn("jobs.submit(", blocked["message"])
+        allowed = json.loads(self._run("--check-blocking", "ls -la"))
+        self.assertFalse(allowed["blocking"])
+        self.assertIsNone(allowed["message"])
+
+    def test_ceiling_is_honoured_through_the_cli(self):
+        # Default ceiling is 30, matching HARNESS_SLEEP_CEILING's default, so the two
+        # guards agree unless a harness moves both.
+        self.assertTrue(json.loads(self._run("--check-blocking", "sleep 40"))["blocking"])
+        self.assertFalse(
+            json.loads(self._run("--check-blocking", "sleep 40", "--ceiling", "120"))["blocking"])
+
+    def test_the_message_says_where_jobs_lives(self):
+        # The reader is holding a SHELL tool. Without this line the obvious next move
+        # is `jobs.submit(...)` as a shell command, which teaches that the primitive
+        # is broken rather than that it is elsewhere — and the error channel is the
+        # strongest teacher this runtime has.
+        message = J.check_blocking("sleep 300")["message"]
+        self.assertIn("ipython tool", message)
+        self.assertIn("not as a shell command", message)
+
+    def test_timeout_message_names_the_replacement(self):
+        # The counterpart to the prelude's cell watchdog: blocking_sleep finds no
+        # sleep in `make`, so a wall-clock kill is the only thing that can see it, and
+        # a bare "timed out" teaches nothing — the agent writes the same line again.
+        message = J.timeout_message(120, "make -j8")
+        self.assertIn("120s", message)
+        self.assertIn("jobs.submit('make -j8'", message)
+
+    def test_quoted_text_is_not_mistaken_for_a_wait(self):
+        # shlex, not a regex over raw source. `echo "sleep 300"` prints a string.
+        self.assertFalse(J.check_blocking('echo "sleep 300"')["blocking"])

@@ -110,10 +110,24 @@ REPO = Path(__file__).resolve().parents[2]
 # MCP-Bench withheld only because it let that arm curl past the MCP tools under
 # test. Here the machine *is* the surface, so withholding it would model no
 # harness anyone ships. Both arms are levelled up, never down.
+#
+# codemode's `bash` is GUARDED whenever the jobs runtime is on — see
+# BASH_EXTENSION below. An unguarded one silently removes the thing the arm is
+# being measured for: the kernel's guards are Python-side, so `bash make` blocks
+# the turn for twenty minutes with no redirect and no watchdog, and codemode
+# behaves like the blocking arms while still wearing the codemode label.
 ARM_TOOLS = {
     "codemode": "ipython,bash,edit",
     "vanilla": "bash,read,edit,write,grep,find,ls",
 }
+
+# The guard, staged into the container alongside the runtime it calls.
+#
+# It registers no tool: it intercepts prime's own `bash` through tool_call /
+# tool_result, so the arm keeps the real tool with its real truncation and its
+# real process-tree kill. See the module docstring for why a replacement tool
+# would be the hand-rolled-kernel mistake again.
+BASH_EXTENSION = "bench/arms/bash-tool-extension.ts"
 
 
 class PrimeAgent(BaseAgent):
@@ -224,6 +238,30 @@ class PrimeAgent(BaseAgent):
             # clamp in the prelude keeps this <= the ceiling backstop.
             env["HARNESS_WEDGE_SUSPECT_SECONDS"] = os.environ.get(
                 "HARNESS_WEDGE_SUSPECT_SECONDS", "120")
+            # --- the same two guards, on the bash TOOL -----------------------
+            #
+            # The kernel's guards cannot see a bash tool call: `%%bash` goes
+            # through the magics manager and the watchdog is a SIGALRM inside
+            # the kernel process, while the tool runs in the harness. Without
+            # these the codemode arm's `bash make` blocks the turn for the
+            # whole build, which is the advantage this arm exists to
+            # demonstrate, deleted by the tool that was meant to help it.
+            env["HARNESS_JOBS_PY"] = f"{RUNTIME_DIR}/jobs.py"
+            # The staged venv, not `python3`: it is the interpreter this run has
+            # already proven imports (`_preflight`), and several of these 241
+            # tasks are *about* the container's own Python — one of them
+            # replacing `python3` would silently disarm the guard.
+            env["HARNESS_JOBS_PYTHON"] = KERNEL_PYTHON
+            # Both guards read the same number rather than each defaulting to 30
+            # independently. Two guards that disagree about the threshold is the
+            # drift this project pins with tests everywhere else.
+            env["HARNESS_SLEEP_CEILING"] = os.environ.get("HARNESS_SLEEP_CEILING", "30")
+            # The bash ceiling IS the wedge-suspect trip, for the same reason and
+            # at the same number: `blocking_sleep` finds no sleep in `make`, so a
+            # wall-clock backstop is the only thing that can see it. Derived from
+            # one variable so the shell and the kernel cannot drift apart.
+            env["HARNESS_BASH_CEILING_SECONDS"] = env["HARNESS_WEDGE_SUSPECT_SECONDS"]
+            env["HARNESS_BASH_LEDGER"] = f"{RUNTIME_DIR}/bash-calls.jsonl"
         return env
 
     @staticmethod
@@ -291,6 +329,26 @@ class PrimeAgent(BaseAgent):
         self._exec(session, ["cp", "-a", f"{AGENT_ROOT}/venv", STAGED_VENV])
         return round(time.time() - t0, 1)
 
+    # Which tool for what, for the arm that has two execution surfaces.
+    #
+    # Given `ipython` and `bash` and nothing said, the split is left to a coin
+    # flip — and the two are not interchangeable here: state lives in the kernel
+    # and dies with a bash call, while a build belongs in a shell. Three lines,
+    # because resident text is re-billed on every turn of every task.
+    #
+    # Given to codemode in BOTH jobs conditions, deliberately. The ON/OFF
+    # contrast must be exactly "the jobs runtime and its guidance"; adding tool
+    # routing to one side only would make the comparison measure two things. The
+    # tool surface it describes is identical in both.
+    TOOL_ROUTING = """\
+## Which tool
+
+`ipython` for code, data and anything whose state you want to keep — variables
+persist across cells, `bash` calls do not share them. `bash` for shell and system
+work: builds, package installs, services, git. `edit` for a targeted change to a
+file you have already looked at.\
+"""
+
     @staticmethod
     def _jobs_prompt() -> str:
         """The guidance, from the runtime itself — never a paraphrase.
@@ -331,6 +389,13 @@ class PrimeAgent(BaseAgent):
         # runtime/harness_unshadow.py. Measured on train-bpe-tokenizer.
         session.copy_to_container(
             [REPO / "runtime" / "harness_unshadow.py"], container_dir=RUNTIME_DIR)
+        # The bash guard travels with the runtime it calls, gated on the same
+        # flag, for the reason the guidance is: an extension staged without
+        # jobs.py would refuse to load and take the whole run with it, and a
+        # jobs.py staged without the extension would leave bash unguarded while
+        # everything else said the runtime was on.
+        session.copy_to_container(
+            [REPO / BASH_EXTENSION], container_dir=RUNTIME_DIR)
         self._exec(session, ["sh", "-c", (
             f'SP=$({KERNEL_PYTHON} -c "import site; print(site.getsitepackages()[0])") '
             f'&& cp {RUNTIME_DIR}/harness_unshadow.py "$SP/harness_unshadow.py" '
@@ -432,7 +497,12 @@ class PrimeAgent(BaseAgent):
         # zero seconds and so trips nothing. Turns went 43 -> 198 and cost
         # $0.67 -> $3.32. Suppressing the bad wait without the agent adopting the
         # good one converts a kernel-holding problem into a turn-burning one.
-        preamble = self._jobs_prompt() if self._jobs == "on" else ""
+        parts = []
+        if self._arm == "codemode":
+            parts.append(self.TOOL_ROUTING)
+        if self._jobs == "on":
+            parts.append(self._jobs_prompt())
+        preamble = "\n\n".join(parts)
 
         argv = [
             # `timeout` inside the container, not only the harness's own clock.
@@ -454,7 +524,12 @@ class PrimeAgent(BaseAgent):
             "--model", self._model,
             "--tools", tools,
             "--cwd", cwd,
-            "--no-context-files", "--no-prompt-templates", "--no-extensions",
+            "--no-context-files", "--no-prompt-templates",
+            # The guard is the ONLY extension, and it is loaded exactly when the
+            # runtime it redirects to exists. `--no-extensions` otherwise, so a
+            # stray extension in the image can never join a run.
+            *(["--extension", f"{RUNTIME_DIR}/{Path(BASH_EXTENSION).name}"]
+              if self._jobs == "on" and self._arm == "codemode" else ["--no-extensions"]),
             *(["--append-system-prompt", preamble] if preamble else []),
             instruction,
         ]
@@ -591,6 +666,30 @@ class PrimeAgent(BaseAgent):
             r = self._exec(session, ["sh", "-c",
                                      f"cat {RUNTIME_DIR}/jobs/*/meta.json 2>/dev/null"])
             (logging_dir / "jobs-manifest.txt").write_bytes(r.output)
+            # The bash guard's own evidence, copied out before the container dies.
+            #
+            # `bashGuardLoaded` is the load marker, not an inference from refusals:
+            # an extension that never loaded and one that was never given a
+            # blocking command both leave zero refusals behind, and the run would
+            # be scored as an arm that chose to block. That ambiguity cost four
+            # TAC runs when the prelude silently failed to bind.
+            r = self._exec(session, ["sh", "-c",
+                                     f"cat {RUNTIME_DIR}/bash-calls.jsonl 2>/dev/null"])
+            (logging_dir / "bash-calls.jsonl").write_bytes(r.output)
+            rows = [json.loads(l) for l in r.output.decode(errors="replace").splitlines()
+                    if l.strip().startswith("{")]
+            summary["bashGuardLoaded"] = any(x.get("phase") == "loaded" for x in rows)
+            summary["bashRefusals"] = sum(
+                1 for x in rows if str(x.get("verdict", "")).startswith("blocked"))
+            summary["bashTimeouts"] = sum(1 for x in rows if x.get("phase") == "timeout")
+            summary["bashAllowed"] = sum(1 for x in rows if x.get("verdict") == "allowed")
+            if self._arm == "codemode" and not summary["bashGuardLoaded"]:
+                # Loud, and it invalidates the trial. An unguarded bash on this arm
+                # is not the arm the result will be filed under.
+                summary["valid"] = False
+                summary["invalidReason"] = (
+                    "the bash guard extension did not load, so this codemode run had an "
+                    "unguarded shell — it is not a jobs=on codemode run")
 
         (logging_dir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
 

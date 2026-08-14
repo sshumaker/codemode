@@ -382,6 +382,81 @@ def blocking_sleep(script: str, ceiling: int = 30) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------------
+# the same guard, for a bash TOOL rather than a %%bash cell
+# --------------------------------------------------------------------------------
+#
+# `_guard_shell_cells` in kernel-prelude.py calls `blocking_sleep` directly, because
+# it runs inside the kernel. A bash *tool* runs in the harness process, in
+# TypeScript, and it is the same act: a command that waits holds the agent's turn
+# and the long-wait advantage disappears. Measured on compile-compcert — the arm
+# with a kernel handed a 30-minute build to `jobs.submit` and passed; the arms that
+# blocked on it failed.
+#
+# The guard must therefore be reachable from outside Python, and it must be THE
+# guard rather than a port of it. A TypeScript reimplementation would be a second
+# implementation wearing one name, and the first divergence would be invisible —
+# the exact shape of every bug in this project's history. So the tool shells out to
+# `jobs.py --check-blocking`, and there is one `blocking_sleep` in the world.
+#
+# The message is generated here for the same reason `--prompt` is: a harness that
+# hard-codes its own copy is one refactor away from naming a function that no
+# longer exists.
+
+
+def shell_job_redirect(problem: str, command: str = "") -> str:
+    """
+    What to say to an agent whose bash command was refused.
+
+    Structurally the prelude's `_redirect`, with one difference that matters: this
+    reader is holding a *shell* tool, so it has to be told that `jobs` is Python
+    living in the ipython tool. Without that line the obvious next move is to run
+    `jobs.submit(...)` as a shell command, which fails in a way that teaches the
+    agent the primitive is broken rather than that it is elsewhere.
+    """
+    first = (command.strip().splitlines() or ["your command"])[0][:60]
+    return (
+        f"{problem}\n"
+        "Hand it to a job instead — it runs outside your turn, outlives the cell and "
+        "the kernel, and nothing is held while it runs:\n"
+        f"    jobs.submit({first!r}, name='pick-a-name', max_runtime='1h')\n"
+        "    jobs.wait(wake_after=300)   # last statement of the cell\n"
+        "then jobs.get('pick-a-name') to collect it: .done, .ok, .output.\n"
+        "`jobs` is Python and lives in the ipython tool — run those three lines "
+        "there, not as a shell command."
+    )
+
+
+def check_blocking(command: str, ceiling: int = 30) -> dict:
+    """The bash tool's pre-flight verdict, as data. Pure, so it is cheap to test."""
+    reason = blocking_sleep(command, ceiling)
+    return {
+        "blocking": reason is not None,
+        "reason": reason,
+        "message": None if reason is None else shell_job_redirect(
+            f"this bash command blocks your turn: {reason}", command),
+    }
+
+
+def timeout_message(seconds: float, command: str = "") -> str:
+    """
+    What to say when a bash command was killed at the ceiling.
+
+    The counterpart to the prelude's cell watchdog, and it exists for the same
+    reason: `blocking_sleep` finds no sleep in `make`, so the pre-flight check
+    passes and a 20-minute build blocks the turn anyway. A wall-clock ceiling is
+    the universal backstop (design §6), and the whole value of it is that the kill
+    arrives with the replacement named — a bare "timed out" teaches nothing and the
+    agent writes the same line again.
+    """
+    return shell_job_redirect(
+        f"this bash command ran for {seconds:g}s without returning and was stopped. "
+        "Nothing else could happen while it ran, and a command that long has no way "
+        "to report progress, survive a restart, or be stopped",
+        command,
+    )
+
+
+# --------------------------------------------------------------------------------
 # handles
 # --------------------------------------------------------------------------------
 
@@ -1340,6 +1415,24 @@ if __name__ == "__main__":
         job = submit(command, name=name)
         print(f"[{name}] {_store()._read(name)['pid']}")
         raise SystemExit(0 if job else 1)
+    if "--check-blocking" in _sys.argv:
+        # The bash tool's guard, called once per bash tool call by
+        # bench/arms/bash-tool-extension.ts. JSON on stdout, and exit 0 whenever the
+        # check itself succeeded — a non-zero exit means the CHECKER failed, which
+        # the extension must be able to tell apart from "allowed". It refuses to
+        # load if it cannot, because a guard that silently fails open reproduces
+        # exactly the bug it was built to close.
+        i = _sys.argv.index("--check-blocking")
+        command = _sys.argv[i + 1] if i + 1 < len(_sys.argv) else ""
+        ceiling = 30
+        if "--ceiling" in _sys.argv:
+            ceiling = int(_sys.argv[_sys.argv.index("--ceiling") + 1])
+        print(json.dumps(check_blocking(command, ceiling)))
+        raise SystemExit(0)
+    if "--timeout-message" in _sys.argv:
+        i = _sys.argv.index("--timeout-message")
+        print(timeout_message(float(_sys.argv[i + 1]), _sys.argv[i + 2] if i + 2 < len(_sys.argv) else ""))
+        raise SystemExit(0)
     if "--prompt" in _sys.argv:
         print(PROMPT)
         # Subagents are jobs, so their guidance ships with the jobs guidance rather
