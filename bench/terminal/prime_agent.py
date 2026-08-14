@@ -111,7 +111,7 @@ REPO = Path(__file__).resolve().parents[2]
 # test. Here the machine *is* the surface, so withholding it would model no
 # harness anyone ships. Both arms are levelled up, never down.
 ARM_TOOLS = {
-    "codemode": "ipython,edit",
+    "codemode": "ipython,bash,edit",
     "vanilla": "bash,read,edit,write,grep,find,ls",
 }
 
