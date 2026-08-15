@@ -562,6 +562,14 @@ async function main() {
 				const message = event.message;
 				for (const block of message.content ?? []) {
 					if (block.type === "text" && block.text) summary.finalText = block.text;
+					// Punch list #35: cc's thinking was logged as "" — the block type was
+					// never read, so cc's reasoning volume was undiagnosable from the
+					// artifacts. Character count, not the text: enough to compare arms
+					// without persisting a transcript-sized field twice.
+					if (block.type === "thinking" && block.thinking) {
+						summary.thinkingChars = (summary.thinkingChars ?? 0) + block.thinking.length;
+						summary.thinkingBlocks = (summary.thinkingBlocks ?? 0) + 1;
+					}
 					if (block.type !== "tool_use") continue;
 					// Blocks are re-emitted too; id-dedupe rather than trusting arrival.
 					if (block.id && countedBlocks.has(block.id)) continue;

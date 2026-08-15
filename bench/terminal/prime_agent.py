@@ -507,6 +507,14 @@ file you have already looked at.\
         want = ["HARNESS_CELL_TIMEOUT_MS"]
         if self._jobs == "on":
             want.append("__HARNESS_WAIT_SECONDS__")
+        # A mode's marker travels with the mode. The first scheduler-mode run
+        # passed every check while the volume's bundle predated the exit-mode
+        # patch: condition.json said wait_mode=exit, the container slept
+        # in-process, and only the ARTIFACTS said so (0 exit-mode texts, 8
+        # sleep-mode texts). Same trap as the pre-patch wait sentinel this list
+        # exists for — the run must fail preflight, not lie in its label.
+        if self._wait_mode == "exit":
+            want.append("HARNESS_WAIT_MODE")
         r = self._exec(session, ["sh", "-c",
                                  f"cat {AGENT_ROOT}/prime/dist/bundle/*.js"])
         blob = r.output
