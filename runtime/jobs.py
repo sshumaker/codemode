@@ -1053,7 +1053,12 @@ class JobStore:
             f"[waiting {clamped}s outside the kernel; nothing is held{note}. "
             f"running jobs: {', '.join(pending) or 'none'}]"
         )
-        self._emit(f"{WAIT_SENTINEL}:{clamped}")
+        # The host matches the sentinel line-anchored, and — when HARNESS_WAIT_TOKEN
+        # is set — only with the token the kernel inherited via env. Without it,
+        # any stdout containing the bare sentinel (a cat of a transcript, a printed
+        # log) could arm an hour-long host-side sleep.
+        token = os.environ.get("HARNESS_WAIT_TOKEN", "")
+        self._emit(f"{WAIT_SENTINEL}:{clamped}:{token}" if token else f"{WAIT_SENTINEL}:{clamped}")
         # Sentinel first, then end the cell. Anything below the call is unreachable by
         # construction rather than by inspection — see WaitSignal.
         raise WaitSignal(clamped)

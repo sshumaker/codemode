@@ -649,6 +649,8 @@ export class KernelManager {
 			const sandboxSettings = process.env.HARNESS_KERNEL_SANDBOX_SETTINGS;
 			const sandboxBin = process.env.HARNESS_KERNEL_SANDBOX_BIN ?? "srt";
 			const kernelArgv: [string, string[]] = sandboxSettings
+				// srt takes SPLIT argv, not one command string: the README's
+				// `srt "cmd"` form fails with "command not found".
 				? [sandboxBin, ["--settings", sandboxSettings, python, "-m", "ipykernel_launcher", "-f", connection.path]]
 				: [python, ["-m", "ipykernel_launcher", "-f", connection.path]];
 			const kernel = spawn(kernelArgv[0], kernelArgv[1], {

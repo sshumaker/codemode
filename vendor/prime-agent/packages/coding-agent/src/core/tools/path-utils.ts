@@ -127,9 +127,11 @@ export async function resolveReadPathAsync(filePath: string, cwd: string): Promi
 	return resolved;
 }
 
+import { access as fsAccess } from "node:fs/promises";
+
 export async function pathExists(filePath: string): Promise<boolean> {
 	try {
-		accessSync(filePath, constants.F_OK);
+		await fsAccess(filePath, constants.F_OK);
 		return true;
 	} catch {
 		return false;

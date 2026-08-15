@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { generate, renderFullDocs } from "./generate.mjs";
 import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./prompts.mjs";
 import { findTask } from "./tasks.mjs";
+import { seedPrimeSettings } from "./prime-settings.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
@@ -284,7 +285,7 @@ const child = spawn(
 			PATH: `${process.env.HOME}/.local/bin:${process.env.PATH}`,
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_TELEMETRY: "0",
-			PRIME_AGENT_CODING_AGENT_DIR: join(runDir, "agent-home"),
+			PRIME_AGENT_CODING_AGENT_DIR: seedPrimeSettings(join(runDir, "agent-home")),
 			HARNESS_MCP_PROXY: PROXY,
 			HARNESS_MCP_CATALOGUE: SCHEMAS,
 			HARNESS_MCP_SERVERS: task.exposedServers.join(","),

@@ -534,6 +534,14 @@ file you have already looked at.\
             instruction,
         ]
 
+        # autoRefine OFF for every arm: neutralize-prime only removes the prompt
+        # injection; the review model calls themselves default on past turn 25 —
+        # an unbudgeted cost confound (2026-08-15 review, P0.2). Mirrors
+        # bench/prime-settings.mjs for the local runners.
+        self._exec(session, ["sh", "-c", (
+            "mkdir -p /tmp/prime-home && "
+            "printf '{\\n\\t\"autoRefine\": {\\n\\t\\t\"enabled\": false\\n\\t}\\n}\\n' "
+            "> /tmp/prime-home/settings.json")])
         stage_secs = self._stage_venv(session)
         jobs_status = self._stage_jobs(session)
         checks = self._preflight(session)
@@ -663,8 +671,11 @@ file you have already looked at.\
             r = self._exec(session, ["sh", "-c",
                                      f"cat {RUNTIME_DIR}/prelude-status.txt 2>&1"])
             (logging_dir / "prelude-status.txt").write_bytes(r.output)
+            # Flat `<name>.json` records — jobs.py has never written `*/meta.json`,
+            # so this artifact was EMPTY on every prior run (2026-08-15 review,
+            # P0.4): a vacuous log that read as "no jobs were used".
             r = self._exec(session, ["sh", "-c",
-                                     f"cat {RUNTIME_DIR}/jobs/*/meta.json 2>/dev/null"])
+                                     f"cat {RUNTIME_DIR}/jobs/*.json 2>/dev/null"])
             (logging_dir / "jobs-manifest.txt").write_bytes(r.output)
             # The bash guard's own evidence, copied out before the container dies.
             #

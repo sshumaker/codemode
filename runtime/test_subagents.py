@@ -492,6 +492,12 @@ class TestCollector(unittest.TestCase):
         self.c.feed(self.assistant("r1", "hello"))
         self.c.feed(self.assistant("r1", "hello"))
         self.assertAlmostEqual(self.c.cost, 0.01)
+        # `turns` sits under the SAME dedup guard as cost: it once incremented
+        # before the responseId check, so a retried message double-counted the
+        # number the max_turns cap enforces off, ending children early
+        # (2026-08-15 review, H5). Fed the same message three times, turns is 1.
+        self.c.feed(self.assistant("r1", "hello"))
+        self.assertEqual(self.c.turns, 1)
 
     def test_user_and_tool_messages_are_not_turns(self):
         self.assertFalse(self.c.feed({"type": "message_end",

@@ -53,6 +53,7 @@ import { fileURLToPath } from "node:url";
 import { apiLayout, docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
 import { loadRequiredDefaults } from "../required-defaults.mjs";
 import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
+import { seedPrimeSettings } from "../prime-settings.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
@@ -787,7 +788,7 @@ async function main() {
 			PATH: `${process.env.HOME}/.local/bin:${process.env.PATH}`,
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_TELEMETRY: "0",
-			PRIME_AGENT_CODING_AGENT_DIR: join(runDir, "agent-home"),
+			PRIME_AGENT_CODING_AGENT_DIR: seedPrimeSettings(join(runDir, "agent-home")),
 			// Both arms' transports read these. The env-server speaks the MCP proxy's
 			// protocol precisely so nothing here needs an AppWorld-specific branch.
 			HARNESS_MCP_PROXY: proxy,

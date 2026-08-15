@@ -42,8 +42,12 @@ const { catalogue } = JSON.parse(readFileSync(SCHEMAS, "utf8"));
 /** Every real tool, indexed by both its MCP name and its python identifier. */
 const byMcpName = new Map();
 const byPyName = new Map();
-const pyIdent = (n) =>
-	n.replace(/[^A-Za-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "tool";
+// The REAL identifier mapping, imported — a local re-implementation here lacked
+// the leading-digit prefix and keyword suffix generate.mjs applies, so a tool
+// emitted as `from_` / `t_2fa_verify` missed byPyName and was scored as an
+// INVALID tool name against codemode, depressing valid_tool_name_rate
+// (2026-08-15 review, P0.1). Import it; never copy it.
+const { pyIdent } = await import("./generate.mjs");
 for (const s of catalogue) {
 	for (const t of s.tools) {
 		byMcpName.set(`${s.server}::${t.name}`, t);

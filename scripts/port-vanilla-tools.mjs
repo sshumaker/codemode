@@ -22,8 +22,11 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+// HARNESS_VENDOR_DIR: see scripts/neutralize-prime.mjs — pristine-replay seam.
+// pi-mono is always read from the real vendor dir (it is pristine by contract).
+const VENDOR = process.env.HARNESS_VENDOR_DIR ?? join(ROOT, "vendor");
 const PI = join(ROOT, "vendor/pi-mono/packages/coding-agent/src");
-const PRIME = join(ROOT, "vendor/prime-agent/packages/coding-agent/src");
+const PRIME = join(VENDOR, "prime-agent/packages/coding-agent/src");
 
 /** The five prime removed. */
 const PORTED = ["read", "write", "grep", "find", "ls"];
@@ -76,7 +79,9 @@ function sub(relPath, find, replace, label) {
 	if (src.includes(replace)) return log(`  present ${relPath} :: ${label}`);
 	const count = src.split(find).length - 1;
 	if (count !== 1) throw new Error(`${relPath}: expected 1 match for ${label}, found ${count}`);
-	writeFileSync(path, src.replace(find, replace));
+	// Function replacement — see scripts/neutralize-prime.mjs sub(): a string
+	// replacement interprets $&/$`/$' and can splice the file into itself.
+	writeFileSync(path, src.replace(find, () => replace));
 	log(`  patched ${relPath} :: ${label}`);
 }
 
@@ -122,14 +127,20 @@ ensure(
 );
 
 // 2. find.ts and ls.ts need pathExists, which prime's path-utils dropped.
-//    prime imports accessSync (sync) rather than pi's fs/promises access.
+//    Keep pi's fs/promises semantics: an earlier port used accessSync (prime's
+//    file imports it, so it was at hand), which made an async-signature function
+//    block the event loop — find/ls pass it as the exists-hook of a directory
+//    walk, so a large tree became a synchronous stat storm on the loop that owns
+//    the model stream. Caught by the 2026-08-15 review (finding #7).
 ensure(
 	"core/tools/path-utils.ts",
 	"export async function pathExists",
 	`
+import { access as fsAccess } from "node:fs/promises";
+
 export async function pathExists(filePath: string): Promise<boolean> {
 	try {
-		accessSync(filePath, constants.F_OK);
+		await fsAccess(filePath, constants.F_OK);
 		return true;
 	} catch {
 		return false;

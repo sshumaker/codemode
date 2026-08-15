@@ -288,13 +288,11 @@ def _shell():
 # against, and printed to the agent.
 
 def _hold(what):
-    return lambda *a, **k: f"{what} blocks this kernel, and nothing else can run while it does."
+    return f"{what} blocks this kernel, and nothing else can run while it does."
 
 
 def _escape(what):
-    return lambda *a, **k: (
-        f"{what} starts work this kernel cannot name, recover after a restart, or stop."
-    )
+    return f"{what} starts work this kernel cannot name, recover after a restart, or stop."
 
 
 def _hold_if_long(what, arg=0, kw=None, default=None):
@@ -335,26 +333,30 @@ def _hold_if_blocking_command(api):
     return policy
 
 
-def _always(reason_fn):
-    return lambda args, kwargs: reason_fn()
+def _always(reason):
+    # `reason` is the finished string. An earlier version took a zero-arg callable
+    # here, and 13 of 19 guards forgot the trailing () — so the agent was handed
+    # `<function _escape.<locals>.<lambda> at 0x…>` where the correction should be.
+    # The error channel is the teaching channel; it must never carry a repr.
+    return lambda args, kwargs: reason
 
 
 # (module path, attribute, policy). A policy returns a reason string, or None to allow.
 _GUARDS = [
     # -- ESCAPE: work that outlives the cell without being a job -----------------
-    ("threading", "Thread", _always(lambda: _escape("threading.Thread"))),
-    ("threading", "Timer", _always(lambda: _escape("threading.Timer"))),
-    ("concurrent.futures", "ThreadPoolExecutor", _always(lambda: _escape("ThreadPoolExecutor"))),
-    ("concurrent.futures", "ProcessPoolExecutor", _always(lambda: _escape("ProcessPoolExecutor"))),
-    ("multiprocessing", "Process", _always(lambda: _escape("multiprocessing.Process"))),
-    ("multiprocessing", "Pool", _always(lambda: _escape("multiprocessing.Pool"))),
-    ("multiprocessing.pool", "ThreadPool", _always(lambda: _escape("multiprocessing.pool.ThreadPool"))),
-    ("os", "fork", _always(lambda: _escape("os.fork"))),
-    ("os", "forkpty", _always(lambda: _escape("os.forkpty"))),
-    ("os", "posix_spawn", _always(lambda: _escape("os.posix_spawn"))),
-    ("os", "popen", _always(lambda: _escape("os.popen"))),
-    ("pty", "spawn", _always(lambda: _escape("pty.spawn"))),
-    ("pty", "fork", _always(lambda: _escape("pty.fork"))),
+    ("threading", "Thread", _always(_escape("threading.Thread"))),
+    ("threading", "Timer", _always(_escape("threading.Timer"))),
+    ("concurrent.futures", "ThreadPoolExecutor", _always(_escape("ThreadPoolExecutor"))),
+    ("concurrent.futures", "ProcessPoolExecutor", _always(_escape("ProcessPoolExecutor"))),
+    ("multiprocessing", "Process", _always(_escape("multiprocessing.Process"))),
+    ("multiprocessing", "Pool", _always(_escape("multiprocessing.Pool"))),
+    ("multiprocessing.pool", "ThreadPool", _always(_escape("multiprocessing.pool.ThreadPool"))),
+    ("os", "fork", _always(_escape("os.fork"))),
+    ("os", "forkpty", _always(_escape("os.forkpty"))),
+    ("os", "posix_spawn", _always(_escape("os.posix_spawn"))),
+    ("os", "popen", _always(_escape("os.popen"))),
+    ("pty", "spawn", _always(_escape("pty.spawn"))),
+    ("pty", "fork", _always(_escape("pty.fork"))),
     # -- conditional: the command decides ---------------------------------------
     ("subprocess", "Popen", _hold_if_blocking_command("subprocess.Popen")),
     ("subprocess", "run", _hold_if_blocking_command("subprocess.run")),
@@ -363,8 +365,8 @@ _GUARDS = [
     ("subprocess", "check_output", _hold_if_blocking_command("subprocess.check_output")),
     ("os", "system", _hold_if_blocking_command("os.system")),
     # -- HOLD: blocks the kernel -------------------------------------------------
-    ("signal", "pause", _always(lambda: _hold("signal.pause")())),
-    ("os", "wait", _always(lambda: _hold("os.wait")())),
+    ("signal", "pause", _always(_hold("signal.pause"))),
+    ("os", "wait", _always(_hold("os.wait"))),
     ("select", "select", _hold_if_long("select.select", arg=3, kw="timeout")),
 ]
 

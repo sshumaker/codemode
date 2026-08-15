@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { TASKS } from "./tasks.mjs";
 import { pollShape } from "./poll-shape.mjs";
+import { seedPrimeSettings } from "../../bench/prime-settings.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUNTIME = join(ROOT, "runtime");
@@ -238,7 +239,7 @@ const child = spawn(
 			...process.env,
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_TELEMETRY: "0",
-			PRIME_AGENT_CODING_AGENT_DIR: join(runDir, "agent-home"),
+			PRIME_AGENT_CODING_AGENT_DIR: seedPrimeSettings(join(runDir, "agent-home")),
 			IPYTHONDIR: ipythonDir,
 			HARNESS_JOB_DIR: jobDir,
 			HARNESS_JOB_CWD: runDir,

@@ -626,6 +626,43 @@ class TestGuardTable(GuardBase):
             self.assertIn("jobs.", msg)
             self.assertIn("jobs.help()", msg, f"guard does not point at help(): {msg[:80]}")
 
+    def test_every_guard_reason_is_a_string_naming_its_target(self):
+        # The regression this pins: _GUARDS once held `_always(lambda: _escape("x"))`
+        # — a policy whose "reason" was a lambda OBJECT, so 13 of 19 guards raised
+        # `RuntimeError: <function _escape.<locals>.<lambda> at 0x…>` instead of the
+        # correction. assertRaises alone cannot catch that; the message content is
+        # the behaviour under test, because the error channel is the teaching channel.
+        mod = self.arm()
+        for path, attr, policy in mod._GUARDS:
+            reason = policy((), {})
+            if reason is None:
+                continue  # conditional guard; benign args are allowed through
+            self.assertIsInstance(reason, str, f"{path}.{attr}: reason is {type(reason)!r}")
+            self.assertNotIn("<function", reason, f"{path}.{attr}: reason is a repr: {reason}")
+            self.assertNotIn("lambda", reason, f"{path}.{attr}: reason is a repr: {reason}")
+            # The message must name what was refused — the last path segment or the
+            # attribute — or the agent cannot connect refusal to action.
+            tail = path.split(".")[-1]
+            self.assertTrue(
+                attr in reason or f"{tail}.{attr}" in reason or path in reason,
+                f"{path}.{attr}: reason does not name its target: {reason}",
+            )
+
+    def test_escape_refusals_name_the_api_end_to_end(self):
+        # Same property, asserted through the real call path for the escape class —
+        # the one class where nothing else teaches jobs.submit.
+        self.arm()
+        for label, fn in [
+            ("os.fork", lambda: os.fork()),
+            ("os.popen", lambda: os.popen("echo hi")),
+            ("threading.Thread", lambda: threading.Thread(target=lambda: None)),
+        ]:
+            with self.assertRaises(RuntimeError) as ctx:
+                fn()
+            msg = str(ctx.exception)
+            self.assertIn(label, msg, f"refusal for {label} does not name it: {msg[:100]}")
+            self.assertNotIn("<function", msg, f"refusal for {label} carries a repr: {msg[:100]}")
+
     def test_the_runtime_may_still_spawn_its_own_jobs(self):
         # jobs.submit() spawns through subprocess.Popen. A guard that did not exempt
         # the runtime would refuse the primitive it redirects people toward.

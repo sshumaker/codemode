@@ -262,6 +262,11 @@ async function main() {
 
 	// ---- 3. the arm under test ---------------------------------------------
 	await startServiceProxy();
+	// autoRefine OFF for every arm — see bench/prime-settings.mjs for why.
+	await docker(["exec", container, "bash", "-c",
+		"mkdir -p /tmp/prime-home && " +
+		"printf '{\\n\\t\"autoRefine\": {\\n\\t\\t\"enabled\": false\\n\\t}\\n}\\n' " +
+		"> /tmp/prime-home/settings.json"]).catch(() => {});
 	await stageJobsRuntime();
 
 	mark("agentStart");

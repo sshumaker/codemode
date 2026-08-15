@@ -30,7 +30,12 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const PRIME = join(ROOT, "vendor/prime-agent/packages/coding-agent/src");
+// HARNESS_VENDOR_DIR retargets which vendored tree gets patched — the
+// pristine-replay test (bench/test/provenance.test.mjs) points it at a scratch
+// extraction of the base commit to prove scripts ≡ committed tree. Patch
+// snippets always come from the real scripts/patches/.
+const VENDOR = process.env.HARNESS_VENDOR_DIR ?? join(ROOT, "vendor");
+const PRIME = join(VENDOR, "prime-agent/packages/coding-agent/src");
 
 const log = (...a) => console.log(...a);
 
@@ -49,7 +54,11 @@ function sub(relPath, find, replace, label, marker) {
 	if (src.includes(marker ?? replace)) return log(`  present ${relPath} :: ${label}`);
 	const count = src.split(find).length - 1;
 	if (count !== 1) throw new Error(`${relPath}: expected 1 match for ${label}, found ${count}`);
-	writeFileSync(path, src.replace(find, replace));
+	// Function replacement: String.replace treats $&, $`, $' in a STRING
+	// replacement as substitution patterns. A patch body containing `$` + backtick
+	// (any template literal ending in `$`) spliced the entire preceding file into
+	// itself — 847 duplicated lines, caught by the pristine-replay test.
+	writeFileSync(path, src.replace(find, () => replace));
 	log(`  patched ${relPath} :: ${label}`);
 }
 
@@ -182,12 +191,12 @@ sub(
 	"const assignedAt = new Map<string, Provenance>()",
 );
 
-// TheAgentCompany runs the agent against a task container: the workspace, the
-// seeded services and the grader all live inside it, so cells must execute
-// there. prime's own kernel cannot — it speaks ZMQ on ports that do not cross
-// the colima VM boundary — so HARNESS_EXEC_CONTAINER swaps the backend for one
-// driven over `docker exec`. Name, schema and description are untouched, so the
-// model sees the same tool it saw on MCP-Bench.
+// The container-kernel backend (HARNESS_EXEC_CONTAINER, a hand-rolled kernel
+// driven over `docker exec`) was REMOVED 2026-08-15. It was the abandoned first
+// fix for TheAgentCompany — CLAUDE.md records why real-harness-in-container
+// (PRIME_AGENT_KERNEL_PYTHON) replaced it — and nothing set the env var any
+// more. Its patch also dead-lettered the namespace patch below via a marker
+// collision, which is the second reason it must not come back as a patch file.
 // A cell that blocks ends the run. prime's `ipython` tool has no per-cell
 // timeout — grep it for `timeoutMs` and there is nothing — while `bash` exposes
 // one that kills the process tree. That asymmetry decided three runs on
@@ -247,8 +256,16 @@ sub(
 	// after it, and the 60s timer ran through that and set cellTimedOut. Every
 	// wait longer than the cell timeout accused a correct cell of being cut off,
 	// teaching the agent to distrust the primitive it had just used properly.
-	"\t\t\t\tclearTimeout(cellTimer);\n" +
+	"\t\t\t\t// The cell has returned, so stop the cell clock HERE rather than in the\n" +
+		"\t\t\t\t// finally below. Everything after this point is host-side time — the\n" +
+		"\t\t\t\t// jobs.wait sleep — and letting the timer run through it marked a cell\n" +
+		"\t\t\t\t// that finished in milliseconds as \"INTERRUPTED after 60s\" whenever the\n" +
+		"\t\t\t\t// requested wait exceeded the cell timeout. The agent was told its work\n" +
+		"\t\t\t\t// had been cut off when it had completed, which is precisely the wrong\n" +
+		"\t\t\t\t// lesson about the primitive it had just used correctly.\n" +
+		"\t\t\t\tclearTimeout(cellTimer);\n" +
 		"\t\t\t\tconst cellTimedOutWhileExecuting = cellTimedOut;\n" +
+		"\n" +
 		"\t\t\t\tlet text = r.stdout;\n" +
 		"\t\t\t\tif (cellTimedOutWhileExecuting) {\n" +
 		"\t\t\t\t\ttext =\n" +
@@ -268,15 +285,17 @@ sub(
 sub(
 	"core/tools/ipython.ts",
 	"\t\t\t} finally {\n\t\t\t\tif (hasWorkingMessage) {",
-	"\t\t\t\t// Say so explicitly: an interrupted cell otherwise looks like an\n" +
-		"\t\t\t\t// inscrutable empty failure, and the model needs to know the work was\n" +
-		"\t\t\t\t// cut off rather than wrong so it can bound the next attempt.\n" +
-		"\t\t\t} finally {\n" +
+	"\t\t\t} finally {\n" +
 		"\t\t\t\tclearTimeout(cellTimer);\n" +
 		"\t\t\t\tsignal?.removeEventListener(\"abort\", forwardAbort);\n" +
 		"\t\t\t\tif (hasWorkingMessage) {",
 	"clear the cell timer",
-	"clearTimeout(cellTimer);",
+	// Unique to THIS patch's body. The previous marker, `clearTimeout(cellTimer);`,
+	// is also emitted by the interrupt patch above, so the already-applied check
+	// fired early and this patch was silently skipped on a fresh upstream — the
+	// same collision class as the namespace patch. Caught by the pristine-replay
+	// test the first time it ran.
+	'removeEventListener("abort", forwardAbort)',
 );
 
 // The hosted-runtime v1 surface (docs/HOSTED-RUNTIME-DESIGN.md §4).
@@ -297,12 +316,32 @@ sub(
 	"\t\t\t\tlet text = r.stdout;",
 	"\t\t\t\tlet text = r.stdout;\n" +
 		"\t\t\t\t// jobs.wait(wake_after=N) — the cell has already returned, so this\n" +
-		"\t\t\t\t// sleep holds nothing. See bench/tac/jobs_runtime.py.\n" +
-		"\t\t\t\tconst waitMatch = /__HARNESS_WAIT_SECONDS__:(\\d+)/.exec(text);\n" +
+		"\t\t\t\t// sleep holds nothing. See runtime/jobs.py.\n" +
+		"\t\t\t\t// Line-anchored, and token-gated when HARNESS_WAIT_TOKEN is set: the\n" +
+		"\t\t\t\t// sentinel is model-reachable stdout, so a bare substring match let a\n" +
+		"\t\t\t\t// cat of a transcript arm an hour-long sleep (2026-08-15 review). The\n" +
+		"\t\t\t\t// kernel inherits the token via env, so only runtime/jobs.py can emit it.\n" +
+		"\t\t\t\tconst waitToken = process.env.HARNESS_WAIT_TOKEN;\n" +
+		"\t\t\t\tconst waitRe = waitToken\n" +
+		"\t\t\t\t\t? new RegExp(`^__HARNESS_WAIT_SECONDS__:(\\\\d+):${waitToken}$`, \"m\")\n" +
+		"\t\t\t\t\t: /^__HARNESS_WAIT_SECONDS__:(\\d+)(?::[A-Za-z0-9_-]+)?$/m;\n" +
+		"\t\t\t\tconst waitMatch = waitRe.exec(text);\n" +
 		"\t\t\t\tif (waitMatch) {\n" +
 		"\t\t\t\t\tconst secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));\n" +
 		"\t\t\t\t\tsetToolWorkingMessage(`waiting ${secs}s (kernel released)`);\n" +
-		"\t\t\t\t\tawait new Promise((resolve) => setTimeout(resolve, secs * 1000));\n" +
+		"\t\t\t\t\t// Abortable: a run timeout or Ctrl-C must interrupt the wait, not\n" +
+		"\t\t\t\t\t// sit behind it — one wedged wait ate 20 minutes past its own budget.\n" +
+		"\t\t\t\t\tawait new Promise((resolve) => {\n" +
+		"\t\t\t\t\t\tconst waitTimer = setTimeout(resolve, secs * 1000);\n" +
+		"\t\t\t\t\t\tcellAbort.signal.addEventListener(\n" +
+		"\t\t\t\t\t\t\t\"abort\",\n" +
+		"\t\t\t\t\t\t\t() => {\n" +
+		"\t\t\t\t\t\t\t\tclearTimeout(waitTimer);\n" +
+		"\t\t\t\t\t\t\t\tresolve(undefined);\n" +
+		"\t\t\t\t\t\t\t},\n" +
+		"\t\t\t\t\t\t\t{ once: true },\n" +
+		"\t\t\t\t\t\t);\n" +
+		"\t\t\t\t\t});\n" +
 		"\t\t\t\t\ttext = text.replace(waitMatch[0], `[waited ${secs}s outside the kernel]`);\n" +
 		"\t\t\t\t}",
 	"host-side wait for jobs.wait",
@@ -417,45 +456,20 @@ log("\ncontainer kernel:");
 // miss and the whole script fail on the second run.
 sub(
 	"core/tools/ipython.ts",
-	'import { join as pathJoin } from "node:path";',
-	'import { join as pathJoin } from "node:path";\nimport { spawn as nodeSpawn } from "node:child_process";',
-	"spawn import for container kernel",
-	"spawn as nodeSpawn",
-);
-
-sub(
-	"core/tools/ipython.ts",
-	"export function createIpythonToolDefinition(",
-	`${patch("container-kernel.ts")}\n\nexport function createIpythonToolDefinition(`,
-	"container-backed ipython tool",
-	"createContainerIpythonToolDefinition",
-);
-
-sub(
-	"core/tools/ipython.ts",
-	"\tconst provisioner = options?.provisioner ?? new IpythonKernelProvisioner(cwd, options);",
-	'\tconst execContainer = process.env.HARNESS_EXEC_CONTAINER;\n' +
-		"\tif (execContainer) return createContainerIpythonToolDefinition(execContainer, cwd);\n\n" +
-		"\tconst provisioner = options?.provisioner ?? new IpythonKernelProvisioner(cwd, options);",
-	"route to container kernel when configured",
-	// Deliberately the call site, not the env var name: the env var also appears
-	// in the injected file's doc comment, so guarding on it would report this
-	// patch as already applied and silently skip it.
-	"if (execContainer) return createContainerIpythonToolDefinition",
-);
-
-sub(
-	"core/tools/ipython.ts",
 	"\t\t\t\tconst imageBlocks = imageBlocksFromAttachments(r.attachments);",
 	`${patch("namespace-inject.ts")
 		.split("\n")
 		.map((l) => (l ? `\t\t\t\t${l}` : l))
 		.join("\n")}\n\n\t\t\t\tconst imageBlocks = imageBlocksFromAttachments(r.attachments);`,
 	"append live namespace to each cell result",
-	"HARNESS_SHOW_NAMESPACE",
+	// Deliberately a phrase unique to the injected BODY, not the env var name.
+	// The env var appears in doc comments of other patches: guarding on it made
+	// the already-applied check fire early and silently skip this patch on a
+	// fresh upstream — the exact plausible-number trap this script exists to
+	// avoid, caught by the 2026-08-15 review. bench/test/provenance.test.mjs's
+	// pristine-replay test now pins scripts ≡ tree.
+	"already available, do not re-fetch",
 );
-
-log("\ndone.");
 
 // --- sandbox the REPL, not the agent -----------------------------------------
 //
@@ -493,3 +507,5 @@ sub(
 	"sandbox the ipython kernel",
 	"HARNESS_KERNEL_SANDBOX_SETTINGS",
 );
+
+log("\ndone.");

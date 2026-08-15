@@ -90,12 +90,15 @@ class Collector:
         if msg.get("role") != "assistant":
             return False
 
-        self.turns += 1
         usage = msg.get("usage") or {}
-        # Dedup by responseId: a retried or re-emitted message would otherwise be
-        # billed twice, and the cap is enforced off this number.
+        # Dedup by responseId BEFORE counting anything: a retried or re-emitted
+        # message would otherwise inflate `turns`, and the max_turns cap is
+        # enforced off that number — a duplicate event ended a child early having
+        # done less work than the cap allows (2026-08-15 review, H5). Cost and
+        # turns must move together, under one guard.
         rid = msg.get("responseId")
         if rid is None or rid not in self._counted:
+            self.turns += 1
             if rid is not None:
                 self._counted.add(rid)
             first = self.input + self.cache_read + self.cache_write == 0
