@@ -169,6 +169,29 @@ class TestLease(Base):
         self.assertFalse(os.path.exists(os.path.join(d, S.LEASE_DIR)))
 
 
+class TestDrain(Base):
+    """--drain: the finite-run mode a single terminal-bench task wants."""
+
+    def test_drains_when_the_last_session_stops_waiting(self):
+        self.session("a", wake_at=900)
+        ok = S.drain(self.root, interval=0.01, now=self.clock,
+                     runner=self.runner, log=lambda m: None)
+        self.assertTrue(ok)
+        self.assertEqual(len(self.runs), 1)
+
+    def test_gives_up_at_the_deadline_when_a_wait_is_never_due(self):
+        self.session("a", wake_at=10**9)  # never due on this clock
+
+        def ticking():
+            self.now += 10
+            return self.now
+
+        ok = S.drain(self.root, interval=0.0, deadline=25, now=ticking,
+                     runner=self.runner, log=lambda m: None)
+        self.assertFalse(ok)
+        self.assertEqual(self.runs, [])
+
+
 class TestCrashReplay(Base):
     """The scheduler's own SIGKILL-replay: every decision derives from disk."""
 

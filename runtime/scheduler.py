@@ -119,7 +119,7 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
             wake = json.load(fh)
     except (OSError, ValueError):
         return None
-    store = J.JobStore(os.path.join(session_dir, "jobs"), emit=lambda m: None)
+    store = J.JobStore(_job_dir(session_dir), emit=lambda m: None)
     for name in wake.get("watch") or []:
         rec = store._refresh(store._read(name))
         if rec and rec.get("state") not in J.LIVE_STATES:
@@ -128,6 +128,21 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     if wake_at is not None and now() >= wake_at:
         return f"the requested wait of {wake.get('wake_after', '?')}s elapsed"
     return None
+
+
+def _job_dir(session_dir: str) -> str:
+    """The session's job dir: session.json may name one (a kernel whose jobs
+    live elsewhere, e.g. /tmp/harness/jobs on terminal-bench); default is the
+    session-local jobs/."""
+    try:
+        with open(os.path.join(session_dir, SESSION_FILE)) as fh:
+            spec = json.load(fh)
+        configured = (spec.get("env") or {}).get("HARNESS_JOB_DIR")
+        if configured:
+            return configured
+    except (OSError, ValueError):
+        pass
+    return os.path.join(session_dir, "jobs")
 
 
 # -- running one wake ----------------------------------------------------------------
@@ -147,9 +162,12 @@ def run_wake(session_dir: str, reason: str, *, runner=subprocess.run) -> int:
 
     argv = list(spec["argv"]) + [f"[woken: {reason}] Check your jobs and continue the task."]
     env = dict(os.environ)
-    env.update(spec.get("env") or {})
     env["HARNESS_JOB_DIR"] = os.path.join(session_dir, "jobs")
     env["HARNESS_WAKE_FILE"] = wake_path
+    # The spec's env WINS: it is the session's identity (its kernel's job dir,
+    # its wait mode), and the defaults above are only for sessions that say
+    # nothing.
+    env.update(spec.get("env") or {})
     result = runner(argv, cwd=spec.get("cwd") or session_dir, env=env)
     return getattr(result, "returncode", 0)
 
@@ -187,6 +205,29 @@ def scan_once(sessions_root: str, *, now=time.time, runner=subprocess.run,
     return woken
 
 
+def drain(sessions_root: str, *, interval: float = 5.0, deadline: Optional[float] = None,
+          now=time.time, runner=subprocess.run, log: Callable[[str], None] = print) -> bool:
+    """
+    Serve until NO session has a pending wake, then return True — the mode a
+    finite run (one terminal-bench task) wants. Returns False on deadline.
+    A session whose harness writes a new wake.json keeps the drain alive.
+    """
+    started = now()
+    while True:
+        scan_once(sessions_root, now=now, runner=runner, log=log)
+        pending = [
+            n for n in (os.listdir(sessions_root) if os.path.isdir(sessions_root) else [])
+            if os.path.exists(os.path.join(sessions_root, n, WAKE_FILE))
+        ]
+        if not pending:
+            log("[scheduler] nothing left waiting; drained")
+            return True
+        if deadline is not None and now() - started > deadline:
+            log(f"[scheduler] deadline after {int(now() - started)}s with {pending} still waiting")
+            return False
+        time.sleep(interval)
+
+
 def serve(sessions_root: str, *, interval: float = 5.0, now=time.time,
           runner=subprocess.run, log: Callable[[str], None] = print) -> None:
     """The loop. Ctrl-C to stop; state is on disk, so stopping is always safe."""
@@ -203,8 +244,15 @@ if __name__ == "__main__":
     ap.add_argument("sessions_root")
     ap.add_argument("--interval", type=float, default=5.0)
     ap.add_argument("--once", action="store_true", help="one scan, then exit (cron mode)")
+    ap.add_argument("--drain", action="store_true",
+                    help="serve until no session is waiting, then exit (finite-run mode)")
+    ap.add_argument("--deadline", type=float, default=None,
+                    help="with --drain: give up after this many seconds")
     args = ap.parse_args()
     if args.once:
         scan_once(args.sessions_root)
+    elif args.drain:
+        raise SystemExit(0 if drain(args.sessions_root, interval=args.interval,
+                                    deadline=args.deadline) else 1)
     else:
         serve(args.sessions_root, interval=args.interval)

@@ -103,6 +103,9 @@ KERNEL_PYTHON = f"{STAGED_VENV}/bin/python"
 
 # Where the jobs runtime lives inside the task container when `jobs=on`.
 RUNTIME_DIR = "/tmp/harness"
+# Scheduler mode: one session per task, under the runtime dir.
+SESSIONS_ROOT = f"{RUNTIME_DIR}/sessions"
+SESSION_DIR = f"{SESSIONS_ROOT}/task"
 REPO = Path(__file__).resolve().parents[2]
 
 # codemode keeps its single execution tool and gains `edit` for safe targeted
@@ -136,12 +139,22 @@ class PrimeAgent(BaseAgent):
         model_name: str | None = None,
         arm: str = "codemode",
         jobs: str = "off",
+        wait_mode: str = "sleep",
         max_cost: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         if arm not in ARM_TOOLS:
             raise ValueError(f"arm must be one of {sorted(ARM_TOOLS)}, got {arm!r}")
+        # sleep: the host-side in-process wait (the measured default).
+        # exit:  scheduler mode — the harness process EXITS at a wait and
+        #        runtime/scheduler.py re-invokes `prime -c` when the wake is due.
+        #        The Phase 3 acceptance condition (CLOUD-HARNESS-DESIGN.md §5).
+        if str(wait_mode) not in ("sleep", "exit"):
+            raise ValueError(f"wait_mode must be sleep|exit, got {wait_mode!r}")
+        self._wait_mode = str(wait_mode)
+        if self._wait_mode == "exit" and str(jobs).lower() != "on":
+            raise ValueError("wait_mode=exit requires jobs=on (the wait IS a jobs feature)")
         if str(jobs).lower() not in ("on", "off"):
             raise ValueError(f"jobs must be on|off, got {jobs!r}")
         self._arm = arm
@@ -189,6 +202,13 @@ class PrimeAgent(BaseAgent):
             # several tasks assert on it. Prime's own state goes somewhere it
             # cannot be mistaken for the agent's work.
             "PRIME_AGENT_CODING_AGENT_DIR": "/tmp/prime-home",
+            # Scheduler mode: jobs.wait records the wake on disk and the ipython
+            # patch skips the in-process sleep — the run ends, the scheduler
+            # resumes it. Present only in exit mode so sleep-mode runs are
+            # byte-identical to every prior campaign run.
+            **({"HARNESS_WAIT_MODE": "exit",
+                "HARNESS_WAKE_FILE": f"{SESSION_DIR}/wake.json"}
+               if self._wait_mode == "exit" else {}),
             "DO_NOT_TRACK": "1",
             "PRIME_AGENT_TELEMETRY": "0",
             # Bound each cell, or one wedged cell consumes the whole task.
@@ -389,6 +409,9 @@ file you have already looked at.\
         # runtime/harness_unshadow.py. Measured on train-bpe-tokenizer.
         session.copy_to_container(
             [REPO / "runtime" / "harness_unshadow.py"], container_dir=RUNTIME_DIR)
+        # The wake scheduler travels with the runtime it schedules (exit mode).
+        session.copy_to_container(
+            [REPO / "runtime" / "scheduler.py"], container_dir=RUNTIME_DIR)
         # Subagents travel with the flag that advertises them. The prompt is
         # generated on the HOST (where `import subagents` always succeeds), so
         # without this the guidance said `spawn(...)` while the container had no
@@ -493,6 +516,79 @@ file you have already looked at.\
         checks["build_ok"] = all(checks["build_markers"].values())
         return checks
 
+    def _consume(self, stream, raw, traj, summary) -> None:
+        """Feed one process's merged output through the JSON-line accumulator.
+
+        Non-JSON lines (node warnings, the scheduler's own log) stay in the raw
+        stream file; counting scheduler wakes here keeps the wake count derived
+        from the artefact rather than asserted."""
+        buf = b""
+        for chunk in stream:
+            raw.write(chunk)
+            raw.flush()
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode(errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    ev = json.loads(text)
+                except json.JSONDecodeError:
+                    if "[scheduler] waking" in text:
+                        summary["wakes"] = summary.get("wakes", 0) + 1
+                    continue
+                ev["_t"] = time.clock_gettime(time.CLOCK_REALTIME)
+                traj.write(json.dumps(ev) + "\n")
+                traj.flush()
+                self._accumulate(ev, summary)
+
+    def _drain_wakes(self, session, raw, traj, summary, remaining: float, *,
+                     tools: str, cwd: str, preamble: str, logging_dir) -> None:
+        """Scheduler mode: after the first run exits, hand the session to
+        runtime/scheduler.py --drain, which re-invokes `prime -c` per due wake
+        until nothing is waiting. Its output (the resumed runs' JSON stream)
+        feeds the SAME accumulator, so turns/cost/cells span the whole task."""
+        r = self._exec(session, ["test", "-f", f"{SESSION_DIR}/wake.json"])
+        if r.exit_code != 0:
+            return  # the first run never waited; nothing to drain
+        remaining = max(60, int(remaining) - 30)
+        resume_argv = [
+            "timeout", "-k", "10", str(remaining),
+            NODE, PRIME_CLI, "-c",
+            "-p", "--mode", "json",
+            "--model", self._model,
+            "--tools", tools,
+            "--cwd", cwd,
+            "--no-context-files", "--no-prompt-templates",
+            *(["--extension", f"{RUNTIME_DIR}/{Path(BASH_EXTENSION).name}"]
+              if self._arm == "codemode" else ["--no-extensions"]),
+            *(["--append-system-prompt", preamble] if preamble else []),
+        ]
+        spec = {
+            "argv": resume_argv,
+            "cwd": cwd,
+            # The spec's env WINS in scheduler.run_wake: the kernel's jobs live
+            # at the runtime dir, not under the session. Secrets stay OUT of
+            # this file — the scheduler process inherits them via exec env.
+            "env": {
+                "HARNESS_JOB_DIR": f"{RUNTIME_DIR}/jobs",
+                "HARNESS_WAIT_MODE": "exit",
+                "HARNESS_WAKE_FILE": f"{SESSION_DIR}/wake.json",
+            },
+        }
+        spec_path = logging_dir / "session.json"
+        spec_path.write_text(json.dumps(spec, indent=2) + "\n")
+        self._exec(session, ["mkdir", "-p", SESSION_DIR])
+        session.copy_to_container([spec_path], container_dir=SESSION_DIR)
+        _, stream = self._exec(
+            session,
+            ["python3", f"{RUNTIME_DIR}/scheduler.py", SESSIONS_ROOT,
+             "--drain", "--interval", "5", "--deadline", str(remaining)],
+            environment=self._env(), workdir=cwd, stream=True, demux=False,
+        )
+        self._consume(stream, raw, traj, summary)
+
     # ------------------------------------------------------------------ main
 
     def perform_task(
@@ -576,6 +672,7 @@ file you have already looked at.\
             "argv": argv[:-1] + ["<instruction>"],
             "instruction": instruction,
             "jobs_runtime": self._jobs,
+            "wait_mode": self._wait_mode,
             "jobs_staging": jobs_status,
             "jobs_preamble_chars": len(preamble),
             "preflight": checks,
@@ -611,30 +708,17 @@ file you have already looked at.\
             "finalText": "",
         }
 
-        buf = b""
         summary["ctx0"] = 0
         summary["kernelRestarts"] = 0
         summary["cells"] = []
+        summary["wakes"] = 0
         with raw_path.open("wb") as raw, traj_path.open("w") as traj:
-            for chunk in stream:
-                raw.write(chunk)
-                raw.flush()
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    text = line.decode(errors="replace").strip()
-                    if not text:
-                        continue
-                    try:
-                        ev = json.loads(text)
-                    except json.JSONDecodeError:
-                        # Not a protocol line (node warnings, stderr interleaved).
-                        # Kept in stream.jsonl, which is why that file is raw.
-                        continue
-                    ev["_t"] = time.clock_gettime(time.CLOCK_REALTIME)
-                    traj.write(json.dumps(ev) + "\n")
-                    traj.flush()
-                    self._accumulate(ev, summary)
+            self._consume(stream, raw, traj, summary)
+            if self._wait_mode == "exit":
+                self._drain_wakes(session, raw, traj, summary,
+                                  deadline - (time.time() - started),
+                                  tools=tools, cwd=cwd, preamble=preamble,
+                                  logging_dir=logging_dir)
 
         pid_after = self._max_pid(session)
         # The arm-independent work counter. Recorded even when it fails (-1), so a

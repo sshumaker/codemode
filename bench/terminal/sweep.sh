@@ -27,6 +27,7 @@ ENV_FILE="${ENV_FILE:-$HOME/src/goals/web/.env.local}"
 
 ARM=codemode
 JOBS=off
+WAIT_MODE=sleep
 AGENT=prime
 MODEL="${PRIME_MODEL:-anthropic/claude-opus-5}"
 TASKS=""
@@ -39,6 +40,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --arm)         ARM="$2"; shift 2 ;;
     --jobs)        JOBS="$2"; shift 2 ;;
+    --wait-mode)   WAIT_MODE="$2"; shift 2 ;;
     --agent)       AGENT="$2"; shift 2 ;;
     --model)       MODEL="$2"; shift 2 ;;
     --tasks)       TASKS="$2"; shift 2 ;;
@@ -53,7 +55,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$TASKS" ]] || { echo "--tasks is required" >&2; exit 2; }
-RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$AGENT-$ARM-jobs$JOBS}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$AGENT-$ARM-jobs$JOBS${WAIT_MODE:+-wait$WAIT_MODE}}"
 
 # Stage every requested task before running. Cheap, idempotent, and it is the
 # only thing standing between a typo'd task id and a trial that silently runs
@@ -68,7 +70,7 @@ for t in "${IDS[@]}"; do TASK_ARGS+=(-t "$t"); done
 case "$AGENT" in
   prime)
     AGENT_ARGS=(--agent-import-path bench.terminal.prime_agent:PrimeAgent
-                -k "arm=$ARM" -k "jobs=$JOBS" -k "model_name=$MODEL") ;;
+                -k "arm=$ARM" -k "jobs=$JOBS" -k "wait_mode=$WAIT_MODE" -k "model_name=$MODEL") ;;
   *)
     AGENT_ARGS=(--agent "$AGENT")
     # oracle and nop take no model; passing one is harmless but noisy.
@@ -86,6 +88,7 @@ export PYTHONPATH="$ROOT"
 echo "run-id     $RUN_ID"
 echo "agent      $AGENT ${ARM}"
 echo "jobs       $JOBS"
+echo "wait-mode  $WAIT_MODE"
 echo "model      $MODEL"
 echo "tasks      $TASKS"
 df_before=$(docker run --rm -v /:/host alpine df -h / 2>/dev/null | awk 'NR==2{print $4}' || echo "?")
