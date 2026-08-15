@@ -59,7 +59,8 @@ from typing import List, Optional, Tuple
 # job was born, which is the property the whole sketch depends on.
 BG_SHELL_FUNCTION = """
 __jobs_bg() {
-  python3 "${HARNESS_RUNTIME_DIR:-/agent/harness}/jobs.py" --spawn "$2" "$1"
+  python3 "${HARNESS_RUNTIME_DIR:-/agent/harness}/jobs.py" --spawn "$2" "$1" \
+    || echo "[adoption FAILED for job $2 — the command did NOT run]" >&2
 }
 """.strip()
 
@@ -119,7 +120,7 @@ def find_background_commands(script: str) -> List[str]:
 _TRAILING_AMP = re.compile(r"(?<![&>])&\s*$")
 
 
-def rewrite_background(script: str, prefix: str = "bg") -> Tuple[str, List[Tuple[str, str]]]:
+def rewrite_background(script: str, prefix: str = "bg", taken: Optional[set] = None) -> Tuple[str, List[Tuple[str, str]]]:
     """
     Rewrite `cmd &` lines so the backgrounded work becomes a durable job.
 
@@ -134,6 +135,11 @@ def rewrite_background(script: str, prefix: str = "bg") -> Tuple[str, List[Tuple
     Names are positional (`bg1`, `bg2`), which is shell job control's own convention
     (`%1`, `%2`) rather than an identity we invented. That is the difference between
     this and adopting `subprocess.Popen`, which has no naming convention at all.
+
+    `taken` is every job name that already exists: numbering continues PAST it.
+    Without it every cell restarted at bg1, the second cell's spawn was refused as
+    a duplicate, the shell swallowed the error, and the banner still said
+    "adopted" — a wrong answer wearing a success message (2026-08-15 review, H6).
     """
     # Already rewritten. The injected helper itself ends a line with `2>&1 &`, so a
     # second pass adopted the helper's own internals and nested jobs inside jobs.
@@ -169,7 +175,12 @@ def rewrite_background(script: str, prefix: str = "bg") -> Tuple[str, List[Tuple
         if not command:
             out.append(raw)
             continue
-        name = f"{prefix}{len(adopted) + 1}"
+        n = len(adopted) + 1
+        while taken and f"{prefix}{n}" in taken:
+            n += 1
+        name = f"{prefix}{n}"
+        if taken is not None:
+            taken.add(name)
         indent = raw[: len(raw) - len(raw.lstrip())]
         out.append(f"{indent}__jobs_bg {shlex.quote(command)} {shlex.quote(name)}")
         adopted.append((name, command))

@@ -123,6 +123,7 @@ class PreludeBase(unittest.TestCase):
             now=lambda: 1000.0,
             spawn=self._spawn,
             kill=lambda pid: None,
+            probe=lambda pid: ("alive", f"start-{pid}"),
             emit=lambda m: None,
         )
         J.use_store(self.store)
@@ -363,7 +364,8 @@ class TestStartupAnnouncement(PreludeBase):
 
     def test_unreadable_job_directory_does_not_break_the_kernel(self):
         # Reporting on state must never take down the thing it reports on.
-        broken = J.JobStore(self.dir, now=lambda: 0.0, spawn=self._spawn, emit=lambda m: None)
+        broken = J.JobStore(self.dir, now=lambda: 0.0, spawn=self._spawn,
+                            probe=lambda pid: ("alive", f"start-{pid}"), emit=lambda m: None)
 
         def explode():
             raise RuntimeError("disk gone")
@@ -819,7 +821,7 @@ class TestCellWatchdog(PreludeBase):
         import signal
         handler = signal.getsignal(signal.SIGALRM)
         self.assertTrue(callable(handler))
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(mod.CellHeldError) as ctx:
             handler(signal.SIGALRM, None)
         msg = str(ctx.exception)
         self.assertIn("jobs.submit", msg)
@@ -850,7 +852,7 @@ class TestCellWatchdog(PreludeBase):
             # The timer is armed at the suspect value, not 585.
             self.assertIn(120, [round(s) for s in armed if s])
             handler = signal.getsignal(signal.SIGALRM)
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(mod.CellHeldError) as ctx:
                 handler(signal.SIGALRM, None)
         finally:
             signal.setitimer = real_setitimer
@@ -871,7 +873,7 @@ class TestCellWatchdog(PreludeBase):
         mod._current_cell["src"] = "some_blocking_thing"
         import signal
         handler = signal.getsignal(signal.SIGALRM)
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(mod.CellHeldError) as ctx:
             handler(signal.SIGALRM, None)
         msg = str(ctx.exception)
         self.assertIn("585s", msg)          # clamped to the backstop
@@ -887,7 +889,7 @@ class TestCellWatchdog(PreludeBase):
         mod._current_cell["src"] = "daemon start | tail"
         import signal
         handler = signal.getsignal(signal.SIGALRM)
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(mod.CellHeldError) as ctx:
             handler(signal.SIGALRM, None)
         self.assertIn("585s", str(ctx.exception))
 
@@ -906,6 +908,6 @@ class TestCellWatchdog(PreludeBase):
         import select
         arm(Info())
         t0 = time.monotonic()
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(mod.CellHeldError):
             select.select([], [], [], 5)  # would block 5s; the 1s alarm cuts in
         self.assertLess(time.monotonic() - t0, 4.5)

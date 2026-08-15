@@ -109,6 +109,9 @@ MAX_WAIT = int(os.environ.get("HARNESS_MAX_WAIT_SECONDS", "3600"))
 MIN_WAIT = int(os.environ.get("HARNESS_MIN_WAIT_SECONDS", "60"))
 # Fraction of max_runtime after which a job that has emitted nothing is flagged.
 SILENCE_FRACTION = 0.4
+# A marker-less job must be observed dead TWICE, this far apart, before its
+# record flips to `died` — the flip is one-way, and `ps` can misread transiently.
+DEATH_CONFIRM_SECONDS = float(os.environ.get("HARNESS_DEATH_CONFIRM_SECONDS", "1.0"))
 
 VALID_EXPECT = ("once", "stream")
 
@@ -505,7 +508,7 @@ class Job:
 
     @property
     def done(self) -> bool:
-        return self.state in ("done", "killed", "deadline")
+        return self.state in ("done", "killed", "deadline", "died")
 
     @property
     def ok(self) -> bool:
@@ -676,6 +679,33 @@ def _real_spawn(wrapped_command: str, log_path: str, cwd: Optional[str]) -> int:
     return proc.pid
 
 
+def _real_probe(pid: int):
+    """
+    ("dead" | "alive", start_identity) for a pid this process may not own.
+
+    `ps` rather than os.kill(pid, 0): a SIGKILLed child of a still-living kernel
+    stays a zombie until reaped, and kill(0) counts a zombie as alive — so the
+    marker-less death this probe exists to detect would read as "running". `ps`
+    reports state Z directly, and `lstart` is the start identity that survives
+    nothing: a reused pid has a different one, which is what makes signalling a
+    recorded pid safe (2026-08-15 review, H2/H3; same defence prime's
+    session-lease uses).
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state=,lstart="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ("alive", None)  # cannot probe: never report death on no evidence
+    if not out:
+        return ("dead", None)
+    state, _, lstart = out.partition(" ")
+    if state.startswith("Z"):
+        return ("dead", None)
+    return ("alive", lstart.strip() or None)
+
+
 class JobStore:
     """
     The whole surface. Clock, spawner and directory are injected so tests never
@@ -684,24 +714,29 @@ class JobStore:
 
     def __init__(
         self,
-        job_dir: str = DEFAULT_JOB_DIR,
+        job_dir: Optional[str] = None,
         *,
         now: Callable[[], float] = time.time,
         spawn: SpawnFn = _real_spawn,
         kill: Optional[Callable[[int], None]] = None,
+        probe: Optional[Callable[[int], tuple]] = None,
         cwd: Optional[str] = None,
         emit: Callable[[str], None] = print,
-        max_wait: int = MAX_WAIT,
-        min_wait: int = MIN_WAIT,
+        max_wait: Optional[int] = None,
+        min_wait: Optional[int] = None,
     ):
-        self.job_dir = job_dir
+        # Resolved HERE, not at import: module-level defaults froze the config at
+        # class-definition time, so a host that re-targets HARNESS_JOB_DIR before
+        # resuming a session onto a new volume was silently ignored (review, M6).
+        self.job_dir = job_dir or os.environ.get("HARNESS_JOB_DIR") or _default_job_dir()
         self._now = now
         self._spawn = spawn
         self._kill = kill if kill is not None else self._default_kill
         self._cwd = cwd or os.environ.get("HARNESS_JOB_CWD") or os.getcwd()
+        self._probe = probe if probe is not None else _real_probe
         self._emit = emit
-        self._max_wait = max_wait
-        self._min_wait = min_wait
+        self._max_wait = max_wait if max_wait is not None else int(os.environ.get("HARNESS_MAX_WAIT_SECONDS", "3600"))
+        self._min_wait = min_wait if min_wait is not None else int(os.environ.get("HARNESS_MIN_WAIT_SECONDS", "60"))
         # Intern handles by name so aliases resolve to one object (§5 aliasing).
         self._handles: Dict[str, Job] = {}
         os.makedirs(self.job_dir, exist_ok=True)
@@ -748,12 +783,34 @@ class JobStore:
         tmp = f"{path}.tmp"
         with open(tmp, "w") as fh:
             json.dump(rec, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
-
-    def _read_log(self, rec: dict) -> str:
+        # The rename is atomic but not durable: on a hard host stop the rename can
+        # be visible with the data not yet on disk, reintroducing the work-exists-
+        # record-does-not window the write ordering exists to close (review, M3).
         try:
-            with open(rec.get("log", "")) as fh:
-                return fh.read()
+            dfd = os.open(self.job_dir, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+
+    def _read_log(self, rec: dict, limit: int = 200_000) -> str:
+        """The log's TAIL, bounded. A verbose build writes hundreds of MB, and an
+        unbounded read of it OOMs the kernel at jobs.get(name).output (review, M2).
+        The full file stays on disk at rec["log"] for targeted reads."""
+        try:
+            with open(rec.get("log", ""), "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - limit))
+                text = fh.read().decode(errors="replace")
+                if size > limit:
+                    text = f"[...{size - limit} earlier bytes in {rec.get('log')}]\n" + text
+                return text
         except OSError:
             return rec.get("output_tail", "")
 
@@ -806,6 +863,7 @@ class JobStore:
             try:
                 with open(self._pid_path(rec["name"])) as fh:
                     rec["pid"] = int(fh.read().strip())
+                rec["pid_start"] = self._probe(rec["pid"])[1]
                 rec["state"] = "running"
                 rec["reason"] = "recovered: submit was interrupted after this job started"
                 self._write(rec)
@@ -844,6 +902,44 @@ class JobStore:
                             else "deadline reached, never fired")
             return self._read(rec["name"]) or rec
 
+        # Liveness fallback (review, H2): the exit marker is written by the dying
+        # process, so a SIGKILL or a host eviction leaves no marker and the record
+        # said "running" FOREVER — precisely the event a schedulable runtime must
+        # survive. If the recorded process is gone (or its pid was reused by a
+        # stranger — start identities differ), the work is provably not running.
+        #
+        # Two observations, a grace interval apart, before the record flips: the
+        # died write is one-way (a terminal state is never re-refreshed), so a
+        # single transient `ps` misread — seen flaking under a loaded test suite —
+        # would permanently kill a live job. A first dead sighting only stamps
+        # `dead_seen_at`; death is declared when a SECOND sighting confirms it
+        # after the grace period with the marker still absent. A live process
+        # observed in between clears the stamp.
+        pid = rec.get("pid")
+        if pid:
+            status, start = self._probe(pid)
+            recorded = rec.get("pid_start")
+            reused = status == "alive" and recorded and start and start != recorded
+            if status == "dead" or reused:
+                seen = rec.get("dead_seen_at")
+                if seen is None:
+                    rec["dead_seen_at"] = self._now()
+                    self._write(rec)
+                elif self._now() - seen >= DEATH_CONFIRM_SECONDS:
+                    rec["state"] = "died"
+                    rec["reason"] = (
+                        "process died without writing an exit marker — killed or evicted; "
+                        "the log tail below is everything it produced"
+                    )
+                    rec["finished_at"] = self._now()
+                    rec["events"] = self._log_bytes(rec)
+                    rec["output_tail"] = self._read_log(rec)[-4000:]
+                    self._write(rec)
+                    return rec
+            elif rec.get("dead_seen_at") is not None:
+                rec["dead_seen_at"] = None
+                self._write(rec)
+
         # Silence flag: cannot prove a filter will fire, but can say it hasn't.
         rec["events"] = self._log_bytes(rec)
         # `>=`, not `>`: the doc's worked example is "0 events in 240s of 600s ⚠ never
@@ -855,15 +951,27 @@ class JobStore:
     def _terminate(self, rec: dict, *, state: str, reason: str) -> None:
         pid = rec.get("pid")
         if pid:
-            try:
-                self._kill(pid)
-            except OSError:
-                pass
+            # Never signal a pid this record can no longer vouch for: records can
+            # be arbitrarily old, and killpg on a reused pid SIGKILLs an unrelated
+            # process GROUP (review, H3). The eval harness re-validated before
+            # signalling; the shipped module did not.
+            status, start = self._probe(pid)
+            recorded = rec.get("pid_start")
+            if status == "dead" or (recorded and start and start != recorded):
+                reason = f"{reason}; the recorded process was already gone, nothing was signalled"
+            else:
+                try:
+                    self._kill(pid)
+                except OSError:
+                    pass
         elif rec.get("state") == "starting":
             # Nothing to signal, and saying "killed" without qualification would be a
             # lie in the one case where it matters: the job may be running and simply
             # never got as far as writing its pid. Record what was actually done.
             reason = f"{reason}; no pid was recorded, so nothing was signalled — if the work did start it is still running"
+            # Machine-readable: submit() refuses to reuse this name, because the
+            # caveat above lives in a string nothing reads back (review, M5).
+            rec["unconfirmed"] = True
         rec["state"] = state
         rec["reason"] = reason
         rec["finished_at"] = self._now()
@@ -920,6 +1028,16 @@ class JobStore:
         # its work is running is unknown. Refusing is the whole protection: silently
         # allowing the name back is how an interrupted submit becomes a second copy of
         # an expensive job, which is the failure the durability design exists to prevent.
+        if existing and existing.get("unconfirmed"):
+            # kill() on a pid-less job frees the name — that is the point of giving
+            # up, and refusing here would strand names forever. But the caveat used
+            # to live only in a reason string nothing read back (review, M5): say it
+            # at the exact moment it matters, on the resubmit that could double-run.
+            self._emit(
+                f"[warn] a previous {name!r} was killed before it recorded a pid, so "
+                "nothing was signalled — if that work did start, it may still be "
+                "running alongside this submission."
+            )
         if existing and existing.get("state") == "starting":
             raise JobError(
                 f"job {name!r} was submitted but the submit did not complete — most likely the "
@@ -1001,6 +1119,9 @@ class JobStore:
             self._terminate(rec, state="killed", reason="failed to start")
             raise
         rec["pid"] = pid
+        # The pid's start identity, so a later kill/refresh can tell THIS process
+        # from a stranger that inherited its number (review, H3).
+        rec["pid_start"] = self._probe(pid)[1]
         rec["state"] = "running"
         self._write(rec)
 

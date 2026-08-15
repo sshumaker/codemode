@@ -197,6 +197,19 @@ def _called_from_agent_code() -> bool:
     return False
 
 
+class CellHeldError(BaseException):
+    """
+    The cell watchdog's refusal.
+
+    BaseException, not Exception, for the same reason jobs.WaitSignal is: the
+    raise lands inside whatever agent code is running, and retry loops wrap
+    their bodies in `except Exception:` — which swallowed the teaching text and
+    left the kernel held with the (now re-armed) timer as the only recourse
+    (2026-08-15 review, M8). Agent code has no legitimate handler for "you are
+    holding the kernel", so it must not be catchable by the reflexive one.
+    """
+
+
 def _redirect(problem: str, suggestion: str = "your command") -> str:
     """
     One message shape for every guard.
@@ -625,7 +638,8 @@ def _guard_shell_cells():
                 try:
                     import shell_jobs
 
-                    rewritten, adopted = shell_jobs.rewrite_background(cell)
+                    existing = {r.get("name") for r in jobs.list()}
+                    rewritten, adopted = shell_jobs.rewrite_background(cell, taken=existing)
                 except Exception:
                     rewritten, adopted = cell, []
                 if adopted:
@@ -859,7 +873,13 @@ def _install_cell_watchdog():
     early = fire_at < ceiling_trip
 
     def on_alarm(signum, frame):
-        signal.setitimer(signal.ITIMER_REAL, 0)  # disarm first: no re-entry
+        # Re-arm rather than disarm: the raise below can land inside agent code
+        # wrapped in `except Exception:` (retry loops do exactly this), and a
+        # watchdog that fires once and goes dark leaves the kernel held for the
+        # rest of the cell with no second trip (2026-08-15 review, M8). Re-armed,
+        # a swallowed refusal fires again a ceiling later; the `finally` in the
+        # cell runner still disarms on the way out.
+        signal.setitimer(signal.ITIMER_REAL, CELL_CEILING)
         lines = [
             ln for ln in _current_cell["src"].strip().splitlines()
             if ln.strip() and not ln.strip().startswith("%%")
@@ -870,7 +890,7 @@ def _install_cell_watchdog():
             if early else
             f"so it was stopped just before the {CELL_CEILING}s ceiling"
         )
-        raise RuntimeError(_redirect(
+        raise CellHeldError(_redirect(
             f"this cell held the kernel for {fire_at}s without returning, {tail}. Something in "
             f"it blocks the kernel — a server or daemon started in the foreground, a "
             f"`| tail`/`| cat` reading a process that never closes its output, or a blocking "

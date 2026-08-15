@@ -389,6 +389,25 @@ file you have already looked at.\
         # runtime/harness_unshadow.py. Measured on train-bpe-tokenizer.
         session.copy_to_container(
             [REPO / "runtime" / "harness_unshadow.py"], container_dir=RUNTIME_DIR)
+        # Subagents travel with the flag that advertises them. The prompt is
+        # generated on the HOST (where `import subagents` always succeeds), so
+        # without this the guidance said `spawn(...)` while the container had no
+        # such module — every prelude-status this campaign produced said
+        # "SUBAGENTS off" and the run read as "the agent chose not to delegate"
+        # (2026-08-15 review, H4/P1.8).
+        if os.environ.get("HARNESS_SUBAGENTS") == "1":
+            session.copy_to_container(
+                [REPO / "runtime" / "subagents.py"], container_dir=RUNTIME_DIR)
+            session.copy_to_container(
+                [REPO / "runtime" / "subagent_run.py"], container_dir=RUNTIME_DIR)
+            # Assert the capability is REACHABLE in the container, not merely
+            # copied — the L1-that-was-L4 lesson: advertise nothing unverified.
+            r = self._exec(session, ["sh", "-c",
+                f"cd {RUNTIME_DIR} && {KERNEL_PYTHON} -c 'import subagents' 2>&1"])
+            if r.exit_code != 0:
+                raise RuntimeError(
+                    f"HARNESS_SUBAGENTS=1 but `import subagents` fails in the "
+                    f"container: {r.output.decode(errors='replace')[:400]}")
         # The bash guard travels with the runtime it calls, gated on the same
         # flag, for the reason the guidance is: an extension staged without
         # jobs.py would refuse to load and take the whole run with it, and a

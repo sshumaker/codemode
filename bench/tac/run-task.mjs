@@ -595,6 +595,17 @@ async function stageJobsRuntime() {
 		await docker(["exec", container, "mkdir", "-p", "/tmp/harness"]);
 		await docker(["cp", join(ROOT, "runtime/jobs.py"), `${container}:/tmp/harness/jobs.py`]);
 		await docker(["cp", join(ROOT, "runtime/kernel-prelude.py"), `${container}:/tmp/harness/kernel_prelude.py`]);
+		if (process.env.HARNESS_SUBAGENTS === "1") {
+			// The prompt (generated on the HOST, where `import subagents` always
+			// succeeds) advertised spawn() while the container had no such module —
+			// review H4/P1.8. Capability and advertisement now travel on one flag,
+			// and the import is verified IN the container before the agent starts.
+			await docker(["cp", join(ROOT, "runtime/subagents.py"), `${container}:/tmp/harness/subagents.py`]);
+			await docker(["cp", join(ROOT, "runtime/subagent_run.py"), `${container}:/tmp/harness/subagent_run.py`]);
+			await docker(["exec", container, "bash", "-c",
+				"cd /tmp/harness && python3 -c 'import subagents'"]);
+			log("subagents: staged and importable in the container");
+		}
 		await docker(["exec", container, "bash", "-c", "sed -i 's#/agent/harness#/tmp/harness#' /tmp/harness/kernel_prelude.py"]);
 		// IPython runs everything in profile_default/startup/ before the first cell,
 		// which is the only hook that reaches the kernel's own namespace.

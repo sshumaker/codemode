@@ -54,6 +54,9 @@ class FakeWorld:
     def advance(self, seconds):
         self.t += seconds
 
+    def probe(self, pid):
+        return ("alive", f"start-{pid}")
+
     def spawn(self, wrapped, log_path, cwd):
         self.spawned.append({"cmd": wrapped, "log": log_path, "cwd": cwd})
         open(log_path, "a").close()
@@ -82,6 +85,7 @@ class Base(unittest.TestCase):
             now=self.world.now,
             spawn=self.world.spawn,
             kill=self.world.kill,
+            probe=self.world.probe,
             cwd="/workspace",
             emit=self.emitted.append,
         )
@@ -126,7 +130,7 @@ class TestSpawnIsAJob(Base):
     def test_a_fresh_kernel_recovers_a_subagent_handle_not_a_plain_job(self):
         self.spawner.spawn("go", name="scout")
         fresh = J.JobStore(self.dir, now=self.world.now, spawn=self.world.spawn,
-                           kill=self.world.kill, emit=self.emitted.append)
+                           probe=self.world.probe, kill=self.world.kill, emit=self.emitted.append)
         self.assertIsInstance(fresh.get("scout"), J.Subagent)
 
     def test_the_submitted_command_runs_the_launcher_on_a_spec_file(self):
@@ -450,7 +454,7 @@ class TestCollection(Base):
         self.write_child_output("scout", text="durable")
         self.finish("scout", 0)
         fresh = J.JobStore(self.dir, now=self.world.now, spawn=self.world.spawn,
-                           kill=self.world.kill, emit=self.emitted.append)
+                           probe=self.world.probe, kill=self.world.kill, emit=self.emitted.append)
         self.assertEqual(fresh.get("scout").result, "durable")
 
 

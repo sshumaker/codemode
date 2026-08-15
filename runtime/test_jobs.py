@@ -46,6 +46,12 @@ class FakeWorld:
     def kill(self, pid):
         self.killed.append(pid)
 
+    def probe(self, pid):
+        # Fake pids are stable and alive with a fixed start identity, so the
+        # liveness fallback (H2) never mistakes a test's 4001 for a dead process.
+        # Death is simulated by tests that choose to, via their own probe.
+        return ("alive", f"start-{pid}")
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -57,6 +63,7 @@ class Base(unittest.TestCase):
             now=self.world.now,
             spawn=self.world.spawn,
             kill=self.world.kill,
+            probe=self.world.probe,
             cwd="/workspace",
             emit=self.emitted.append,
         )
@@ -565,7 +572,8 @@ class TestKernelRestart(Base):
     def fresh_store(self):
         """A new store over the same directory IS a new kernel: files, no memory."""
         return J.JobStore(self.dir, now=self.world.now, spawn=self.world.spawn,
-                          kill=self.world.kill, emit=self.emitted.append)
+                          kill=self.world.kill, probe=self.world.probe,
+                          emit=self.emitted.append)
 
     def test_get_recovers_a_job_in_a_brand_new_store(self):
         self.store.submit("gradle build", name="build")
