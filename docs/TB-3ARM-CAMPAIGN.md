@@ -14,8 +14,11 @@ Arms, all Opus 5, all in the real task container:
 | **vanilla** | `bash,read,edit,write,grep,find,ls` | — |
 | **claude-code** | upstream's installed `claude-code` agent, typed into tmux | — |
 
-Status: **Phase 0 complete (screen 4/4 PASS). Phase 1a in progress — `compile-compcert`
-done, and it does not say what this project expected.**
+Status: **STOPPED DELIBERATELY after six tasks.** Phase 0 complete (screen 4/4
+PASS); Phase 1a complete (3 tasks x 3 arms); Phase 1b partially complete (3 of 6
+tasks x 3 arms) and **halted mid-sweep by the lead** to free disk and pivot to
+CyberGym. Phase 2 (subagents ON/OFF) **not run** — and would not have measured
+anything as wired; see §9.
 
 > **Headline so far, stated before the caveats rather than after them:**
 > on `compile-compcert`, **vanilla tool-calling beat codemode on every quantity
@@ -559,3 +562,192 @@ anywhere, so the tier is CLEAN and may ratchet.
 
 Cumulative spend after phase 1a: **$4.07** of ~$60 (codemode $1.095, vanilla
 $0.706, claude-code $2.235, vanilla smoke $0.034; all oracle screening $0).
+
+---
+
+## 7. Phase 1b (partial) — three more tasks, three arms
+
+Halted mid-sweep by the lead after `train-fasttext`. `train-bpe-tokenizer`,
+`gcc-compiler-optimization` and `password-recovery` were **not run**; the
+stdlib-shadowing regression check therefore did **not** get its 3-arm confirmation
+here (it remains confirmed only by §8.4's own E2E check).
+
+### 7.1 `magsac-install` — the widest claude-code gap in the campaign
+
+OpenCV 4.3.0 + pymagsac from source. All three arms **PASS**.
+
+| endpoint | codemode | vanilla | claude-code |
+|---|---|---|---|
+| resolved | PASS | PASS | PASS |
+| turns | 28 | 32 | 69 |
+| cost | $1.056 | **$0.935** | $4.122 |
+| wall-clock | 1473s | **699s** | 886s |
+| `ctx0` | 7,501 | **5,455** | 23,721 |
+| ctx last turn | 41,223 | 41,041 | **118,132** |
+| **ctx accumulated** | 748,547 | 739,755 | **4,354,865** |
+| output tokens | **8,968** | 13,165 | 54,599 |
+| cache expiries | 1 ($0.222 extra) | 0 | 0 |
+
+```
+codemode     7k  9k 12k 15k 22k 34k 35k 36k 38k 41k
+vanilla      5k  7k 11k 16k 21k 25k 29k 32k 38k 41k
+claude-code 23k 37k 54k 68k 79k 87k 97k 106k 112k 118k
+```
+
+**claude-code reached 118K resident context and 4.35M accumulated — 5.8× codemode
+— for the same three passing assertions, at 4.4× the cost.** This is the
+context-rot curve the campaign was looking for, and it is claude-code's, not
+vanilla's: the two prime arms track each other almost exactly (748K vs 740K,
+41.2K vs 41.0K final) while cc diverges from turn one and never converges.
+
+### 7.2 `hf-train-lora-adapter` — all three arms fail, task-level
+
+| arm | assertions | secs | hitDeadline |
+|---|---|---|---|
+| codemode | 1/5 (`test_training_script` only) | 1772.8 | **True** |
+| vanilla | **4/5** (all but `test_model_improvement`) | 1772.0 | **True** |
+| claude-code | 1/5 | 1639 | — |
+
+Per skill §3 this is **task-level, not arm-level**: the oracle passes it in 271.6s
+because it knows the exact `pip install` line, and all three agents spent the
+1800s budget discovering it. **All three ran to the wall.** vanilla got closest —
+it produced the adapter and results file and failed only the quality assertion.
+Classification **AGENT** (acted, then exhausted the task's own budget), carrying
+no arm signal.
+
+**The Phase 0 watchdog prediction was tested here and is FALSIFIED.** §1.1
+predicted the 208.6s foreground training would trip the 120s wedge-suspect
+watchdog. Scanning both codemode streams for `held the kernel for` /
+`INTERRUPTED after`: **NONE on `hf-train-lora-adapter`, NONE on `magsac-install`.**
+The agent submitted the training to `jobs` (7 cells) instead of running it
+foreground, so the watchdog never armed against real compute. The threshold
+survives a corpus that now includes a genuine multi-minute train — which is the
+evidence §8.4 lacked. Recorded as a negative result for a prediction this document
+made in advance.
+
+**claude-code's cache expiries — the only 40K+ re-warm measured.**
+
+```
+cc turn 15: ctx 39,312  rewarm 21,612  (cacheRead 17,698)  gapBefore 609s  modelLatency 8.1s
+cc turn 24: ctx 47,287  rewarm 29,587  (cacheRead 17,698)  gapBefore 603s  modelLatency 2.3s
+```
+
+Note `cacheRead 17,698` on both: cc retains a long-lived prefix (its system
+prompt) and re-warms only the transcript above it — a real mitigation the prime
+arms did not show, where `cacheRead` was 0 on every expiry. Its two events cost
+**$0.294 extra**. The first shows an 8.1s wake against a 4.8s warm median (1.7×);
+the second shows 2.3s (below it). **Two events, opposite signs — still no latency
+result.**
+
+### 7.3 `train-fasttext` — vanilla passes, both other arms fail
+
+| arm | assertions | turns | cost | secs |
+|---|---|---|---|---|
+| codemode | `test_model_size` pass, **`test_accuracy` fail** | 12 | $0.192 | 365 |
+| vanilla | **2/2 PASS** | 31 | $0.693 | 1068 |
+| claude-code | 0/2 | 23 | $0.842 | 394 |
+
+**codemode: AGENT, train/serve preprocessing skew.** Its final message claims
+success —
+
+> "Held-out test accuracy: **0.6357** (≥0.62 target). Model saved at
+> **/app/model.bin**, size **99 MB**"
+
+— and `test_model_size` did pass. But it trained with "light punctuation/lowercase
+normalization", while the grader (`tests/test_outputs.py:21-30`) reads
+`/app/data/test.txt` and predicts on the **raw** line text against
+`ACCURACY_THRESHOLD = 0.62`. The 0.6357 was measured on its own *normalized*
+held-out split — a correct number for a distribution the grader never presents.
+Vanilla applied no normalization and passed.
+
+The shape worth noting: **codemode quit confident at 365s of a 3600s budget;
+vanilla ground on for 1068s and passed.** Same failure family as claude-code on
+compcert — early, confident termination — arrived at by a different route
+(believing a self-measured metric rather than yielding to a session).
+
+## 8. Campaign totals — six tasks, three arms, eighteen runs
+
+| arm | trials | resolved | total cost | total ctx accumulated | expiries | re-warm tok | extra $ |
+|---|---|---|---|---|---|---|---|
+| **codemode** (jobs=on) | 6 | 4/6 | $2.662 | 1,633,976 | 4 | 89,756 | $0.516 |
+| **vanilla** | 6 | **5/6** | **$2.538** | 1,657,329 | 2 | 17,129 | $0.098 |
+| **claude-code** | 6 | 3/6 | $8.609 | **8,226,788** | 2 | 51,199 | $0.294 |
+
+| task | codemode | vanilla | claude-code |
+|---|---|---|---|
+| `cartpole-rl-training` | PASS $0.179 | PASS $0.162 | PASS $0.346 |
+| `compile-compcert` | PASS $0.726 | PASS $0.340 | **fail** $0.902 |
+| `sqlite-with-gcov` | PASS $0.190 | PASS $0.204 | PASS $0.987 |
+| `magsac-install` | PASS $1.056 | PASS $0.935 | PASS $4.122 |
+| `hf-train-lora-adapter` | **fail** $0.319 | **fail** $0.204 | **fail** $1.410 |
+| `train-fasttext` | **fail** $0.192 | PASS $0.693 | **fail** $0.842 |
+
+Total spend **$13.81** of ~$60 (+$0.034 vanilla smoke). All oracle screening $0.
+
+## 9. Verdict
+
+**1. Against claude-code, the context and cost result is large, consistent, and
+replicates AppWorld.** 5.0× the accumulated context of either prime arm
+(8.23M vs 1.63M/1.66M) and 3.2–3.4× the cost, across six tasks including the four
+it and they both passed. `ctx0` is ~23K for cc on every single task against
+4.7–7.6K for both prime arms. It peaked at **118K resident** on `magsac-install`.
+This is the campaign's most robust finding.
+
+**2. claude-code has no usable long-wait behaviour under `-p`, and this is the
+strongest wait-half evidence the project has.** On `compile-compcert` it
+backgrounded the build correctly, polled its own task-output file, went looking
+for a `Monitor` tool via `ToolSearch`, wrote `until grep -q …; do sleep 10; done`
+— and then ended its turn at 225s of a 2400s budget with
+`"OCaml 4.14.2 is still compiling. I'll continue when it lands."`, reporting
+`subtype: success`. It had built nearly the right thing and lacked only a **resume
+seam**. prime's `jobs.wait(wake_after=N)` ends the turn *and the harness restarts
+it*; `claude … -p` has no addressee. n=1, mechanism named, class AGENT — but the
+arms genuinely differ in wake support and that difference is the treatment.
+
+**3. The jobs runtime is clean and its watchdog is safe.** Across six tasks:
+0 blocking sleeps, 0 wedged cells, 0 kernel restarts, `jobs_staging.bound = true`
+and full preflight on every codemode run, `jobs.` adopted on 5 of 6 tasks (2–13
+cells). The 120s wedge-suspect trip **false-positived nothing** — including on a
+2200s Coq build, a 1473s OpenCV build and a genuine GPT-2 LoRA training run, which
+is exactly the corpus §8.4 admitted it lacked.
+
+**4. Cache expiry is real, caused by waits, and scales with resident context —
+but only the cost half.** 8 expiry events across the campaign, every one with a
+424–903s gap before it, and **0/0/0 on all three arms of both tasks with no long
+wait** (cartpole, sqlite) — a control that rules out the detector firing on
+ordinary turns. Cost $0.098–$0.516 per arm over the campaign, 13–29% of run cost
+on the tasks where it bites. **The latency half is unsupported and should stop
+being quoted**: across 8 events, wake-turn latency is at or below the arm's own
+warm median in 7 of them; the single exception (cc, 8.1s vs 4.8s warm, on a 21.6K
+re-warm) is contradicted by its own second event at 2.3s.
+
+**5. The honest negative: codemode did not beat vanilla.** 4/6 vs **5/6**
+resolved, $2.662 vs **$2.538**, and accumulated context a statistical tie
+(1.634M vs 1.657M — 1.4% apart). Vanilla was cheaper on 4 of 6 tasks. Three
+distinct causes were identified from traces, and **none of them is the tool
+surface**:
+
+- a `def sh(c): print(r.stdout[-4000:])` helper codemode wrote itself and used 16
+  times on compcert, against vanilla's habitual `tail -3` (§3.2) — the
+  "caller decides what survives" affordance used to keep *more*;
+- a wrong-Coq-version detour that made codemode do 35% more work on the same task
+  (43,779 vs 32,345 procs);
+- train/serve preprocessing skew on `train-fasttext` (§7.3).
+
+n=6 paired tasks, far under the ~20 `CLAUDE.md` requires to rank two arms, so this
+is **not** a ranking. It is a flag that the representation advantage measured on
+AppWorld does not reproduce on shell-shaped terminal work, where the code arm pays
+a `%%bash`/`subprocess` framing tax to reach the same shell the other arm has
+natively.
+
+**6. Not run, deliberately.** Phase 1b's last three tasks
+(`train-bpe-tokenizer`, `gcc-compiler-optimization`, `password-recovery`) and
+**Phase 2 (subagents ON/OFF) were never run.** Phase 2 would additionally have
+measured nothing as wired: `prime_agent._stage_jobs` copies `jobs.py`,
+`kernel-prelude.py` and `harness_unshadow.py` but **not** `subagents.py` /
+`subagent_run.py`, and `_bind_subagents()` is deliberately failure-tolerant — so
+`HARNESS_SUBAGENTS=1` would have recorded
+`SUBAGENTS not available: ModuleNotFoundError` and come up anyway, and the run
+would have looked like "the agent chose not to delegate". Confirmed in every
+`prelude-status.txt` this campaign produced: `SUBAGENTS off`. **That staging must
+be added and A0'd before any subagent number is believed.**
