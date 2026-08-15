@@ -19,6 +19,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, createWriteStream, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadCatalogue, loadGenerated } from "./catalogue.mjs";
 import { generate, renderFullDocs } from "./generate.mjs";
 import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./prompts.mjs";
 import { findTask } from "./tasks.mjs";
@@ -90,10 +91,7 @@ function buildPreamble() {
 	// prompt is what makes this L1 rather than L0 — a first attempt hid them
 	// behind a search tool, and the model never looked, falling back to curl.
 	if (arm === "vanilla" && residency === "L1") {
-		const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
-			task.exposedServers.includes(s.server),
-		);
-		const { toolDefs } = generate(catalogue);
+		const { toolDefs } = loadGenerated(SCHEMAS, { servers: task.exposedServers });
 		// w3, not an inline copy. This block used to build its own preamble and so
 		// silently skipped the efficiency guidance the L4 cell receives from w2 —
 		// a difference inside the tools row, on the axis the 2x2 varies.
@@ -108,18 +106,13 @@ function buildPreamble() {
 	// measured "which representation survives no instructions", not which
 	// architecture is better.
 	if (arm === "vanilla") {
-		const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
-			task.exposedServers.includes(s.server),
-		);
-		const { toolDefs } = generate(catalogue);
+		const { toolDefs } = loadGenerated(SCHEMAS, { servers: task.exposedServers });
 		return buildVanillaPreamble(vanillaPromptName, { toolCount: toolDefs.length });
 	}
 	if (arm !== "codemode") return "";
 
-	const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
-		task.exposedServers.includes(s.server),
-	);
-	const { tocLines, names, normalized } = generate(catalogue);
+	const { tocLines, names, normalized } = loadGenerated(SCHEMAS, { servers: task.exposedServers });
+	const catalogue = loadCatalogue(SCHEMAS, { servers: task.exposedServers });
 	const pointer = buildCodemodePreamble(promptName, {
 		toolCount: tocLines.length,
 		serverCount: catalogue.length,
@@ -169,10 +162,7 @@ writeFileSync(join(runDir, "prompt.txt"), preamble);
 
 // codemode reads its catalogue off disk; vanilla gets it as tool definitions.
 if (arm === "codemode") {
-	const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
-		task.exposedServers.includes(s.server),
-	);
-	const { files } = generate(catalogue);
+	const { files } = loadGenerated(SCHEMAS, { servers: task.exposedServers });
 	for (const [rel, content] of Object.entries(files)) {
 		const path = join(runDir, "api", rel);
 		mkdirSync(dirname(path), { recursive: true });
@@ -223,10 +213,7 @@ let toolList;
 if (arm === "notools") {
 	toolList = [];
 } else if (arm === "vanilla") {
-	const catalogue = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue.filter((s) =>
-		task.exposedServers.includes(s.server),
-	);
-	const { toolDefs } = generate(catalogue);
+	const { toolDefs } = loadGenerated(SCHEMAS, { servers: task.exposedServers });
 	meta.mcpToolCount = toolDefs.length;
 	// L4 names every tool; L1 defers behind three meta-tools, which is what a
 	// modern harness ships. Both must be listed here because --tools is an

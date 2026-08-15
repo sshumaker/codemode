@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { pool } from "./pool.mjs";
 import { generate } from "./generate.mjs";
 import { loadTasks } from "./tasks.mjs";
+import { loadCatalogue } from "./catalogue.mjs";
 
 // Look tasks up without the grounded/runnable filters: runs made before a task
 // was excluded still exist on disk and should still be scoreable.
@@ -58,7 +59,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS = join(ROOT, ".run/runs");
 const MCP_LOG = join(ROOT, ".run/mcp-calls.jsonl");
 const SCHEMAS = join(ROOT, "bench/data/mcp-schemas.json");
-const CATALOGUE = JSON.parse(readFileSync(SCHEMAS, "utf8")).catalogue;
+const CATALOGUE = loadCatalogue(SCHEMAS);
 
 /**
  * Wire names of every tool the agent could reach on this task.

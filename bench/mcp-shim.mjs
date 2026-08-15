@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generate } from "./generate.mjs";
+import { loadCatalogue } from "./catalogue.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCHEMAS = join(ROOT, "bench/data/mcp-schemas.json");
@@ -27,7 +28,7 @@ const PROXY = process.env.HARNESS_MCP_PROXY ?? "http://127.0.0.1:8765";
 const RUN_ID = process.env.HARNESS_RUN_ID ?? "";
 const SERVERS = (process.env.HARNESS_MCP_SERVERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
-const { catalogue } = JSON.parse(readFileSync(SCHEMAS, "utf8"));
+const catalogue = loadCatalogue(SCHEMAS);
 const selected = SERVERS.length > 0 ? catalogue.filter((s) => SERVERS.includes(s.server)) : catalogue;
 const { toolDefs } = generate(selected);
 
