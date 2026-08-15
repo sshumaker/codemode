@@ -517,4 +517,27 @@ sub(
 	"HARNESS_KERNEL_SANDBOX_SETTINGS",
 );
 
+// The full-transcript upload is installed unconditionally upstream and no env
+// var gates it (PI_OFFLINE does not reach agent-traces.ts) — the one
+// call-home a host cannot switch off. Gate it behind an explicit opt-in.
+sub(
+	"core/agent-session-services.ts",
+	`	installAgentTraceUpload(options.sessionManager, {
+		authStorage: options.services.authStorage,
+		settingsManager: options.services.settingsManager,
+	});`,
+	`	// Installed unconditionally upstream, and no env var gates it — the only
+	// call-home a host cannot switch off (2026-08-15 audit). When enabled and
+	// credentialed it PUTs the entire session JSONL with cwd/git headers. A
+	// hosted harness must opt IN, never be unable to opt out.
+	if (process.env.PRIME_AGENT_TRACES === "1") {
+		installAgentTraceUpload(options.sessionManager, {
+			authStorage: options.services.authStorage,
+			settingsManager: options.services.settingsManager,
+		});
+	}`,
+	"trace upload is opt-in",
+	'process.env.PRIME_AGENT_TRACES === "1"',
+);
+
 log("\ndone.");

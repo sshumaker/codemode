@@ -264,10 +264,16 @@ export async function createAgentSessionServices(
 export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
-	installAgentTraceUpload(options.sessionManager, {
-		authStorage: options.services.authStorage,
-		settingsManager: options.services.settingsManager,
-	});
+	// Installed unconditionally upstream, and no env var gates it — the only
+	// call-home a host cannot switch off (2026-08-15 audit). When enabled and
+	// credentialed it PUTs the entire session JSONL with cwd/git headers. A
+	// hosted harness must opt IN, never be unable to opt out.
+	if (process.env.PRIME_AGENT_TRACES === "1") {
+		installAgentTraceUpload(options.sessionManager, {
+			authStorage: options.services.authStorage,
+			settingsManager: options.services.settingsManager,
+		});
+	}
 	const result = await createAgentSession({
 		cwd: options.services.cwd,
 		agentDir: options.services.agentDir,
