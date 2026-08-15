@@ -317,6 +317,33 @@ class TestStartingStateRecovery(Base):
         self.assertEqual([r["name"] for r in live], ["victim"])
 
 
+class TestWakeFile(Base):
+    """wait() records the wake request on disk for the scheduler (Phase 3)."""
+
+    def test_wait_writes_the_wake_request_with_live_watch_list(self):
+        import json as _json
+        wake = os.path.join(self.dir, "wake.json")
+        os.environ["HARNESS_WAKE_FILE"] = wake
+        try:
+            self.store.submit("make build", name="build")
+            with self.assertRaises(J.WaitSignal):
+                self.store.wait(wake_after=120)
+        finally:
+            os.environ.pop("HARNESS_WAKE_FILE", None)
+        with open(wake) as fh:
+            req = _json.load(fh)
+        self.assertEqual(req["wake_after"], 120)
+        self.assertEqual(req["watch"], ["build"])
+        # wake_at is real wall-clock (the scheduler's clock), not the store's fake.
+        self.assertGreater(req["wake_at"], 0)
+
+    def test_no_env_no_file(self):
+        self.store.submit("make build", name="build")
+        with self.assertRaises(J.WaitSignal):
+            self.store.wait(wake_after=120)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "wake.json")))
+
+
 class TestSubmit(Base):
     def test_happy_path_records_and_spawns_once(self):
         job = self.store.submit("gradle build", name="build", max_runtime="1h")

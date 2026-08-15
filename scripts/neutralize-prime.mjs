@@ -326,7 +326,16 @@ sub(
 		"\t\t\t\t\t? new RegExp(`^__HARNESS_WAIT_SECONDS__:(\\\\d+):${waitToken}$`, \"m\")\n" +
 		"\t\t\t\t\t: /^__HARNESS_WAIT_SECONDS__:(\\d+)(?::[A-Za-z0-9_-]+)?$/m;\n" +
 		"\t\t\t\tconst waitMatch = waitRe.exec(text);\n" +
-		"\t\t\t\tif (waitMatch) {\n" +
+		"\t\t\t\tif (waitMatch && process.env.HARNESS_WAIT_MODE === \"exit\") {\n" +
+		"\t\t\t\t\t// Scheduler mode (runtime/scheduler.py): do not hold this process\n" +
+		"\t\t\t\t\t// through the wait. The runtime wrote the wake request to disk; the\n" +
+		"\t\t\t\t\t// model ends its turn, print mode exits, and the scheduler re-invokes\n" +
+		"\t\t\t\t\t// --resume when the deadline passes or a watched job finishes.\n" +
+		"\t\t\t\t\ttext = text.replace(\n" +
+		"\t\t\t\t\t\twaitMatch[0],\n" +
+		"\t\t\t\t\t\t`[wait recorded; this run will now end and be resumed when due — finish your turn]`,\n" +
+		"\t\t\t\t\t);\n" +
+		"\t\t\t\t} else if (waitMatch) {\n" +
 		"\t\t\t\t\tconst secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));\n" +
 		"\t\t\t\t\tsetToolWorkingMessage(`waiting ${secs}s (kernel released)`);\n" +
 		"\t\t\t\t\t// Abortable: a run timeout or Ctrl-C must interrupt the wait, not\n" +

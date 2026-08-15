@@ -1174,6 +1174,24 @@ class JobStore:
             f"[waiting {clamped}s outside the kernel; nothing is held{note}. "
             f"running jobs: {', '.join(pending) or 'none'}]"
         )
+        # Scheduler mode (runtime/scheduler.py): the wake request goes on DISK,
+        # where a host that exits between turns can find it. {wake_at, watch}
+        # is the whole contract — deadline OR any watched job finishing, first
+        # one wins. Written atomically for the same reason job records are.
+        wake_file = os.environ.get("HARNESS_WAKE_FILE")
+        if wake_file:
+            try:
+                tmp = f"{wake_file}.tmp"
+                with open(tmp, "w") as fh:
+                    json.dump({
+                        "wake_at": time.time() + clamped,
+                        "wake_after": clamped,
+                        "watch": [p.split(" ")[0] for p in pending],
+                    }, fh)
+                os.replace(tmp, wake_file)
+            except OSError as exc:
+                self._emit(f"[jobs] could not record the wake request ({exc}); "
+                           "the host-side deadline is the only wake")
         # The host matches the sentinel line-anchored, and — when HARNESS_WAIT_TOKEN
         # is set — only with the token the kernel inherited via env. Without it,
         # any stdout containing the bare sentinel (a cat of a transcript, a printed

@@ -843,7 +843,16 @@ export function createIpythonToolDefinition(
 					? new RegExp(`^__HARNESS_WAIT_SECONDS__:(\\d+):${waitToken}$`, "m")
 					: /^__HARNESS_WAIT_SECONDS__:(\d+)(?::[A-Za-z0-9_-]+)?$/m;
 				const waitMatch = waitRe.exec(text);
-				if (waitMatch) {
+				if (waitMatch && process.env.HARNESS_WAIT_MODE === "exit") {
+					// Scheduler mode (runtime/scheduler.py): do not hold this process
+					// through the wait. The runtime wrote the wake request to disk; the
+					// model ends its turn, print mode exits, and the scheduler re-invokes
+					// --resume when the deadline passes or a watched job finishes.
+					text = text.replace(
+						waitMatch[0],
+						`[wait recorded; this run will now end and be resumed when due — finish your turn]`,
+					);
+				} else if (waitMatch) {
 					const secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));
 					setToolWorkingMessage(`waiting ${secs}s (kernel released)`);
 					// Abortable: a run timeout or Ctrl-C must interrupt the wait, not
