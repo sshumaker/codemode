@@ -844,14 +844,21 @@ export function createIpythonToolDefinition(
 					: /^__HARNESS_WAIT_SECONDS__:(\d+)(?::[A-Za-z0-9_-]+)?$/m;
 				const waitMatch = waitRe.exec(text);
 				if (waitMatch && process.env.HARNESS_WAIT_MODE === "exit") {
-					// Scheduler mode (runtime/scheduler.py): do not hold this process
-					// through the wait. The runtime wrote the wake request to disk; the
-					// model ends its turn, print mode exits, and the scheduler re-invokes
-					// --resume when the deadline passes or a watched job finishes.
+					// Scheduler mode (runtime/scheduler.py): the run ENDS at a wait, by
+					// mechanism rather than by request. Asking the model to end its turn
+					// was measured twice (demo2/demo3: 36 and 28 zero-second waits) and
+					// lost to the sampling prior both times — the same lesson as the
+					// guards: a deviation the prose requests, the mechanism must enforce.
+					// The grace period lets the toolResult land in the session JSONL and
+					// the protocol stream; the wake is `--resume` plus a user message, so
+					// a transcript ending at this toolResult is exactly resumable. Any
+					// partial next turn the model starts in the window is never recorded
+					// (messages persist on message_end) and costs nothing but tokens.
 					text = text.replace(
 						waitMatch[0],
-						`[wait armed — STOP. End your turn NOW: no more tool calls, no more text. This process exits when you stop, and you will be re-invoked automatically the moment the job finishes or the deadline passes. Any cell you run now executes BEFORE the wait and defeats it.]`,
+						`[wait armed: this process now exits; you will be re-invoked the moment the job finishes or the deadline passes]`,
 					);
+					setTimeout(() => process.exit(0), Number(process.env.HARNESS_WAIT_EXIT_GRACE_MS ?? 1500));
 				} else if (waitMatch) {
 					const secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));
 					setToolWorkingMessage(`waiting ${secs}s (kernel released)`);

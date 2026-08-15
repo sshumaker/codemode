@@ -781,11 +781,23 @@ def _render_wait_signal_cleanly():
 
     def handler(shell, etype, value, tb, tb_offset=None):
         seconds = value.args[0] if value.args else "?"
-        print(
-            f"[cell ended here so the kernel is free; the host waits {seconds}s and then "
-            f"calls you again. Anything written after jobs.wait() in this cell did NOT run — "
-            f"put it in the next cell.]"
-        )
+        if os.environ.get("HARNESS_WAIT_MODE") == "exit":
+            # Scheduler mode: the run itself ends at this wait. The sleep-mode
+            # sentence ("the host waits Ns and then calls you again") actively
+            # CONTRADICTED the host's stop notice — the model read "calls you
+            # again" as "keep going" and busy-polled 36 zero-second waits
+            # (measured, demo2/demo3). One channel, one story.
+            print(
+                f"[cell ended here; this run now stops and you will be re-invoked "
+                f"when the wait is due (at most {seconds}s). Anything written after "
+                f"jobs.wait() in this cell did NOT run.]"
+            )
+        else:
+            print(
+                f"[cell ended here so the kernel is free; the host waits {seconds}s and then "
+                f"calls you again. Anything written after jobs.wait() in this cell did NOT run — "
+                f"put it in the next cell.]"
+            )
         return None
 
     try:

@@ -327,14 +327,21 @@ sub(
 		"\t\t\t\t\t: /^__HARNESS_WAIT_SECONDS__:(\\d+)(?::[A-Za-z0-9_-]+)?$/m;\n" +
 		"\t\t\t\tconst waitMatch = waitRe.exec(text);\n" +
 		"\t\t\t\tif (waitMatch && process.env.HARNESS_WAIT_MODE === \"exit\") {\n" +
-		"\t\t\t\t\t// Scheduler mode (runtime/scheduler.py): do not hold this process\n" +
-		"\t\t\t\t\t// through the wait. The runtime wrote the wake request to disk; the\n" +
-		"\t\t\t\t\t// model ends its turn, print mode exits, and the scheduler re-invokes\n" +
-		"\t\t\t\t\t// --resume when the deadline passes or a watched job finishes.\n" +
+		"\t\t\t\t\t// Scheduler mode (runtime/scheduler.py): the run ENDS at a wait, by\n" +
+		"\t\t\t\t\t// mechanism rather than by request. Asking the model to end its turn\n" +
+		"\t\t\t\t\t// was measured twice (demo2/demo3: 36 and 28 zero-second waits) and\n" +
+		"\t\t\t\t\t// lost to the sampling prior both times — the same lesson as the\n" +
+		"\t\t\t\t\t// guards: a deviation the prose requests, the mechanism must enforce.\n" +
+		"\t\t\t\t\t// The grace period lets the toolResult land in the session JSONL and\n" +
+		"\t\t\t\t\t// the protocol stream; the wake is `--resume` plus a user message, so\n" +
+		"\t\t\t\t\t// a transcript ending at this toolResult is exactly resumable. Any\n" +
+		"\t\t\t\t\t// partial next turn the model starts in the window is never recorded\n" +
+		"\t\t\t\t\t// (messages persist on message_end) and costs nothing but tokens.\n" +
 		"\t\t\t\t\ttext = text.replace(\n" +
 		"\t\t\t\t\t\twaitMatch[0],\n" +
-		"\t\t\t\t\t\t`[wait armed — STOP. End your turn NOW: no more tool calls, no more text. This process exits when you stop, and you will be re-invoked automatically the moment the job finishes or the deadline passes. Any cell you run now executes BEFORE the wait and defeats it.]`,\n" +
+		"\t\t\t\t\t\t`[wait armed: this process now exits; you will be re-invoked the moment the job finishes or the deadline passes]`,\n" +
 		"\t\t\t\t\t);\n" +
+		"\t\t\t\t\tsetTimeout(() => process.exit(0), Number(process.env.HARNESS_WAIT_EXIT_GRACE_MS ?? 1500));\n" +
 		"\t\t\t\t} else if (waitMatch) {\n" +
 		"\t\t\t\t\tconst secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));\n" +
 		"\t\t\t\t\tsetToolWorkingMessage(`waiting ${secs}s (kernel released)`);\n" +
