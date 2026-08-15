@@ -850,7 +850,7 @@ export function createIpythonToolDefinition(
 					// --resume when the deadline passes or a watched job finishes.
 					text = text.replace(
 						waitMatch[0],
-						`[wait recorded; this run will now end and be resumed when due — finish your turn]`,
+						`[wait armed — STOP. End your turn NOW: no more tool calls, no more text. This process exits when you stop, and you will be re-invoked automatically the moment the job finishes or the deadline passes. Any cell you run now executes BEFORE the wait and defeats it.]`,
 					);
 				} else if (waitMatch) {
 					const secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));

@@ -333,7 +333,7 @@ sub(
 		"\t\t\t\t\t// --resume when the deadline passes or a watched job finishes.\n" +
 		"\t\t\t\t\ttext = text.replace(\n" +
 		"\t\t\t\t\t\twaitMatch[0],\n" +
-		"\t\t\t\t\t\t`[wait recorded; this run will now end and be resumed when due — finish your turn]`,\n" +
+		"\t\t\t\t\t\t`[wait armed — STOP. End your turn NOW: no more tool calls, no more text. This process exits when you stop, and you will be re-invoked automatically the moment the job finishes or the deadline passes. Any cell you run now executes BEFORE the wait and defeats it.]`,\n" +
 		"\t\t\t\t\t);\n" +
 		"\t\t\t\t} else if (waitMatch) {\n" +
 		"\t\t\t\t\tconst secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));\n" +
