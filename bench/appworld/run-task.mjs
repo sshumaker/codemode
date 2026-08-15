@@ -537,7 +537,7 @@ function preambleFor() {
 		// codemode; a TOC the agent cannot act on is worse than no TOC.
 		if (residency === "L1") return `${body}\n\nAvailable functions:\n${toolDefs.map((d) => d.name).join("\n")}`;
 		if (residency === "L2") {
-			const wireToc = normalized.flatMap(({ server, tools }) => renderTocLines(tools, { server, style: "wire" }));
+			const wireToc = normalized.flatMap(({ server, pyServer, tools }) => renderTocLines(tools, { server, pkg: pyServer, style: "wire" }));
 			return `${body}\n\nAvailable functions:\n${wireToc.join("\n")}`;
 		}
 		throw new Error(`unsupported vanilla residency: ${residency}`);
@@ -567,7 +567,7 @@ function preambleFor() {
 		// does, and why it needs the same <=20-API predictor as their tool-calling
 		// agent. If codemode's advantage survives this, the mechanism is
 		// representation; if it does not, the mechanism is residency.
-		const docs = normalized.map(({ server, tools }) => renderFullDocs(tools, { server })).join("\n");
+		const docs = normalized.map(({ server, pyServer, tools }) => renderFullDocs(tools, { server, pkg: pyServer })).join("\n");
 		return `${pointer}\n\n## Full API documentation\n\nEvery function is documented below, so you do not need to read \`api/\` at all.\n\n${docs}`;
 	}
 	throw new Error(`unsupported codemode residency: ${residency}`);

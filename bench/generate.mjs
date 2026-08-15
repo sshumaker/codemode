@@ -39,6 +39,41 @@ const PY_KEYWORDS = new Set([
 	"with", "yield", "match", "case",
 ]);
 
+/**
+ * Description text made safe for interpolation into a `"""…"""` docstring.
+ *
+ * Backslashes double (so the DISPLAYED text is unchanged — Python renders \\ as
+ * \), then `"""` is escaped, then a trailing `"` is escaped so it cannot fuse
+ * with the closing quotes. Without this, one `"""` anywhere in an MCP tool
+ * description is a SyntaxError that takes out the whole app module in the
+ * consolidated layout — and only drops one tool in per-method, i.e. a
+ * capability difference between arms masquerading as a token saving. AppWorld
+ * ships zero of either character, which is luck, not a property; the first
+ * real-world catalogue is where this fires. The sanitisation is display-
+ * preserving, so on catalogues without these characters output is unchanged.
+ */
+export function pyDocstring(text) {
+	let safe = String(text ?? "").replace(/\\/g, "\\\\").replace(/"""/g, '\\"\\"\\"');
+	if (safe.endsWith('"')) safe = `${safe.slice(0, -1)}\\"`;
+	return safe;
+}
+
+/**
+ * One enum/const member as a PYTHON literal.
+ *
+ * JSON.stringify emits `true`/`false`/`null` — which PARSE inside a Literal[…]
+ * annotation and then raise NameError at import, past the ast.parse gate the
+ * tests used to rely on. Objects and arrays have no Literal spelling; the
+ * caller degrades the whole enum to the base type instead.
+ */
+export function pyLiteral(v) {
+	if (v === true) return "True";
+	if (v === false) return "False";
+	if (v === null) return "None";
+	if (typeof v === "object") return null; // no Literal spelling — degrade
+	return JSON.stringify(v);
+}
+
 /** A tool identifier that is safe as a Python module and function name. */
 export function pyIdent(name) {
 	const cleaned = name.replace(/[^A-Za-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
@@ -62,12 +97,19 @@ export function pyPackage(server) {
 function pyType(schema) {
 	if (!schema || typeof schema !== "object") return "Any";
 	if (Array.isArray(schema.enum) && schema.enum.length > 0) {
-		const literals = schema.enum.map((v) => JSON.stringify(v)).join(", ");
-		return `Literal[${literals}]`;
+		const members = schema.enum.map(pyLiteral);
+		// Any member with no Literal spelling (an object/array) degrades the whole
+		// enum to the base type rather than emitting a token that NameErrors.
+		if (members.every((m) => m !== null)) return `Literal[${members.join(", ")}]`;
+		return PY_TYPES[schema.type] ?? "Any";
 	}
 	// A single permitted value is a Literal, same as a one-member enum. Rendering it
 	// `str` would drop the only thing the schema actually says about the parameter.
-	if ("const" in schema) return `Literal[${JSON.stringify(schema.const)}]`;
+	if ("const" in schema) {
+		const member = pyLiteral(schema.const);
+		if (member !== null) return `Literal[${member}]`;
+		return PY_TYPES[schema.type] ?? "Any";
+	}
 	if (Array.isArray(schema.type)) {
 		// `items` still applies when "array" arrives inside a type union, so recurse
 		// rather than flattening to a bare `list` — the same information loss the
@@ -109,7 +151,23 @@ export function normalizeTool(tool) {
 		required: required.has(name),
 		type: pyType(spec),
 		description: (spec?.description ?? "").trim(),
+		// The server-side default, surfaced in the docstring. Vanilla's tool defs
+		// carry it in the raw schema; dropping it here made 363 AppWorld defaults
+		// visible to one arm and invisible to the other — an asymmetry against
+		// the fairness invariant (2026-08-15 review, P1.5).
+		serverDefault: spec !== null && typeof spec === "object" && "default" in spec ? spec.default : undefined,
 	}));
+
+	// Two wire names can normalize to one identifier (`page-index` and
+	// `page_index`): the second becomes `page_index_2` instead of a SyntaxError
+	// (duplicate argument) that takes the whole module down. The wire `name` is
+	// untouched — _call sends the original.
+	const seenParams = new Map();
+	for (const p of params) {
+		const n = seenParams.get(p.pyName) ?? 0;
+		seenParams.set(p.pyName, n + 1);
+		if (n > 0) p.pyName = `${p.pyName}_${n + 1}`;
+	}
 
 	// Required parameters must precede optional ones in a Python signature.
 	params.sort((a, b) => Number(b.required) - Number(a.required));
@@ -147,6 +205,20 @@ const firstLine = (text) => (text ?? "").trim().split("\n")[0]?.trim() ?? "";
  * classifier that sees schemas and docstrings only, and every entry carries the
  * verbatim sentence that justifies it.
  */
+/**
+ * The schema's own `default`, as one docstring line — or null.
+ *
+ * Skipped for promoted (requiredDefault) parameters: those get the "Required
+ * here" sentence instead, and showing a default under a required slot would
+ * reintroduce exactly the contradiction the promotion removed.
+ */
+export function serverDefaultNote(param) {
+	if (param.serverDefault === undefined || param.requiredDefault || param.required) return null;
+	const literal = JSON.stringify(param.serverDefault);
+	if (literal === undefined || literal.length > 80) return null;
+	return `Server-side default: ${pyDocstring(literal)}.`;
+}
+
 export function requiredDefaultNote(param) {
 	if (!param?.requiredDefault) return null;
 	// Whitespace-collapsed, and `"""` removed so a quote can never terminate the
@@ -249,12 +321,12 @@ export function renderToolDefs(tools, { server } = {}) {
  *   "python"  api.math_mcp.add(a, b) — ...      (codemode: an importable path)
  *   "wire"    Math_MCP__add(a, b) — ...         (vanilla: the tool name)
  */
-export function renderTocLines(tools, { server, style = "python" } = {}) {
+export function renderTocLines(tools, { server, pkg = pyPackage(server), style = "python" } = {}) {
 	return tools.map((t) => {
 		const path =
 			style === "wire"
 				? `${wireName(server, t.name)}(${t.params.map((p) => (p.required ? p.pyName : `${p.pyName}?`)).join(", ")})`
-				: pyCallSignature(t, pyPackage(server));
+				: pyCallSignature(t, pkg);
 		return `${path} — ${firstLine(t.description)}`;
 	});
 }
@@ -276,8 +348,7 @@ export function renderTocLines(tools, { server, style = "python" } = {}) {
  * and the on-disk text cannot drift. It is the same container, relocated into the
  * prompt, which is exactly the contrast wanted.
  */
-export function renderFullDocs(tools, { server, heading = true }) {
-	const pkg = pyPackage(server);
+export function renderFullDocs(tools, { server, pkg = pyPackage(server), heading = true }) {
 	// The per-app DOCS.md file has its own title, so it asks for the body alone.
 	// An option rather than the caller slicing lines off the front: a slice would
 	// silently eat documentation the day this renderer's shape changes.
@@ -289,11 +360,13 @@ export function renderFullDocs(tools, { server, heading = true }) {
 		if (description) for (const line of description.split("\n")) lines.push(`    ${line}`);
 		for (const p of tool.params) {
 			const required = requiredDefaultNote(p);
-			if (!p.description && !required) continue;
+			const dflt = serverDefaultNote(p);
+			if (!p.description && !required && !dflt) continue;
 			if (p.description) lines.push(`      ${p.pyName}: ${p.description}${p.required ? "" : " (optional)"}`);
-			// The same sentence the module docstring carries, from the same helper: the
-			// resident L4 text and the on-disk text must not be able to drift.
+			// The same sentences the module docstring carries, from the same helpers:
+			// the resident L4 text and the on-disk text must not be able to drift.
 			if (required) lines.push(`        ${required}`);
+			if (dflt) lines.push(`        ${dflt}`);
 		}
 		lines.push("");
 	}
@@ -713,9 +786,9 @@ export function renderNeighbours(normalized) {
 }
 
 /** L1: names only. */
-export function renderNames(tools, { server, style = "python" } = {}) {
+export function renderNames(tools, { server, pkg = pyPackage(server), style = "python" } = {}) {
 	return tools.map((t) =>
-		style === "wire" ? wireName(server, t.name) : `api.${pyPackage(server)}.${t.pyName}`,
+		style === "wire" ? wireName(server, t.name) : `api.${pkg}.${t.pyName}`,
 	);
 }
 
@@ -737,14 +810,17 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
 	const args = tool.params.map((p) => (p.required ? `${p.pyName}: ${p.type}` : `${p.pyName}: ${p.type} | None = None`));
 	const signatureLine = `async def ${tool.pyName}(${args.join(", ")}) -> Any:`;
 
-	const doc = [`    """${firstLine(tool.description) || tool.name}`];
-	const rest = (tool.description ?? "").trim().split("\n").slice(1).join("\n").trim();
+	// Every description is untrusted catalogue text on its way into a `"""…"""`
+	// block — pyDocstring keeps the displayed text identical and the parse safe.
+	const safeDescription = pyDocstring((tool.description ?? "").trim());
+	const doc = [`    """${firstLine(safeDescription) || tool.pyName}`];
+	const rest = safeDescription.split("\n").slice(1).join("\n").trim();
 	if (rest) doc.push("", ...rest.split("\n").map((l) => `    ${l}`));
 
 	if (tool.params.length > 0) {
 		doc.push("", "    Args:");
 		for (const p of tool.params) {
-			const note = p.description ? ` ${p.description}` : "";
+			const note = p.description ? ` ${pyDocstring(p.description)}` : "";
 			const opt = p.required ? "" : " Optional.";
 			doc.push(`        ${p.pyName}:${note}${opt}`.trimEnd());
 			// One line, and only for a promoted parameter. Without it the signature
@@ -753,6 +829,11 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
 			// contradictory statements about the same slot.
 			const required = requiredDefaultNote(p);
 			if (required) doc.push(`            ${required}`);
+			// The schema's own default, which the raw JSON schema shows vanilla and
+			// the signature's `= None` erases: the None-drop in _call is what lets
+			// the server apply it, so the DOCSTRING carries it (P1.5).
+			const dflt = serverDefaultNote(p);
+			if (dflt) doc.push(`            ${dflt}`);
 		}
 	}
 	doc.push("", "    Returns:", "        The tool result as returned by the MCP server.", '    """');
@@ -786,7 +867,7 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
  */
 export function renderToolModule(tool, { server, docsGate = "off" }) {
 	return [
-		`"""${server}.${tool.name} — generated from the MCP schema. Do not edit."""`,
+		`"""${pyDocstring(`${server}.${tool.name}`)} — generated from the MCP schema. Do not edit."""`,
 		"",
 		"from typing import Any, Literal",
 		"",
@@ -837,7 +918,7 @@ export function renderAppModule(tools, options) {
 export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), docsGate = "off", readGate = false }) {
 	const conventions = appConventions(tools, pkg);
 	const lines = [
-		`"""${server} — generated from the MCP schema. Do not edit.`,
+		`"""${pyDocstring(server)} — generated from the MCP schema. Do not edit.`,
 		"",
 		`${tools.length} API${tools.length === 1 ? "" : "s"}, all async, documented in full below.`,
 		`Call them as \`api.${pkg}.<name>(...)\`.`,
@@ -877,8 +958,7 @@ export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), d
 }
 
 /** codemode: the per-server package index, one line per tool. */
-export function renderServerIndex(tools, { server, docsGate = "off" }) {
-	const pkg = pyPackage(server);
+export function renderServerIndex(tools, { server, pkg = pyPackage(server), docsGate = "off" }) {
 	return [
 		`# ${server}`,
 		"",
@@ -896,7 +976,7 @@ export function renderServerIndex(tools, { server, docsGate = "off" }) {
 /** codemode: the package __init__, re-exporting every tool. */
 export function renderServerInit(tools, { server }) {
 	return [
-		`"""${server} — generated from the MCP schema. Do not edit."""`,
+		`"""${pyDocstring(server)} — generated from the MCP schema. Do not edit."""`,
 		"",
 		...tools.map((t) => `from .${t.pyName} import ${t.pyName}`),
 		"",
@@ -1346,10 +1426,26 @@ export function generate(
 	const seen = new Map();
 	for (const s of normalized) {
 		// Two servers could normalize to the same identifier; disambiguate rather
-		// than silently overwriting one package with the other.
+		// than silently overwriting one package with the other. The deduped
+		// pyServer is then THE package name: every renderer takes it as `pkg`
+		// rather than recomputing pyPackage(server) — recomputation is how the TOC
+		// and INDEX ended up citing `api.math_mcp.sub` while the module lived in
+		// `math_mcp_2/` (2026-08-15 review, P1.5 #4).
 		const count = seen.get(s.pyServer) ?? 0;
 		seen.set(s.pyServer, count + 1);
 		if (count > 0) s.pyServer = `${s.pyServer}_${count + 1}`;
+
+		// Same collision class one level down: `dup-name` and `dup_name` both
+		// normalize to `dup_name`. Consolidated, the second def silently SHADOWED
+		// the first — api.x.dup_name called the wrong wire tool, no error;
+		// per-method, one module file overwrote the other. The wire `name` is
+		// untouched — _call still sends the original.
+		const seenTools = new Map();
+		for (const t of s.tools) {
+			const n = seenTools.get(t.pyName) ?? 0;
+			seenTools.set(t.pyName, n + 1);
+			if (n > 0) t.pyName = `${t.pyName}_${n + 1}`;
+		}
 	}
 
 	const toolDefs = [];
@@ -1377,8 +1473,8 @@ export function generate(
 
 	for (const { server, pyServer, tools } of normalized) {
 		toolDefs.push(...renderToolDefs(tools, { server }));
-		tocLines.push(...renderTocLines(tools, { server }));
-		names.push(...renderNames(tools, { server }));
+		tocLines.push(...renderTocLines(tools, { server, pkg: pyServer }));
+		names.push(...renderNames(tools, { server, pkg: pyServer }));
 
 		if (layoutMode === "consolidated") {
 			// One module, and nothing else: no per-app INDEX.md (the module is the
@@ -1388,7 +1484,7 @@ export function generate(
 			if (lineMap) lineMap[pyServer] = part.lineMap;
 			continue;
 		}
-		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server, docsGate: gateMode });
+		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server, pkg: pyServer, docsGate: gateMode });
 		files[`${pyServer}/__init__.py`] = renderServerInit(tools, { server });
 		// The redirect target. Both live modes render it: `redirect` sends the agent
 		// here instead of showing a docstring, `inline` sends it here when a sibling

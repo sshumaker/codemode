@@ -134,7 +134,7 @@ function buildPreamble() {
 		// cell uses: if the two benchmarks rendered documentation differently, a
 		// difference between them would be unattributable — benchmark, or wording.
 		// Same container as the api/ tree, relocated into the prompt.
-		const docs = normalized.map(({ server, tools }) => renderFullDocs(tools, { server })).join("\n");
+		const docs = normalized.map(({ server, pyServer, tools }) => renderFullDocs(tools, { server, pkg: pyServer })).join("\n");
 		return `${pointer}\n\n## Full API documentation\n\nEvery tool is documented below, so you do not need to read \`api/\` at all.\n\n${docs}`;
 	}
 	throw new Error(`unsupported residency for codemode: ${residency}`);

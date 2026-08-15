@@ -224,3 +224,95 @@ export const wide = [
 		})),
 	},
 ];
+
+/**
+ * The hostile catalogue: every input-domain trap the 2026-08-15 review found
+ * the compiler survives on AppWorld only by luck. Each entry names the failure
+ * it pins. Used by bench/test/hostile.test.mjs, whose gate is IMPORT, not
+ * ast.parse — findings 2a and 3 both parse cleanly and fail at import.
+ */
+export const hostile = [
+	{
+		// Two servers that normalize to one package name. The docs/TOC once cited
+		// `api.math_mcp.sub` while the module lived in `math_mcp_2/`.
+		server: "Math MCP",
+		tools: [
+			{
+				name: "add",
+				description: "Add two numbers.",
+				inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] },
+			},
+		],
+	},
+	{
+		server: "math-mcp",
+		tools: [
+			{
+				name: "sub",
+				description: "Subtract b from a.",
+				inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] },
+			},
+		],
+	},
+	{
+		server: "traps",
+		tools: [
+			{
+				// A `"""` and a backslash in the description: SyntaxError in the
+				// docstring unless sanitized, whole app module lost when consolidated.
+				name: "inject_doc",
+				description: 'Bad """ docstring with a trailing backslash \\',
+				inputSchema: { type: "object", properties: { a: { type: "string", description: 'also """ here \\' } } },
+			},
+			{
+				// Tool-name collision under pyIdent: `dup-name` and `dup_name`. The
+				// second def silently shadowed the first (consolidated) or one module
+				// file overwrote the other (per-method).
+				name: "dup-name",
+				description: "First of a colliding pair.",
+				inputSchema: { type: "object", properties: {} },
+			},
+			{
+				name: "dup_name",
+				description: "Second of a colliding pair.",
+				inputSchema: { type: "object", properties: {} },
+			},
+			{
+				// Parameter-name collision: SyntaxError (duplicate argument).
+				name: "kwcollide",
+				description: "Two params, one identifier.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						"page-index": { type: "integer", description: "Kebab twin." },
+						page_index: { type: "integer", description: "Snake twin." },
+					},
+				},
+			},
+			{
+				// Non-string enum members: Literal[true, false, null] parses and then
+				// NameErrors at import — past any ast.parse gate.
+				name: "boolenum",
+				description: "Enum of booleans and null.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						x: { type: "boolean", enum: [true, false, null] },
+						y: { type: "string", const: "fixed" },
+						z: { type: "integer", enum: [1, 2, 3] },
+						w: { type: "object", enum: [{ bad: 1 }], description: "Object member degrades to base type." },
+					},
+				},
+			},
+			{
+				// A schema default that must surface in the docstring (P1.5).
+				name: "defaulted",
+				description: "Carries a server-side default.",
+				inputSchema: {
+					type: "object",
+					properties: { page_limit: { type: "integer", minimum: 1, maximum: 20, default: 5 } },
+				},
+			},
+		],
+	},
+];
