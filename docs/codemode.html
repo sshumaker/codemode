@@ -1,0 +1,518 @@
+<title>Codemode — a code-execution runtime for agents</title>
+<style>
+  :root {
+    --paper:#eef0ec; --surface:#f8faf6; --raised:#ffffff;
+    --ink:#171b17; --muted:#5b645b; --faint:#88918a;
+    --line:#d7dcd3; --line-soft:#e4e8e0;
+    --accent:#0f7a54; --accent-ink:#0b5c3f; --accent-wash:#e2efe8;
+    --warn:#9c6f18; --warn-wash:#f2e9d4;
+    --bad:#a8402c; --bad-wash:#f1ddd7;
+    --code-bg:#121814; --code-fg:#d9e2d9; --code-line:#243029;
+    --tok-key:#7fd1a8; --tok-str:#e0b06b; --tok-com:#6d7d72; --tok-fn:#8fd0ff; --tok-out:#93a396;
+    --serif:"Iowan Old Style","Charter","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,"Cascadia Code",Consolas,monospace;
+    --maxw:74ch;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#0d110e; --surface:#141a15; --raised:#181f19;
+      --ink:#e5eae2; --muted:#9aa89b; --faint:#717f70;
+      --line:#26302a; --line-soft:#1e271f;
+      --accent:#45c08a; --accent-ink:#63d4a0; --accent-wash:#132b21;
+      --warn:#cf9b3f; --warn-wash:#2c2413;
+      --bad:#d76a52; --bad-wash:#2c1a14;
+      --code-bg:#0b0f0c; --code-fg:#d3ddd3; --code-line:#1c261f;
+    }
+  }
+  :root[data-theme="light"]{
+    --paper:#eef0ec; --surface:#f8faf6; --raised:#ffffff;
+    --ink:#171b17; --muted:#5b645b; --faint:#88918a;
+    --line:#d7dcd3; --line-soft:#e4e8e0;
+    --accent:#0f7a54; --accent-ink:#0b5c3f; --accent-wash:#e2efe8;
+    --warn:#9c6f18; --warn-wash:#f2e9d4; --bad:#a8402c; --bad-wash:#f1ddd7;
+    --code-bg:#121814; --code-fg:#d9e2d9; --code-line:#243029;
+  }
+  :root[data-theme="dark"]{
+    --paper:#0d110e; --surface:#141a15; --raised:#181f19;
+    --ink:#e5eae2; --muted:#9aa89b; --faint:#717f70;
+    --line:#26302a; --line-soft:#1e271f;
+    --accent:#45c08a; --accent-ink:#63d4a0; --accent-wash:#132b21;
+    --warn:#cf9b3f; --warn-wash:#2c2413; --bad:#d76a52; --bad-wash:#2c1a14;
+    --code-bg:#0b0f0c; --code-fg:#d3ddd3; --code-line:#1c261f;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--serif); font-size:19px; line-height:1.62;
+    font-feature-settings:"kern";
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 26px}
+  .bleed{max-width:1040px; margin:0 auto; padding:0 26px}
+  p{margin:0 0 1.05em; text-wrap:pretty}
+  a{color:var(--accent-ink); text-underline-offset:2px}
+  h1,h2,h3{font-family:var(--serif); font-weight:600; text-wrap:balance; line-height:1.14; letter-spacing:-.012em}
+  .mono{font-family:var(--mono)}
+  .eyebrow{font-family:var(--mono); font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--accent-ink); font-weight:600}
+  .lede{font-size:22px; line-height:1.5; color:var(--ink)}
+  .muted{color:var(--muted)}
+
+  /* ---- top bar ---- */
+  header.top{border-bottom:1px solid var(--line); background:color-mix(in srgb,var(--paper) 88%, transparent); position:sticky; top:0; z-index:5; backdrop-filter:saturate(1.4) blur(6px)}
+  header.top .row{max-width:1040px; margin:0 auto; padding:12px 26px; display:flex; align-items:center; gap:14px}
+  .brand{font-family:var(--mono); font-weight:600; letter-spacing:-.01em; font-size:15px; display:flex; align-items:center; gap:9px}
+  .brand .dot{width:9px;height:9px;border-radius:2px;background:var(--accent);box-shadow:0 0 0 3px var(--accent-wash)}
+  .brand .caret{color:var(--accent)}
+  header .spacer{flex:1}
+  header .tag{font-family:var(--mono); font-size:12px; color:var(--muted)}
+
+  /* ---- hero ---- */
+  .hero{padding:74px 0 40px}
+  .hero h1{font-size:clamp(38px,6.6vw,68px); margin:.15em 0 .35em}
+  .hero h1 em{font-style:normal; color:var(--accent-ink); position:relative; white-space:nowrap}
+  .hero .lede{max-width:60ch}
+  .statstrip{max-width:1040px;margin:44px auto 0;padding:0 26px;display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .statstrip .cell{background:var(--surface);padding:20px 18px}
+  .statstrip .n{font-family:var(--mono);font-size:30px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums;color:var(--ink);line-height:1}
+  .statstrip .n small{font-size:15px;color:var(--muted);font-weight:500}
+  .statstrip .k{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-top:9px}
+  @media (max-width:720px){.statstrip{grid-template-columns:repeat(2,1fr)}.hero{padding:48px 0 28px}}
+
+  /* ---- sections ---- */
+  section{padding:52px 0}
+  .sechead{display:flex;gap:16px;align-items:baseline;margin-bottom:22px}
+  .sechead .num{font-family:var(--mono);font-size:13px;color:var(--accent);font-weight:600;padding-top:6px;min-width:2.4ch}
+  .sechead h2{font-size:clamp(26px,3.6vw,36px);margin:0}
+  .sechead .sub{font-family:var(--mono);font-size:12.5px;color:var(--muted);letter-spacing:.02em}
+  hr.rule{border:0;border-top:1px solid var(--line-soft);margin:0}
+
+  /* ---- code cell ---- */
+  .cell{background:var(--code-bg);border-radius:11px;overflow:hidden;border:1px solid var(--code-line);margin:22px 0;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+  .cell .bar{display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--code-line);background:color-mix(in srgb,var(--code-bg) 80%,#000)}
+  .cell .bar .lbl{font-family:var(--mono);font-size:11.5px;letter-spacing:.05em;color:#9fb0a3;text-transform:uppercase}
+  .cell .bar .lights{display:flex;gap:6px}
+  .cell .bar .lights i{width:9px;height:9px;border-radius:50%;display:block;background:#3a463d}
+  pre{margin:0;overflow-x:auto}
+  .cell pre{padding:15px 16px}
+  code,pre{font-family:var(--mono);font-size:13.5px;line-height:1.62;color:var(--code-fg)}
+  pre .in{color:var(--tok-fn)} pre .kw{color:var(--tok-key)} pre .str{color:var(--tok-str)}
+  pre .com{color:var(--tok-com);font-style:italic} pre .fn{color:var(--accent-ink)} pre .out{color:var(--tok-out)}
+  :root[data-theme="light"] pre .fn,pre .fn{color:#7fd1a8}
+  .promptline{color:var(--tok-com)}
+  p code,li code{font-family:var(--mono);font-size:.86em;background:var(--accent-wash);color:var(--accent-ink);padding:1px 6px;border-radius:5px}
+
+  /* inline prose */
+  .prose{max-width:var(--maxw)}
+  .prose h3{font-size:20px;margin:1.8em 0 .5em}
+  ul.tight{padding-left:1.1em;margin:0 0 1.1em}
+  ul.tight li{margin:.35em 0}
+
+  /* pull quote / principle */
+  .principle{border-left:3px solid var(--accent);padding:2px 0 2px 20px;margin:26px 0;font-size:21px;line-height:1.5}
+  .principle .who{font-family:var(--mono);font-size:12px;letter-spacing:.05em;color:var(--muted);text-transform:uppercase;margin-top:8px;display:block}
+
+  /* ---- comparison bars ---- */
+  .cmp{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:22px 22px 8px;margin:22px 0}
+  .cmp h4{margin:0 0 3px;font-size:16px;font-family:var(--serif)}
+  .cmp .cap{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-bottom:16px;letter-spacing:.02em}
+  .bars{display:flex;flex-direction:column;gap:14px;margin-bottom:14px}
+  .bar-row{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:14px}
+  .bar-row .name{font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+  .bar-row .name.win{color:var(--accent-ink);font-weight:600}
+  .track{height:22px;background:var(--line-soft);border-radius:5px;overflow:hidden;position:relative}
+  .fill{height:100%;border-radius:5px;background:var(--accent);opacity:.9}
+  .fill.warn{background:var(--warn)} .fill.bad{background:var(--bad)} .fill.neutral{background:var(--faint)}
+  .bar-row .val{font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--muted);min-width:8ch;text-align:right}
+  .bar-row .val b{color:var(--ink);font-weight:600}
+
+  /* ---- data table ---- */
+  .tablewrap{overflow-x:auto;margin:22px 0;border:1px solid var(--line);border-radius:12px}
+  table{border-collapse:collapse;width:100%;font-size:14.5px;background:var(--surface)}
+  th,td{padding:11px 15px;text-align:left;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+  thead th{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;background:color-mix(in srgb,var(--surface) 60%,var(--paper))}
+  tbody tr:last-child td{border-bottom:0}
+  td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+  td.arm{font-family:var(--mono);font-size:13px}
+  .win td{background:var(--accent-wash)}
+  .pill{display:inline-block;font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:20px;font-weight:600;letter-spacing:.02em}
+  .pill.pass{background:var(--accent-wash);color:var(--accent-ink)}
+  .pill.fail{background:var(--bad-wash);color:var(--bad)}
+
+  /* ---- api cards ---- */
+  .apigrid{display:grid;gap:16px;margin:22px 0}
+  .apicard{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px 22px}
+  .apicard .sig{font-family:var(--mono);font-size:13.5px;color:var(--ink);margin-bottom:8px;overflow-x:auto}
+  .apicard .sig .fn{color:var(--accent-ink);font-weight:600}
+  .apicard p{margin:0;font-size:16.5px;color:var(--muted);line-height:1.5}
+
+  /* ---- systems grid ---- */
+  .sys{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:22px 0}
+  .sys .item{background:var(--surface);padding:22px}
+  .sys .item .h{display:flex;align-items:center;gap:10px;margin-bottom:9px}
+  .sys .item .h .ix{font-family:var(--mono);font-size:12px;color:var(--accent);font-weight:600}
+  .sys .item h4{margin:0;font-size:17px;font-family:var(--serif)}
+  .sys .item p{margin:0;font-size:15.5px;line-height:1.5;color:var(--muted)}
+  .sys .item .tag{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:10px;display:block;letter-spacing:.02em}
+  @media (max-width:720px){.sys{grid-template-columns:1fr}.bar-row{grid-template-columns:92px 1fr auto;gap:10px}}
+
+  /* footer */
+  footer{border-top:1px solid var(--line);padding:40px 0 60px;margin-top:30px}
+  footer .wrap{color:var(--muted);font-size:15px}
+  footer .brand{margin-bottom:10px}
+
+  .turnbreak{display:flex;align-items:center;gap:12px;margin:12px 6px;font-family:var(--mono);font-size:11px;letter-spacing:.05em;color:var(--warn);text-transform:uppercase}
+  .turnbreak::before,.turnbreak::after{content:"";flex:1;border-top:1px dashed color-mix(in srgb,var(--warn) 50%,transparent)}
+  .kicker{font-family:var(--mono);font-size:13px;color:var(--accent-ink);font-weight:600;letter-spacing:.02em}
+  .note{font-family:var(--mono);font-size:12.5px;color:var(--muted);background:var(--surface);border:1px solid var(--line-soft);border-left:3px solid var(--warn);border-radius:0 8px 8px 0;padding:12px 16px;margin:20px 0;line-height:1.55}
+  .note b{color:var(--ink)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:3px}
+  @media (prefers-reduced-motion:no-preference){
+    .reveal{opacity:0;transform:translateY(8px);animation:rise .6s ease forwards}
+    @keyframes rise{to{opacity:1;transform:none}}
+  }
+</style>
+
+<header class="top">
+  <div class="row">
+    <span class="brand"><span class="dot"></span>code<span class="caret">·</span>mode</span>
+    <span class="spacer"></span>
+    <span class="tag">a runtime for agents that write code, not tool calls</span>
+  </div>
+</header>
+
+<div class="bleed hero">
+  <div class="wrap" style="padding-left:0;padding-right:0">
+    <p class="eyebrow reveal">Technical report · code is the tool call</p>
+    <h1 class="reveal">The agent writes <em>code</em>, not JSON tool calls.</h1>
+    <p class="lede reveal">Codemode gives an agent a persistent Python kernel and compiles every tool into an importable module. Instead of emitting one JSON tool-call per turn and receiving the whole result back into its context, the agent writes a program: it loops, filters, keeps state in variables, and <em>prints only what matters</em>. On matched tasks it holds parity with Claude Code at a fraction of the cost, context, and latency — and when a task involves work that runs longer than a single turn, like a build or a long job, it can start that work, let go of the machine while it runs, and collect the result on a later turn.</p>
+  </div>
+</div>
+
+<div class="statstrip reveal">
+  <div class="cell"><div class="n">4×</div><div class="k">cheaper than tool-calling</div></div>
+  <div class="cell"><div class="n">~20×</div><div class="k">less context in play</div></div>
+  <div class="cell"><div class="n">2.3×</div><div class="k">cheaper than Claude Code · same quality</div></div>
+  <div class="cell"><div class="n">1.4×</div><div class="k">faster, end to end</div></div>
+</div>
+
+<hr class="rule" style="margin-top:56px">
+
+<!-- 1. WHY -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">01</span><div><h2>Why: meet the model where it is strongest</h2><div class="sub">shift the task into the model's own distribution</div></div></div>
+  </div>
+  <div class="bleed"><div class="prose wrap" style="padding-left:0;padding-right:0">
+    <p>Part of a harness's job is not visible in any API surface: it decides <em>which region of the model's ability a task lands in</em>. The same problem can be posed to a model in a way it has practiced millions of times, or in a way it has barely seen. A good harness shifts the task toward the first — into the model's <b>local distribution</b>, where it is fluent.</p>
+    <p>Code is that region. Models are trained on code continuously — through pre-training and all the way through post-training — so writing a loop, composing a helper, keeping a value in a variable are among the most deeply practiced things a model does. Tool-calling, by contrast, is a comparatively <b>thin, recent post-training veneer</b>: a narrow JSON dialect layered late. Asking a model to solve a task as code plays to its deepest training; asking it to solve the same task as a sequence of tool-call blocks asks it to work in the dialect it saw least.<sup><a href="#paper" id="cite" style="text-decoration:none">†</a></sup></p>
+
+    <div class="principle">Code isn't just a way to call tools. It is a richer, more expressive medium — loops, conditionals, data structures, composition, error handling — and it hands the model its own context management: what to keep, what to discard, what to name, what to print.<span class="who">the premise</span></div>
+
+    <p>A tool call is a single function invocation with a flat bag of arguments, and its result returns to the model whole. A program can fetch two collections, intersect them, keep the intersection in a variable, and surface only the answer — deciding, at run time, what is worth its own attention. That control over its own context is not a feature bolted onto the model; it is what writing code <em>is</em>.</p>
+
+    <p>And there is a second reason, about the interface itself. An API is not a thinner tool schema — it is a <em>richer</em> one. Typed clients, SDKs, OpenAPI specifications: describing a service as an API is how machines have talked to machines for decades — a composable, expressive convention the model has read millions of times. A tool-call schema is a narrow, recent re-description of that same idea. Codemode simply hands the model the mature medium — the API, as code — instead of a flattened restatement of it.</p>
+
+    <h3>Where the savings come from</h3>
+    <p>Three separate things get cheaper when tools become code.</p>
+    <p><b>You load less up front.</b> A tool can only be called if its description is already in the prompt, so a tool-calling harness has to hold the whole catalogue in context — a few hundred tools is roughly <b>100,000 tokens</b>, sitting there on turn one and re-read on every turn after, whether or not the task ever touches most of them. Codemode loads almost nothing; it opens a tool's documentation only when it is about to use it. This is a flat cost every task pays, large or small.</p>
+    <p><b>You keep less of what comes back.</b> When a tool returns, its result drops into the conversation <em>whole</em> — the tool's author fixed that shape long ago. When code calls the same tool, the agent decides in the moment what to keep: fetch a ninety-row list and keep only the fourteen rows it needs, leaving the rest in a variable the model never reads. This is a large effect — force a codemode agent to print every response in full and its context <b>more than doubles</b>, its cost up about 74%.</p>
+    <p><b>You write less to act.</b> A tool-calling agent emits a separate structured block for every call and takes each whole result back; over a task that is dozens of bulky blocks. Code does the same work in <em>one compact cell per turn</em>. This saving is independent of the other two: even a codemode agent forbidden to filter anything was still about <b>3.8× cheaper</b> than tool-calling — the difference was never only about what it kept, but about how little it had to write. The last two savings grow with how much the task does, so the bigger the job, the wider the gap.</p>
+    <p class="muted" style="font-size:16.5px"><b>Where this sits.</b> The second and third savings are not unique to a full runtime. <em>Programmatic tool calling</em> — a feature, available today, where the model orchestrates ordinary tools from inside code and keeps the intermediate results in the code environment instead of the conversation — already recovers much of them. Codemode is the far end of the same idea: the tools are not called <em>from</em> code, they <em>are</em> code — typed API modules the model imports — the kernel persists across turns rather than one orchestration, and long-running work becomes durable, resumable jobs. It is a spectrum from tool-calling, to code that orchestrates tools, to a full API-and-kernel runtime — not a binary.</p>
+  </div></div>
+</section>
+
+<hr class="rule">
+
+<!-- 2. HOW IT WORKS -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">02</span><div><h2>How it works</h2><div class="sub">MCP schema → compiled Python → the agent's code</div></div></div>
+    <div class="prose">
+      <p>A codemode session is a long-lived kernel. Before the agent's first cell, the runtime compiles the API surface into importable, typed, documented modules on disk. The source can be anything that describes an API: our convention today compiles each MCP server into its own file under a shared <code>api/</code> directory — but point the same agent at an OpenAPI spec run through a code generator, or at an existing typed client, and it works just as well. The only requirement is that the tools arrive as code the model can read and call. Below is one tool through the pipeline we run today: the MCP the harness receives, the Python it generates, and the code the agent then writes.</p>
+    </div>
+
+    <p class="eyebrow" style="margin:26px 0 -6px">1 · the source — an MCP tool <span style="color:var(--muted)">(or an OpenAPI spec, an SDK…)</span></p>
+    <div class="cell">
+      <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="lbl">spotify · show_liked_songs · as the harness receives it</span></div>
+<pre>{
+  <span class="str">"name"</span>: <span class="str">"spotify__show_liked_songs"</span>,
+  <span class="str">"description"</span>: <span class="str">"Get a list of songs you have liked."</span>,
+  <span class="str">"input_schema"</span>: {
+    <span class="str">"type"</span>: <span class="str">"object"</span>,
+    <span class="str">"properties"</span>: {
+      <span class="str">"access_token"</span>: {<span class="str">"type"</span>: <span class="str">"string"</span>, <span class="str">"description"</span>: <span class="str">"Access token from spotify login."</span>},
+      <span class="str">"page_index"</span>:   {<span class="str">"type"</span>: <span class="str">"integer"</span>, <span class="str">"minimum"</span>: 0, <span class="str">"default"</span>: 0},
+      <span class="str">"page_limit"</span>:   {<span class="str">"type"</span>: <span class="str">"integer"</span>, <span class="str">"minimum"</span>: 1, <span class="str">"maximum"</span>: 20, <span class="str">"default"</span>: 5},
+      <span class="str">"sort_by"</span>:      {<span class="str">"type"</span>: <span class="str">"string"</span>, <span class="str">"description"</span>: <span class="str">"+/- one of liked_at, play_count, title"</span>}
+    },
+    <span class="str">"required"</span>: [<span class="str">"access_token"</span>]
+  }
+}</pre>
+    </div>
+
+    <p class="eyebrow" style="margin:24px 0 -6px">2 · the compile — generated <span class="mono" style="text-transform:none;letter-spacing:0">api/spotify.py</span></p>
+    <div class="cell">
+      <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="lbl">one file per app · typed · documented · do not edit</span></div>
+<pre><span class="com">"""spotify — generated from the MCP schema. Do not edit."""</span>
+
+<span class="kw">async def</span> <span class="fn">show_liked_songs</span>(
+    access_token: <span class="kw">str</span>,
+    page_index: <span class="kw">int</span> | <span class="kw">None</span> = <span class="kw">None</span>,
+    page_limit: <span class="kw">int</span> | <span class="kw">None</span> = <span class="kw">None</span>,
+    sort_by:    <span class="kw">str</span> | <span class="kw">None</span> = <span class="kw">None</span>,
+) -> Any:
+    <span class="com">"""Get a list of songs you have liked.
+
+    Args:
+        access_token: Access token obtained from spotify app login.
+        page_index:   The index of the page to return.
+        sort_by:      +/- one of liked_at, play_count, title.
+    """</span>
+    <span class="kw">return await</span> _call(<span class="str">"spotify"</span>, <span class="str">"show_liked_songs"</span>,
+        {<span class="str">"access_token"</span>: access_token, <span class="str">"page_index"</span>: page_index, ...})</pre>
+    </div>
+    <div class="prose">
+      <p>The schema becomes a real Python signature: types, the union for optionals, the docstring the model reads before calling. The body forwards through one transport, so every arm reaches the world the same logged way. The agent finds this by reading <code>api/spotify.py</code> — never by holding 469 schemas in context.</p>
+    </div>
+
+    <p class="eyebrow" style="margin:24px 0 -6px">3 · the use — the agent writes code</p>
+    <div class="cell">
+      <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="lbl">In [9] · fetch both lists — a pagination helper it writes once</span></div>
+<pre><span class="kw">import</span> api.spotify
+
+<span class="kw">async def</span> <span class="fn">all_pages</span>(fn, **kw):        <span class="com"># reused for every paginated call, in any app</span>
+    out, i = [], 0
+    <span class="kw">while</span> True:
+        page = json.loads(<span class="kw">await</span> fn(page_index=i, page_limit=20, **kw))
+        out += page
+        <span class="kw">if</span> len(page) &lt; 20: <span class="kw">return</span> out
+        i += 1
+
+liked = <span class="kw">await</span> <span class="fn">all_pages</span>(api.spotify.show_liked_songs, access_token=st)
+lib   = <span class="kw">await</span> <span class="fn">all_pages</span>(api.spotify.show_song_library, access_token=st)
+print(len(liked), len(lib))                <span class="out">→ 92 41</span></pre>
+    </div>
+    <div class="cell">
+      <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="lbl">In [10] · the task's whole logic — a set intersection</span></div>
+<pre>libids = {s[<span class="str">'song_id'</span>] <span class="kw">for</span> s <span class="kw">in</span> lib}                 <span class="com"># set → O(1) membership</span>
+common = [s <span class="kw">for</span> s <span class="kw">in</span> liked <span class="kw">if</span> s[<span class="str">'song_id'</span>] <span class="kw">in</span> libids]
+titles = [s[<span class="str">'title'</span>] <span class="kw">for</span> s <span class="kw">in</span> common]
+print(titles)              <span class="out">→ ['Midnight City', 'Retrograde', ... ]  (14 titles)</span></pre>
+    </div>
+    <div class="prose">
+      <p>These are real cells from a passing run. The task's entire logic — "liked songs ∩ library" — is a <em>set intersection</em>, one line of code. A tool-calling agent has no <span class="mono">∩</span>: it must pull both full lists into its transcript and reason over them token by token, or fan out a call per song. Here the two 90-item lists live in kernel variables and never touch the model's context — only the fourteen titles it will send do. That is the pipeline paying out on an ordinary errand.</p>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 3. THE WAIT -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">03</span><div><h2>Work that outlives a turn</h2><div class="sub">backgrounding is easy — reliably resuming is the hard part</div></div></div>
+    <div class="prose">
+      <p>A tool-calling agent is not helpless with long work. It can launch a process in the background — <code>nohup … &amp;</code> through a bash tool — and poll it with later tool calls. On a machine you already hold open, that can be enough. The hard part was never <em>starting</em> the work; it is <em>reliably coming back to it</em>. On a real 25–40 minute compile, Claude Code did background the build, polled it, and even reached for a monitor tool — and then ended its turn with <em>"OCaml is still compiling. I'll continue when it lands."</em> There was no next turn. The build never finished; the task failed. The mechanism to background was right there, and it still didn't bridge the wait.</p>
+      <p>Codemode turns "come back to it" into a first-class primitive instead of a process the agent has to remember to poll. Its one deliberate break from ordinary Python is a <code>wait</code> that <em>ends the turn</em> rather than blocking. Work is a durable, named, file-backed job; the agent yields, the host sleeps, and a later turn collects it by name. A thirty-minute build becomes ordinary control flow:</p>
+    </div>
+    <div class="cell">
+      <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="lbl">In [19] · start the 30-minute compile, then release the kernel</span></div>
+<pre><span class="com"># the whole build, backgrounded — the last thing this turn does</span>
+jobs.<span class="fn">submit</span>(<span class="str">"cd /tmp/CompCert && make -j$(nproc) all"</span>, name=<span class="str">"build"</span>, max_runtime=<span class="str">"4h"</span>)
+jobs.<span class="fn">wait</span>(wake_after=900)
+   <span class="out">→ submitted build (pid 41134); log /tmp/harness/jobs/build.log</span>
+   <span class="out">→ waiting 900s outside the kernel; nothing is held.</span></pre>
+    </div>
+    <div class="turnbreak">the turn ends · host waits at most 900s · woken the moment the build finishes</div>
+    <div class="cell">
+      <div class="bar"><span class="lights"><i></i><i></i><i></i></span><span class="lbl">In [20] · a new turn — collect the job that ran while the agent was gone</span></div>
+<pre>j = jobs.<span class="fn">get</span>(<span class="str">"build"</span>)
+print(j.done, j.ok)
+   <span class="out">→ True True</span>
+   <span class="out">→ ... OCAMLOPT driver/Frontend.ml · ccomp built</span></pre>
+    </div>
+    <div class="prose" style="margin-top:6px">
+      <p><span class="mono" style="font-size:14px">submit</span> and <span class="mono" style="font-size:14px">wait</span> are the <em>last</em> statements of one turn; <span class="mono" style="font-size:14px">get</span> is the <em>first</em> of the next. Between them the agent does not exist — the kernel is idle, the host is released, and the build runs unattended on disk. <code>wake_after</code> is a <em>deadline, not a fixed sleep</em>: the agent is re-invoked the instant the job finishes, or when the deadline elapses — whichever comes first — so a build that takes six minutes costs six, not the fifteen it was willing to wait. The full run installs <span class="mono">apt</span>, <span class="mono">opam</span>, and <span class="mono">coq</span> the same way — submit, yield, collect next turn — four named jobs, and the kernel is never held.</p>
+    </div>
+    <div class="prose">
+      <p>The real trace is not a happy path — the agent hit a 404 download mirror, hunted GitHub tags, resolved a Coq version conflict, and debugged a linker error (<span class="mono">undefined reference to `sqrt`</span> → add <span class="mono">-lm</span>) — all while four named jobs (<span class="mono">apt</span>, <span class="mono">opam</span>, <span class="mono">coq16</span>, <span class="mono">build</span>) ran in the background. <b>Zero blocking sleeps. The kernel was never held.</b> It is the same task Claude Code walked away from.</p>
+    </div>
+    <div class="cmp">
+      <h4>compile-compcert — a 25–40 minute build from source</h4>
+      <div class="cap">terminal-bench · Opus 5 · resolved / cost / wait behaviour</div>
+      <div class="bars">
+        <div class="bar-row"><span class="name win">codemode</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="val"><b>finished</b> · jobs · 0 blocks</span></div>
+        <div class="bar-row"><span class="name">tool-calling</span><div class="track"><div class="fill neutral" style="width:100%"></div></div><span class="val">finished · by blocking</span></div>
+        <div class="bar-row"><span class="name">claude-code</span><div class="track"><div class="fill bad" style="width:60%"></div></div><span class="val" style="color:var(--bad)"><b>quit</b> · ended its turn</span></div>
+      </div>
+    </div>
+    <div class="note"><b>Honest read.</b> This is one run, not a benchmark rate — read it as an existence proof that a <code>-p</code> tool-calling loop has no resume seam, not as "codemode wins long tasks N% of the time." The same harness in plain tool-calling mode also finished, by <em>blocking</em> on a build that fit its budget — so the point here is not cost (this task's cost story belongs to the full-suite numbers, not one build); it is that codemode finishes <em>without holding anything</em>, and keeps finishing when a wait exceeds the budget, where blocking breaks too. The jobs runtime is the seam that makes the wait survivable.</div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 4. CLOUD -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">04</span><div><h2>Built to be scheduled, not held</h2><div class="sub">the primitive that finishes long work is the one that makes it cheap to host</div></div></div>
+    <div class="prose">
+      <p>Claude Code has the easy version of this problem. It is a <em>local</em> harness — it runs on your machine and can hold a process open on your own computer for as long as it likes; the compute is already there and already yours. A harness you <em>host</em> — one remote runtime serving many users — cannot. It can't run unbounded compute, and it can't keep a VM pinned open for thirty minutes waiting on a build. Held-open sessions are precisely what make hosting an agent expensive.</p>
+      <p>The jobs framework was designed for that constraint. Because <code>wait</code> <em>ends the turn</em> instead of blocking, the agent releases its compute the instant it begins waiting. A job is a file-backed process with a bounded lifetime, and it is <b>awaitable and resumable</b> — so a scheduler can put the whole session to sleep and wake it, on a different machine, when the job signals done. Nothing is pinned to one long-lived host.</p>
+      <div class="principle">The wait that ends a turn is also the wait that releases a VM.<span class="who">the design goal</span></div>
+      <p>That is what lets the runtime live on <b>small, short-lived micro-VMs</b> instead of one giant always-on box: the VM can be torn down while a job runs on managed compute, and rebuilt only when there is a result to collect. And because the kernel's state is recoverable — jobs persist on disk, and the agent can re-fetch anything a fresh kernel has lost — you can <b>evict the REPL under memory pressure</b> and let the agent rebuild. It pays a small re-fetch cost and carries on; and because its context is small, there is little to rebuild.</p>
+      <p>This is exactly where ad-hoc backgrounding falls down. A <code>nohup … &amp;</code> process is pinned to the machine that spawned it — no durable handle, no way to resume it on another host — so it dies the moment a hosted harness reclaims the VM. To make backgrounding survive being hosted, you end up rebuilding precisely this: durable, named, awaitable, resumable jobs. And the payoff is not hypothetical — the remote setting is the <em>harder</em> one, and codemode still outperformed Claude Code, whose own background-and-monitor tooling was available and did not close the gap.</p>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 5. THE API -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">05</span><div><h2>The surface the agent sees</h2><div class="sub">designed to be what you'd write anyway</div></div></div>
+    <div class="prose">
+      <p>The guiding rule for every primitive: write down what a competent engineer would type <em>without</em> the new thing, then get as close to that as the constraints allow. A bespoke API is a tax the model pays on every task, because it appears in zero pretraining tokens. So the surface is deliberately ordinary — imports, function calls, and one unavoidable deviation.</p>
+    </div>
+    <div class="apigrid">
+      <div class="apicard">
+        <div class="sig"><span class="fn">api.&lt;app&gt;.&lt;tool&gt;</span>(arg, *, opt=None) -> str &nbsp;<span class="muted">· async</span></div>
+        <p>The compiled catalogue: one <code>app.py</code> per service, every tool a typed, documented async function. Signatures carry the schema — unions, enums as <code>Literal[...]</code> — and consequential defaults are promoted to <em>required</em> so a decision can't be made silently.</p>
+      </div>
+      <div class="apicard">
+        <div class="sig">jobs.<span class="fn">submit</span>(command, name, max_runtime=…) → Job &nbsp;·&nbsp; jobs.<span class="fn">wait</span>(wake_after=N)</div>
+        <p>Durable background work. <code>submit</code> returns immediately and spools to a file that survives kernel death; <code>wait</code> ends the turn instead of blocking; <code>get(name)</code>, <code>manifest()</code>, and <code>kill(name)</code> recover and manage jobs across turns and restarts.</p>
+      </div>
+      <div class="apicard">
+        <div class="sig"><span class="fn">spawn</span>(prompt, name, agent={"tools":[…], "model":…, "max_turns":…}) → Job</div>
+        <p>Subagents, built <em>on</em> the jobs substrate — a child is a job. It returns immediately, runs a real agent process with its own kernel and its own tool grant, and its result is collected like any other job. Nine tool schemas in a tool-calling harness; one module here.</p>
+      </div>
+      <div class="apicard">
+        <div class="sig"><span class="fn">bash</span> &nbsp;·&nbsp; <span class="fn">read</span> &nbsp;·&nbsp; <span class="fn">grep</span> &nbsp;<span class="muted">· first-class tools, guarded</span></div>
+        <p>Shell and file navigation as native tools, in the language the model was trained to use — not hand-rolled through the kernel. Every long or blocking <code>bash</code> command is filtered by the same guard the kernel uses and redirected to a job, so the shell can never quietly hold the turn.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 5. SYSTEMS -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">06</span><div><h2>The systems underneath</h2><div class="sub">what makes the surface safe and fast</div></div></div>
+    <div class="prose"><p>A persistent kernel that an agent writes arbitrary code into is a sharp instrument. Most of the engineering is the machinery that keeps it from cutting the wrong way — and that makes the good idioms the easy ones.</p></div>
+    <div class="sys">
+      <div class="item"><div class="h"><span class="ix">◆</span><h4>The jobs runtime</h4></div><p>File-backed submit / wait / get. Jobs survive a kernel restart because they are processes on disk, not objects in memory; a fresh kernel is told what is still running and recovers it by name. The substrate under both background work and subagents.</p><span class="tag">durable · recoverable · one abstraction</span></div>
+      <div class="item"><div class="h"><span class="ix">◆</span><h4>Kernel guards + cell watchdog</h4></div><p>The in-process shapes a Python programmer reaches for — <code>threading</code>, <code>subprocess</code>, a long <code>sleep</code> — fail loudly at the point of use, each error naming the job primitive to use instead. A wall-clock watchdog catches anything that blocks past the ceiling and rewrites the interrupt into the same redirect.</p><span class="tag">correction lives in the error, not the prompt</span></div>
+      <div class="item"><div class="h"><span class="ix">◆</span><h4>MCP → API compiler</h4></div><p>Schemas become typed Python: unions, enums, required-ness. A one-time, schema-only enrichment pass promotes constraints stated in prose ("a number, a yes/no") into the type system — narrowing-only, every proposal logged and verified against the source. Runtime validation then checks each call <em>at the call site</em>, in-process, before the request leaves — where a tool-calling arm learns of a bad argument a provider round-trip later.</p><span class="tag">the contract, enforced in the language</span></div>
+      <div class="item"><div class="h"><span class="ix">◆</span><h4>The catalogue is ordinary API docs</h4></div><p>Any API description compiles in — an MCP server, an OpenAPI spec, a typed client. Our convention lays each service out the way an SDK is, <code>api/gmail.py</code> rather than a schema per call, so one read delivers a whole service's contract, its conventions, and the sibling it should have called instead.</p><span class="tag">MCP · OpenAPI · SDK — same target</span></div>
+      <div class="item"><div class="h"><span class="ix">◆</span><h4>Read-gate</h4></div><p>Modeled on the edit-tool contract: the first call to an API is refused until its file has been read, and the refusal names the exact lines. A verified precondition, not an advisory — there is no path through without the read.</p><span class="tag">verified precondition · edit semantics</span></div>
+      <div class="item"><div class="h"><span class="ix">◆</span><h4>Required-default transform</h4></div><p>When an optional argument's default resolves against runtime state — "otherwise, replies to the sender" — the model, feeling certain, will skip it even with the docstring in context. So the compiler makes those parameters <em>required</em>: the decision becomes a value the code must supply, and the model computes it correctly.</p><span class="tag">forced explicitness &gt; requested reading</span></div>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 6. METRICS -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">07</span><div><h2>What it costs, measured</h2><div class="sub">Opus 5 · AppWorld challenge + terminal-bench · paired</div></div></div>
+    <div class="prose">
+      <p>Two baselines, and they are different things. The first is <b>the same harness in tool-calling mode</b> — identical machinery, but the tools exposed as ordinary JSON tool-calls instead of code. Comparing against it isolates the one variable: code versus tool-calling. The second is <b>Claude Code</b> — a separate, real product — which answers whether codemode holds up against a strong agent people actually use. Score is reported as underpowered: frontier models saturate these suites, so an identical config can score 8/8 then 3/8 on a re-run. Cost, context, and latency are the endpoints that move.</p>
+    </div>
+
+    <div class="cmp">
+      <h4>Code vs tool-calling — same harness, full 417-task suite</h4>
+      <div class="cap">score is a tie (within noise); cost is not (paired t = −25.8, n=432)</div>
+      <div class="bars">
+        <div class="bar-row"><span class="name win">codemode</span><div class="track"><div class="fill" style="width:25%"></div></div><span class="val"><b>$0.21</b>/task</span></div>
+        <div class="bar-row"><span class="name">tool-calling</span><div class="track"><div class="fill neutral" style="width:100%"></div></div><span class="val">$0.83 · 4.0× more</span></div>
+      </div>
+    </div>
+
+    <div class="cmp">
+      <h4>Held-out, all three arms — 46 fresh tasks, full config</h4>
+      <div class="cap">exact score tie; the cost and context gaps hold on data the config never saw</div>
+      <div class="bars">
+        <div class="bar-row"><span class="name win">codemode</span><div class="track"><div class="fill" style="width:44%"></div></div><span class="val">44/46 · <b>$0.45</b></span></div>
+        <div class="bar-row"><span class="name">claude-code</span><div class="track"><div class="fill neutral" style="width:100%"></div></div><span class="val">44/46 · $1.02 · 2.3×</span></div>
+      </div>
+    </div>
+
+    <div class="prose"><h3>First-turn context — the structural gap</h3>
+      <p>This is the number no prompt tuning can close for a tool-calling arm: schemas <em>must</em> be resident to be callable, so the catalogue is paid on turn zero and re-paid every turn after. It is why cost and latency track context, and why a 100k-context arm can ignore a rule it is technically "looking at."</p>
+    </div>
+    <div class="cmp">
+      <h4>Tokens in context before the first action</h4>
+      <div class="cap">AppWorld · same task, four arms</div>
+      <div class="bars">
+        <div class="bar-row"><span class="name win">codemode</span><div class="track"><div class="fill" style="width:4.5%"></div></div><span class="val"><b>~5,000</b></span></div>
+        <div class="bar-row"><span class="name">tool-calling</span><div class="track"><div class="fill neutral" style="width:96%"></div></div><span class="val">101,167</span></div>
+        <div class="bar-row"><span class="name">claude-code</span><div class="track"><div class="fill neutral" style="width:100%"></div></div><span class="val">105,626</span></div>
+      </div>
+    </div>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Endpoint</th><th>codemode</th><th>tool-calling</th><th>claude-code</th><th>advantage</th></tr></thead>
+        <tbody>
+          <tr class="win"><td>Cost / task</td><td class="num">$0.21</td><td class="num">$0.83</td><td class="num">$1.02</td><td class="num">4.0× / 2.3×</td></tr>
+          <tr><td>First-turn context</td><td class="num">~5k</td><td class="num">~101k</td><td class="num">~106k</td><td class="num">~22×</td></tr>
+          <tr><td>Accumulated context</td><td class="num">115k</td><td class="num">988k</td><td class="num">921k</td><td class="num">~8×</td></tr>
+          <tr><td>Wall-clock / task</td><td class="num">61s</td><td class="num">—</td><td class="num">88s</td><td class="num">1.4×</td></tr>
+          <tr><td>Long build (30 min)</td><td><span class="pill pass">PASS</span></td><td><span class="pill pass">PASS</span></td><td><span class="pill fail">FAIL</span></td><td class="num">only one</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="muted" style="font-size:14px;font-family:var(--mono)">Cost advantage is 4.0× vs the tool-calling harness (full suite, n=432) and 2.3× vs Claude Code (held-out). Latency is warm-kernel; see integration notes. The long-build row is a single illustrative task (n=1) — an existence proof, not a rate.</p>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 7. LEARNINGS -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">08</span><div><h2>What we learned building it</h2><div class="sub">principles, not process</div></div></div>
+    <div class="prose">
+      <h3>Match the idiom; deviate on exactly one verb.</h3>
+      <p>Given a REPL, the model reaches for what every Python corpus taught it — <code>time.sleep</code>, <code>subprocess.Popen</code>, <code>threading.Thread</code>. Fighting that prior is a losing battle; the win is to make the natural idiom durable underneath, and to force a deviation only where one is unavoidable. The single forced deviation is <code>wait</code> — because a wait needs wall-clock to pass, and a single-threaded kernel serving a turn-based agent cannot both hold and yield. Everything else is ordinary code.</p>
+
+      <h3>The correction belongs in the error, not the prompt.</h3>
+      <p>When a guard fired and its message named the right primitive, the model adopted it on the very next cell — every time. When we instead advertised the rule in the system prompt, one run clamped to the exact threshold and never discovered the primitive at all. A rule in a prompt is a statement of intent; a verified error is a control. We stopped writing advisories and started making the wrong path fail at the point of use.</p>
+
+      <h3>Context management is representation, not a feature you can bolt on.</h3>
+      <p>It is tempting to treat "keep the context small" as a scaffold trick any arm could adopt. It isn't. In tool-calling, every result lands in the transcript and management means summarizing a transcript the agent doesn't control. In a REPL, the caller chooses what survives each call and state lives outside the transcript entirely. These are different formulations of the same problem — and the REPL's is the one that scales.</p>
+
+      <h3>For a consequential default, required beats optional beats documented.</h3>
+      <p>The sharpest failure we found: an agent replying to its own sent email, omitting the recipient argument whose default is "the sender." It had the docstring resident, it had even printed the correct recipients moments before — and still skipped the slot, because "to whom" was not part of its concept of <em>reply</em>. Reading did not fix it; a visible-but-optional schema did not fix it. Making the parameter <em>required</em> did, on the first try — the model computes the right value when the language forces it to supply one.</p>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 8. INTEGRATION -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">09</span><div><h2>Integrating codemode</h2><div class="sub">what you need, where it wins, the honest trade</div></div></div>
+    <div class="prose">
+      <p><b>What it takes.</b> A kernel per session, a one-time compile step from your API schemas to the typed module tree, and the guard layer. The one operational cost to plan for is the kernel's environment. A warm kernel starts in about <b>five seconds</b>; the very first boot has to page a few hundred MB of interpreter and libraries in from disk — about 70s cold, and worse if many kernels boot at once and contend for I/O. But this is <b>one-time and global</b>: the pages stay warm in the OS cache, so every kernel after the first is fast. A prewarm step — boot one throwaway kernel to warm the cache — erases it, and with it codemode is faster end to end than tool-calling, because latency is dominated by prefill and prefill by context. A warm pool is a launch requirement for a hosted service, not an optimization.</p>
+      <p><b>Where it wins.</b> The advantage scales with the work: tasks that make many calls, carry a large tool catalogue, or run long enough to need background work. On short, shell-dominated tasks the representation has little to grip and a competent bash-tool arm is a wash — codemode's edge there is only the jobs runtime, and only when a wait is real.</p>
+      <p><b>The honest trade.</b> The advantage is not uniform. Codemode reads an API's contract before it calls it and takes more, smaller turns than a tool-calling agent — so on a simple errand that discipline can leave it no cheaper per task, even as it stays far ahead on context. The gap is decisive in aggregate and on the tasks that actually fail — where an unread contract or an unbounded wait is the failure — and thin on short, self-contained work. Adopt it for what its shape is good at, not as a universal drop-in.</p>
+    </div>
+    <div class="principle" style="margin-top:32px">Code turns data-wrangling into code; the jobs runtime turns "wait thirty minutes" into a control-flow primitive. The first is why it's cheaper. The second is the one thing a tool-calling agent structurally cannot do.<span class="who">the whole argument, in two sentences</span></div>
+  </div>
+</section>
+
+<footer>
+  <div class="bleed"><div class="wrap" style="padding-left:0;padding-right:0">
+    <span class="brand"><span class="dot"></span>code<span class="caret">·</span>mode</span>
+    <p style="margin:0 0 16px">Persistent-kernel agent runtime · MCP-to-Python compiler · durable jobs · guarded shell · subagents. Measured on AppWorld (challenge split, 417 tasks) and terminal-bench, Opus 5, paired against the same harness in tool-calling mode and against Claude Code. Score reported underpowered by design; cost, context, and latency are the endpoints that move.</p>
+    <p id="paper" style="margin:0;font-family:var(--mono);font-size:13px" class="muted"><span style="color:var(--accent-ink)">†</span> The framing of a harness as keeping each model call <em>locally in-distribution</em> — and the reading of context accumulation as drift away from it — is drawn from Alex L. Zhang, <a href="https://alexzhang13.github.io/blog/2026/harness/">“Language model harnesses are compositional generalizers”</a> (2026).</p>
+  </div></div>
+</footer>
