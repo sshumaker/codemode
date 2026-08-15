@@ -22,13 +22,11 @@
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const RUNS = join(ROOT, flag("dir", ".run/tac"));
 
 const byTask = new Map();

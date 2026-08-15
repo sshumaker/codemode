@@ -54,6 +54,7 @@ import { apiLayout, docsGateMode, generate, renderFullDocs, renderTocLines } fro
 import { loadRequiredDefaults } from "../required-defaults.mjs";
 import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
 import { seedPrimeSettings } from "../prime-settings.mjs";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
@@ -86,10 +87,7 @@ const BASH_EXTENSION = join(ROOT, "bench/arms/bash-tool-extension.ts");
 const JOBS_PY = join(ROOT, "runtime/jobs.py");
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const positional = argv.filter((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1].startsWith("--")));
 const [envFile, model, taskId, arm] = positional;
 const cataloguePath = flag("catalogue", DEFAULT_CATALOGUE);

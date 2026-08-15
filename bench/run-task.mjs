@@ -24,6 +24,7 @@ import { generate, renderFullDocs } from "./generate.mjs";
 import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./prompts.mjs";
 import { findTask } from "./tasks.mjs";
 import { seedPrimeSettings } from "./prime-settings.mjs";
+import { makeArgv } from "./argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
@@ -32,10 +33,7 @@ const EXTENSION = join(ROOT, "bench/arms/mcp-tools-extension.ts");
 const PROXY = process.env.HARNESS_MCP_PROXY ?? "http://127.0.0.1:8765";
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const positional = argv.filter((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1].startsWith("--")));
 const [envFile, model, taskId, arm] = positional;
 

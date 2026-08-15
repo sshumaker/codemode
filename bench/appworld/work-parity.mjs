@@ -48,13 +48,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatPaired, mean, pairedTest } from "../stats.mjs";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const model = flag("model", "anthropic/claude-opus-5").replace(/[^a-z0-9]/gi, "-");
 const band = Number(flag("band", 1.6));
 const tasks = flag(

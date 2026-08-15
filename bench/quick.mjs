@@ -25,6 +25,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pool } from "./pool.mjs";
 import { loadTasks } from "./tasks.mjs";
+import { makeArgv } from "./argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS = join(ROOT, ".run/runs");
@@ -44,10 +45,7 @@ export const FAST_TASKS = [
 ];
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
 if (!envFile) {
 	console.error("usage: bench/quick.mjs <env-file> [--variants v1,v5] [--arms codemode] [--repeat 2]");

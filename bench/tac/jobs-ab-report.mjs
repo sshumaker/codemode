@@ -24,15 +24,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { formatPaired, pairedTest } from "../stats.mjs";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUNS = join(ROOT, ".run/tac");
 
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const prefix = flag("prefix", "a1");
 const asMarkdown = argv.includes("--md");
 

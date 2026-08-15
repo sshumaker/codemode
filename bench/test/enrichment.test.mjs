@@ -242,7 +242,9 @@ describe("the enricher cannot see task data", () => {
 		}
 		// It imports the checker and the pool, and nothing that knows about tasks.
 		const imports = [...ENRICHER.matchAll(/^import .* from "(\.[^"]+)";$/gm)].map((m) => m[1]);
-		assert.deepEqual(imports.sort(), ["./enrich-schemas.mjs", "./pool.mjs"]);
+		// argv.mjs is the shared flag parser — pure argv, no I/O, so it does not
+		// weaken the isolation this test pins.
+		assert.deepEqual(imports.sort(), ["./argv.mjs", "./enrich-schemas.mjs", "./pool.mjs"]);
 	});
 
 	it("refuses to enrich an already-enriched catalogue", () => {

@@ -31,6 +31,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const APPWORLD = join(ROOT, "vendor/appworld");
@@ -38,10 +39,7 @@ const PYTHON = join(APPWORLD, ".venv/bin/python3");
 const ENV_SERVER = join(ROOT, "bench/appworld/env-server.py");
 
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const taskId = flag("task", "82e2fac_1");
 const runDir = mkdtempSync(join(tmpdir(), "appworld-symmetry-"));
 

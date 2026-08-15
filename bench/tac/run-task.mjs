@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { buildTacPreamble } from "./prompts.mjs";
+import { makeArgv } from "../argv.mjs";
 
 const run = promisify(execFile);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -39,10 +40,7 @@ const VERSION = "1.0.0";
 const DECRYPTION_KEY = "theagentcompany is all you need";
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const positional = argv.filter((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1].startsWith("--")));
 const [envFile, taskName] = positional;
 

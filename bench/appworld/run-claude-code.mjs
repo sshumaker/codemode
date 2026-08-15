@@ -69,6 +69,7 @@ import { createServer as createSocketServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BASE_PROMPTS, buildBase, buildClaudePreamble } from "./prompts.mjs";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const APPWORLD = join(ROOT, "vendor/appworld");
@@ -77,10 +78,7 @@ const VENV_BIN = join(APPWORLD, ".venv/bin");
 const ENV_SERVER = join(ROOT, "bench/appworld/env-server.py");
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const has = (name) => argv.includes(`--${name}`);
 const positional = argv.filter((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1].startsWith("--")));
 const [envFile, model, taskId] = positional;

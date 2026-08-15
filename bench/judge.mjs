@@ -45,6 +45,7 @@ import { pool } from "./pool.mjs";
 import { generate } from "./generate.mjs";
 import { loadTasks } from "./tasks.mjs";
 import { loadCatalogue } from "./catalogue.mjs";
+import { makeArgv } from "./argv.mjs";
 
 // Look tasks up without the grounded/runnable filters: runs made before a task
 // was excluded still exist on disk and should still be scoreable.
@@ -74,10 +75,7 @@ function availableToolNames(task) {
 }
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
 const judgeModel = flag("model", "claude-opus-4-5");
 const force = argv.includes("--force");

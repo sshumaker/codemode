@@ -77,6 +77,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { callModel } from "./enrich-catalogue.mjs";
 import { pool } from "./pool.mjs";
+import { makeArgv } from "./argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -253,10 +254,7 @@ export function loadRequiredDefaults(path) {
 // --- everything below is I/O; the model's view is fixed above ------------------
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 
 async function main() {
 	const replayPath = flag("replay", null);

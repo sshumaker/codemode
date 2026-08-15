@@ -27,10 +27,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
 if (!envFile) {
 	console.error("usage: bench/tac/rejudge.mjs <env-file> [--k 5] [--task <name>]");
@@ -95,6 +92,7 @@ for (const [task, taskCalls] of byTask) {
 
 	const script = `
 import json, sys
+import { makeArgv } from "../argv.mjs";
 sys.path.insert(0, "/utils")
 from common import evaluate_with_llm
 calls = json.load(open("/tmp/payload.json"))

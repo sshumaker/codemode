@@ -139,7 +139,7 @@ describe("the classifier cannot see task data", () => {
 			assert.equal(CLASSIFIER.includes(forbiddenApi), false, `the classifier can enumerate files with ${forbiddenApi}`);
 		}
 		const imports = [...CLASSIFIER.matchAll(/^import .* from "(\.[^"]+)";$/gm)].map((m) => m[1]);
-		assert.deepEqual(imports.sort(), ["./enrich-catalogue.mjs", "./pool.mjs"]);
+		assert.deepEqual(imports.sort(), ["./argv.mjs", "./enrich-catalogue.mjs", "./pool.mjs"]);
 	});
 });
 

@@ -11,16 +11,14 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeArgv } from "./argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS = join(ROOT, ".run/runs");
 const MCP_LOG = join(ROOT, ".run/mcp-calls.jsonl");
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const modelFilter = flag("model", null);
 const pairedOnly = argv.includes("--paired");
 // Restrict to specific arms — the notools control has no place in a

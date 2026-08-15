@@ -32,14 +32,12 @@ import { fileURLToPath } from "node:url";
 import { pairedTest, formatPaired, mean, sd } from "./stats.mjs";
 import { selectTags } from "./select-tags.mjs";
 import { loadTasks } from "./tasks.mjs";
+import { makeArgv } from "./argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS = join(ROOT, ".run/runs");
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 // Comma-separated: each tag is one full pass over the factorial, i.e. one
 // replicate. Replicates are averaged within (task, cell) BEFORE pairing —
 // treating them as independent observations is pseudo-replication and inflates n.

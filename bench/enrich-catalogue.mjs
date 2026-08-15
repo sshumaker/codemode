@@ -56,6 +56,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkNarrowing, DEFAULT_KEYWORDS, NARROWABLE } from "./enrich-schemas.mjs";
 import { pool } from "./pool.mjs";
+import { makeArgv } from "./argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -113,10 +114,7 @@ export function buildPrompt({ name, description, inputSchema }) {
 // --- everything below is I/O; the model's view is fixed above ------------------
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 
 /** Run a command asynchronously, writing `input` to its stdin. Same form as judge.mjs. */
 function run(cmd, args, input) {

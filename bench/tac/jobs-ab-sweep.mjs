@@ -29,15 +29,13 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const LOGS = join(ROOT, ".run/tac-logs");
 
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
 if (!envFile) {
 	console.error("usage: jobs-ab-sweep.mjs <env-file> --tasks a,b --reps 3 [--conditions on,off] [--prefix a1]");

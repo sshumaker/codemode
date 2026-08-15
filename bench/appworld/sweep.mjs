@@ -73,6 +73,7 @@ import { apiLayout, docsGateMode } from "../generate.mjs";
 import { pool } from "../pool.mjs";
 import { BASE_PROMPTS } from "./prompts.mjs";
 import { prewarm } from "./prewarm.mjs";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUNNER = join(ROOT, "bench/appworld/run-task.mjs");
@@ -84,10 +85,7 @@ const CLAUDE_RUNNER = join(ROOT, "bench/appworld/run-claude-code.mjs");
 const APPWORLD = join(ROOT, "vendor/appworld");
 
 const argv = process.argv.slice(2);
-const flag = (name, fallback) => {
-	const i = argv.indexOf(`--${name}`);
-	return i >= 0 ? argv[i + 1] : fallback;
-};
+const { flag } = makeArgv(argv);
 const has = (name) => argv.includes(`--${name}`);
 const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
 

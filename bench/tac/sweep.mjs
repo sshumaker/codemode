@@ -21,15 +21,13 @@ import { spawn } from "node:child_process";
 import { readdirSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeArgv } from "../argv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const TASKS_DIR = join(ROOT, "vendor/TheAgentCompany/workspaces/tasks");
 
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
 if (!envFile) {
 	console.error("usage: bench/tac/sweep.mjs <env-file> [--tasks a,b] [--limit 20] [--arms codemode,vanilla]");

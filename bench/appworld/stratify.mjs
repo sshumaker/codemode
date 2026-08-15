@@ -56,10 +56,7 @@ const PYTHON = join(APPWORLD, ".venv/bin/python3");
 const CACHE = join(ROOT, "bench/data/appworld-gt-calls.json");
 
 const argv = process.argv.slice(2);
-const flag = (n, d) => {
-	const i = argv.indexOf(`--${n}`);
-	return i >= 0 ? argv[i + 1] : d;
-};
+const { flag } = makeArgv(argv);
 const perStratum = Number(flag("per-stratum", 10));
 const seed = Number(flag("seed", 0));
 const split = flag("split", "train+dev");
@@ -81,6 +78,7 @@ function groundTruthCallCounts() {
 	if (existsSync(CACHE)) return JSON.parse(readFileSync(CACHE, "utf8"));
 	const script = `
 import warnings, json, os
+import { makeArgv } from "../argv.mjs";
 warnings.filterwarnings("ignore")
 from multiprocessing import Pool
 from appworld import AppWorld, load_task_ids
