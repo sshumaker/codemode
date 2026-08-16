@@ -598,7 +598,10 @@ file you have already looked at.\
         session.copy_to_container([spec_path], container_dir=SESSION_DIR)
         _, stream = self._exec(
             session,
-            ["python3", f"{RUNTIME_DIR}/scheduler.py", SESSIONS_ROOT,
+            # -u: stdout is a pipe here, and block-buffered prints held every
+            # "[scheduler] waking" line until exit — the wakes were invisible in
+            # the live stream (demo5) even while they were happening.
+            ["python3", "-u", f"{RUNTIME_DIR}/scheduler.py", SESSIONS_ROOT,
              "--drain", "--interval", "5", "--deadline", str(remaining)],
             environment=self._env(), workdir=cwd, stream=True, demux=False,
         )
