@@ -216,7 +216,11 @@ export function serverDefaultNote(param) {
 	if (param.serverDefault === undefined || param.requiredDefault || param.required) return null;
 	const literal = JSON.stringify(param.serverDefault);
 	if (literal === undefined || literal.length > 80) return null;
-	return `Server-side default: ${pyDocstring(literal)}.`;
+	// Sanitize backslashes and triple-quotes only. pyDocstring's trailing-quote
+	// escape is for text that ENDS a docstring; here a period follows, and the
+	// escape DISPLAYED — seen in a live trace as `Server-side default: "success\".`
+	const safe = literal.replace(/\\/g, "\\\\").replace(/"""/g, '\\"\\"\\"');
+	return `Server-side default: ${safe}.`;
 }
 
 export function requiredDefaultNote(param) {
