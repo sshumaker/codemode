@@ -35,6 +35,11 @@ import { constrained, realistic } from "./fixtures/catalogue.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const ENRICHER = readFileSync(join(ROOT, "bench/enrich-catalogue.mjs"), "utf8");
+// The apparatus the two codegen passes share. It is pinned here as well as in
+// required-defaults.test.mjs because the isolation guarantee is a property of
+// the I/O, and the I/O moved into it: a second input can now be added to BOTH
+// passes by adding it to one file, so that file has to be under the same pin.
+const DRIVER = readFileSync(join(ROOT, "bench/enrich-driver.mjs"), "utf8");
 
 /** The canonical target: an enum stated in prose, absent from the schema. */
 const SORT_BY = {
@@ -224,27 +229,36 @@ describe("the enricher cannot see task data", () => {
 
 	it("reads exactly one file, the catalogue", () => {
 		// The isolation guarantee is a property of the I/O, so it is asserted on the
-		// I/O: every readFileSync in the pass, listed. A future reader adding a second
-		// input has to change this test, which is the point.
-		// The catalogue, and — in replay mode — a trace this pass itself wrote. Nothing
-		// else. A future reader adding a second input has to change this test, which is
-		// the point of listing them rather than describing them.
+		// I/O: every readFileSync, listed. A future reader adding a second input has
+		// to change this test, which is the point of listing them rather than
+		// describing them.
+		//
+		// The pass itself now reads NOTHING — every read moved into the shared
+		// driver, so both files are pinned: the enricher may not grow a read, and
+		// the driver may only hold the catalogue and, in replay mode, a trace the
+		// pass itself wrote.
 		const reads = [...ENRICHER.matchAll(/readFileSync\(([^)]*)\)/g)].map((m) => m[1].trim());
+		assert.deepEqual(reads, [], `the enricher reads a file directly: ${reads}`);
+		const driverReads = [...DRIVER.matchAll(/readFileSync\(([^)]*)\)/g)].map((m) => m[1].trim());
 		assert.deepEqual(
-			reads,
-			["inPath, \"utf8\"", "resolve(ROOT, replayPath", "inPath"],
-			`the enricher reads something other than the catalogue and its own trace: ${reads}`,
+			driverReads,
+			["inPath", "resolve(ROOT, replayPath"],
+			`the driver reads something other than the catalogue and its own trace: ${driverReads}`,
 		);
-		// No directory walk and no second source. `readdirSync` is how a pass would
-		// grow a second input without anyone noticing.
+		// No directory walk and no second source, in either file. `readdirSync` is
+		// how a pass would grow a second input without anyone noticing.
 		for (const forbiddenApi of ["readdirSync", "loadTasks", "globSync", "Task.load"]) {
 			assert.equal(ENRICHER.includes(forbiddenApi), false, `the enricher can enumerate files with ${forbiddenApi}`);
+			assert.equal(DRIVER.includes(forbiddenApi), false, `the driver can enumerate files with ${forbiddenApi}`);
 		}
-		// It imports the checker and the pool, and nothing that knows about tasks.
-		const imports = [...ENRICHER.matchAll(/^import .* from "(\.[^"]+)";$/gm)].map((m) => m[1]);
-		// argv.mjs is the shared flag parser — pure argv, no I/O, so it does not
-		// weaken the isolation this test pins.
-		assert.deepEqual(imports.sort(), ["./argv.mjs", "./enrich-schemas.mjs", "./pool.mjs"]);
+		// It imports the checker and the driver, and nothing that knows about tasks.
+		const imports = [...ENRICHER.matchAll(/^} from "(\.[^"]+)";$|^import .* from "(\.[^"]+)";$/gm)].map((m) => m[1] ?? m[2]);
+		assert.deepEqual(imports.sort(), ["./enrich-driver.mjs", "./enrich-schemas.mjs"]);
+		// argv.mjs is the shared flag parser and pool.mjs the concurrency limiter —
+		// pure argv and pure scheduling, no I/O, so neither weakens the isolation
+		// this test pins.
+		const driverImports = [...DRIVER.matchAll(/^import .* from "(\.[^"]+)";$/gm)].map((m) => m[1]);
+		assert.deepEqual(driverImports.sort(), ["./argv.mjs", "./pool.mjs"]);
 	});
 
 	it("refuses to enrich an already-enriched catalogue", () => {
@@ -260,18 +274,23 @@ describe("the trace", () => {
 		// tomorrow, after the catalogue has moved on — so the SOURCE schema goes in the
 		// record, not a pointer to it. This project has one check whose cause is now
 		// permanently unknowable for exactly this reason.
-		const write = ENRICHER.slice(ENRICHER.indexOf("\tonTrace({"), ENRICHER.indexOf("if (!verdict.ok)"));
-		for (const field of ["source: sourceSchema", "proposed: proposed", "evidence:", "accepted: verdict.ok", "reason: verdict.reason", "model: record.model"]) {
+		const write = ENRICHER.slice(ENRICHER.indexOf("const narrowingRow ="), ENRICHER.indexOf("});", ENRICHER.indexOf("const narrowingRow =")));
+		for (const field of ["source: record.sourceSchema", "proposed: record.proposed", "evidence:", "accepted: verdict.ok", "reason: verdict.reason"]) {
 			assert.ok(write.includes(field), `the trace omits ${field}`);
 		}
-		// Written before the accept/reject branch, so a rejection is logged too.
-		assert.ok(ENRICHER.indexOf("\tonTrace({") < ENRICHER.indexOf("if (!verdict.ok)"));
+		// The model that produced the proposal comes from the driver's shared prefix,
+		// so a row cannot lose it by being rewritten here.
+		assert.match(DRIVER, /model: record\.model/);
+		// Written before the accept/reject branch, so a rejection is logged too. That
+		// ordering is the invariant the shared judge exists to hold in one place.
+		assert.ok(DRIVER.indexOf("\t\tonTrace(rowFor(record, verdict));") < DRIVER.indexOf("if (!verdict.ok)"));
 	});
 
 	it("writes the model's object nowhere — only the checker's applied result", () => {
-		assert.match(ENRICHER, /return verdict\.applied;/);
+		// One write into the catalogue, and it takes the CHECKER's merged schema.
+		assert.match(ENRICHER, /properties\[parameter\] = verdict\.applied;/);
+		assert.equal((ENRICHER.match(/properties\[[^\]]+\] =/g) ?? []).length, 1, "the catalogue is written from more than one place");
 		assert.equal(/properties\[[^\]]+\] = (proposal|row)\b/.test(ENRICHER), false, "the model's object is written through unchecked");
-		assert.match(ENRICHER, /properties\[proposal\.parameter\] = applied/);
 	});
 
 	it("replay scores a saved trace through the same judge as the live pass", () => {
@@ -281,9 +300,12 @@ describe("the trace", () => {
 		// pass that would draw different proposals. Two implementations of "is this a
 		// narrowing?" would make the replay a different question, so there is one.
 		assert.equal((ENRICHER.match(/checkNarrowing\(/g) ?? []).length, 1, "the checker is called from more than one place");
-		assert.match(ENRICHER, /const applied = judge\(/);
+		// One judge, built once, used by both branches — the replay and the live pass
+		// cannot diverge into two spellings of the same question.
+		assert.equal((ENRICHER.match(/makeJudge\(/g) ?? []).length, 1, "the pass builds more than one judge");
+		assert.equal((ENRICHER.match(/\bjudge\(\{/g) ?? []).length, 2, "the replay and the live pass do not both go through the judge");
 		// And a replay must not overwrite the trace it is replaying.
-		assert.match(ENRICHER, /replayPath \? resolve\(ROOT, flag\("trace", `\$\{replayPath\}\.replay`\)\) : tracePath/);
+		assert.match(DRIVER, /replayPath \? resolve\(ROOT, flag\("trace", `\$\{replayPath\}\.replay`\)\)/);
 	});
 });
 

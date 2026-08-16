@@ -71,15 +71,22 @@
  * failure is; if it works, it is a catalogue-level improvement both arms are
  * entitled to. Level up, not down.
  */
-import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { callModel } from "./enrich-catalogue.mjs";
-import { pool } from "./pool.mjs";
-import { makeArgv } from "./argv.mjs";
-
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+import {
+	drivePass,
+	makeJudge,
+	openTrace,
+	parsePassArgs,
+	printRejections,
+	provenance,
+	readCatalogue,
+	replayTrace,
+	toolIndex,
+	toolKey,
+	traceBase,
+} from "./enrich-driver.mjs";
 
 /**
  * The instruction, and the model's entire view of the world.
@@ -252,76 +259,71 @@ export function loadRequiredDefaults(path) {
 }
 
 // --- everything below is I/O; the model's view is fixed above ------------------
+//
+// The apparatus — argv, the catalogue read, the trace, the pool, the provenance
+// block — is `bench/enrich-driver.mjs`, shared with `bench/enrich-catalogue.mjs`.
+// What stays here is the question, the checker call, and the trace ROW, whose
+// field order is what makes an old trace replayable.
 
-const argv = process.argv.slice(2);
-const { flag } = makeArgv(argv);
+/**
+ * The trace row: content, predicate, verdict, model — the judge-trace pattern.
+ *
+ * The parameter's own schema goes in the record rather than a pointer to it,
+ * because the catalogue it points at is the thing that moves. `mutatingClaimed`
+ * next to `mutatingDerived` is what makes "the model agreed with itself" visible
+ * as data rather than an assumption.
+ */
+const requiredDefaultRow = (record, verdict, tool) => ({
+	...traceBase(record),
+	source: tool?.inputSchema?.properties?.[record.parameter] ?? null,
+	mutatingClaimed: record.mutatingClaimed ?? null,
+	mutatingDerived: tool ? isMutation(tool) : null,
+	resolves_to: record.resolves_to ?? null,
+	evidence: record.evidence ?? null,
+	accepted: verdict.ok,
+	reason: verdict.reason,
+});
 
 async function main() {
-	const replayPath = flag("replay", null);
-	const envFile = argv.find((a) => !a.startsWith("--") && (a.includes("/") || a.includes(".env")));
-	if (!envFile && !replayPath) {
-		console.error("usage: bench/required-defaults.mjs <env-file> [--in <catalogue>] [--out <json>]");
-		console.error("       bench/required-defaults.mjs --replay <trace.jsonl> [--out <json>]");
-		process.exit(2);
-	}
-	const inPath = resolve(ROOT, flag("in", "bench/data/appworld-schemas.json"));
-	const outPath = resolve(ROOT, flag("out", "bench/data/appworld-required-defaults.json"));
-	const model = flag("model", "claude-opus-5");
-	const concurrency = Number(flag("concurrency", 6));
-	const limit = Number(flag("limit", 0));
+	const { envFile, replayPath, sourceFlag, inPath, outPath, tracePath, model, concurrency, limit } = parsePassArgs({
+		usage: [
+			"usage: bench/required-defaults.mjs <env-file> [--in <catalogue>] [--out <json>]",
+			"       bench/required-defaults.mjs --replay <trace.jsonl> [--out <json>]",
+		],
+		defaultOut: "bench/data/appworld-required-defaults.json",
+		defaultTrace: "bench/data/required-defaults-trace.jsonl",
+		defaultConcurrency: 6,
+	});
 
-	// The single input. Nothing else is read: no task file, no run directory, no
-	// evaluator. This line IS guardrail 1.
-	const source = JSON.parse(readFileSync(inPath, "utf8"));
+	// The single input, read by the driver. Nothing else is read: no task file, no
+	// run directory, no evaluator. That read IS guardrail 1.
+	//
+	// No already-processed guard, unlike the enricher: this pass never mutates the
+	// catalogue it read, its output is a LIST rather than a catalogue, and running
+	// it twice over the same input re-derives the same entries from the same
+	// source schemas. Feeding it its own output is caught by `readCatalogue`.
+	const { source, digest } = readCatalogue(inPath);
+	const index = toolIndex(source);
+	const toolFor = (record) => index.get(toolKey(record.app, record.tool));
 
 	const stats = { tools: 0, mutating: 0, proposals: 0, accepted: 0, rejected: 0, failed: 0, inputTokens: 0, outputTokens: 0 };
 	const rejections = {};
-	const tracePath = replayPath
-		? resolve(ROOT, flag("trace", `${replayPath}.replay`))
-		: resolve(ROOT, flag("trace", "bench/data/required-defaults-trace.jsonl"));
-	mkdirSync(dirname(tracePath), { recursive: true });
-	writeFileSync(tracePath, "");
-	const onTrace = (row) => appendFileSync(tracePath, `${JSON.stringify(row)}\n`);
-
 	const entries = [];
-	const toolIndex = new Map();
-	for (const app of source.catalogue) {
-		for (const tool of app.tools) toolIndex.set(`${app.server}\u0000${tool.name}`, tool);
-	}
+	const onTrace = openTrace(tracePath);
+	const judge = makeJudge({
+		stats,
+		rejections,
+		onTrace,
+		verdict: (record) => {
+			const tool = toolFor(record);
+			return tool ? checkRequiredDefault(record, tool) : { ok: false, reason: `no such tool: ${record.app}.${record.tool}` };
+		},
+		row: (record, verdict) => requiredDefaultRow(record, verdict, toolFor(record)),
+	});
 
-	/** Judge one proposal and record it, whatever the verdict. Shared with --replay. */
-	const judge = (record) => {
-		stats.proposals++;
-		const tool = toolIndex.get(`${record.app}\u0000${record.tool}`);
-		const verdict = tool
-			? checkRequiredDefault(record, tool)
-			: { ok: false, reason: `no such tool: ${record.app}.${record.tool}` };
-		// content, predicate, verdict, model — the judge-trace pattern. The parameter's
-		// own schema goes in the record rather than a pointer to it, because the
-		// catalogue it points at is the thing that moves.
-		onTrace({
-			ts: new Date().toISOString(),
-			model: record.model,
-			app: record.app,
-			tool: record.tool,
-			parameter: record.parameter,
-			source: tool?.inputSchema?.properties?.[record.parameter] ?? null,
-			mutatingClaimed: record.mutatingClaimed ?? null,
-			mutatingDerived: tool ? isMutation(tool) : null,
-			resolves_to: record.resolves_to ?? null,
-			evidence: record.evidence ?? null,
-			accepted: verdict.ok,
-			reason: verdict.reason,
-		});
-		if (!verdict.ok) {
-			stats.rejected++;
-			const key = verdict.reason.split(":")[0].slice(0, 60);
-			rejections[key] = (rejections[key] ?? 0) + 1;
-			return;
-		}
-		stats.accepted++;
-		// The SOURCE text, normalized — never the model's string written through.
-		entries.push({ app: record.app, tool: record.tool, param: record.parameter, evidence_quote: verdict.quote });
+	/** The SOURCE text, normalized — never the model's string written through. */
+	const collect = (record, verdict) => {
+		if (verdict) entries.push({ app: record.app, tool: record.tool, param: record.parameter, evidence_quote: verdict.quote });
 	};
 
 	if (replayPath) {
@@ -329,43 +331,21 @@ async function main() {
 		// trace. Re-deciding an old trace under today's checker must reproduce the same
 		// verdicts for the same inputs — CLAUDE.md's test for sufficient logging, in
 		// executable form.
-		const rows = readFileSync(resolve(ROOT, replayPath), "utf8")
-			.split("\n")
-			.filter((line) => line.trim())
-			.map((line) => JSON.parse(line));
-		for (const row of rows) {
-			if (row.error) {
-				stats.failed++;
-				continue;
-			}
-			judge({ ...row, mutatingClaimed: row.mutatingClaimed });
-		}
-		console.log(`replayed ${rows.length} trace records from ${replayPath}`);
+		replayTrace(replayPath, { stats, onRow: (row) => collect(row, judge(row)) });
 	} else {
-		const jobs = [];
-		for (const app of source.catalogue) {
-			for (const tool of app.tools) jobs.push({ app, tool });
-		}
-		const selected = limit > 0 ? jobs.slice(0, limit) : jobs;
-		console.log(`${selected.length} tools -> ${model}, concurrency ${concurrency}`);
-
-		await pool(
-			selected,
-			async ({ app, tool }) => {
-				let reply;
-				try {
-					reply = await callModel(envFile, model, buildPrompt(tool));
-				} catch (error) {
-					stats.failed++;
-					onTrace({ ts: new Date().toISOString(), model, app: app.server, tool: tool.name, error: String(error) });
-					return;
-				}
-				stats.tools++;
-				stats.inputTokens += reply.usage.input_tokens ?? 0;
-				stats.outputTokens += reply.usage.output_tokens ?? 0;
+		await drivePass({
+			source,
+			envFile,
+			model,
+			limit,
+			concurrency,
+			stats,
+			onTrace,
+			buildPrompt,
+			onReply: (reply, { app, tool }) => {
 				if (reply.parsed.mutating) stats.mutating++;
 				for (const proposal of reply.parsed.proposals ?? []) {
-					judge({
+					const record = {
 						model,
 						app: app.server,
 						tool: tool.name,
@@ -373,32 +353,32 @@ async function main() {
 						resolves_to: proposal.resolves_to,
 						evidence: proposal.evidence,
 						mutatingClaimed: reply.parsed.mutating === true,
-					});
+					};
+					collect(record, judge(record));
 				}
 			},
-			concurrency,
-		);
+		});
 	}
 
 	entries.sort((a, b) => `${a.app}.${a.tool}.${a.param}`.localeCompare(`${b.app}.${b.tool}.${b.param}`));
-	const doc = {
+	const doc = provenance({
 		model,
-		source: flag("in", "bench/data/appworld-schemas.json"),
-		sourceDigest: createHash("sha256").update(readFileSync(inPath)).digest("hex").slice(0, 16),
-		replayedFrom: replayPath ?? undefined,
-		trace: tracePath.slice(ROOT.length + 1),
-		builtAt: new Date().toISOString(),
+		sourceFlag,
+		digest,
+		replayPath,
+		tracePath,
+		at: "builtAt",
 		stats,
 		rejections,
-		entries,
-	};
+		tail: { entries },
+	});
 	writeFileSync(outPath, `${JSON.stringify(doc, null, 1)}\n`);
 
 	console.log(
 		`tools ${stats.tools} (${stats.failed} failed, ${stats.mutating} called mutating)  ` +
 			`proposals ${stats.proposals}  accepted ${stats.accepted}  rejected ${stats.rejected}`,
 	);
-	for (const [reason, n] of Object.entries(rejections).sort((a, b) => b[1] - a[1])) console.log(`  ${String(n).padStart(4)}  ${reason}`);
+	printRejections(rejections);
 	for (const entry of entries) console.log(`  + ${entry.app}.${entry.tool}.${entry.param}  "${entry.evidence_quote}"`);
 	console.log(`-> ${outPath}\n-> ${tracePath}`);
 }

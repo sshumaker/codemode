@@ -25,6 +25,7 @@ import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./
 import { findTask } from "./tasks.mjs";
 import { seedPrimeSettings } from "./prime-settings.mjs";
 import { makeArgv } from "./argv.mjs";
+import { createStreamCollector, newSummary } from "./stream-collector.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
@@ -309,21 +310,7 @@ const child = spawn(
 
 const streamFile = createWriteStream(join(runDir, "stream.jsonl"));
 const started = Date.now();
-const summary = {
-	turns: 0,
-	toolCalls: 0,
-	toolNames: [],
-	toolErrors: 0,
-	errorMessages: [],
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	cost: 0,
-	finalText: "",
-};
-const counted = new Set();
-let buffer = "";
+const summary = newSummary();
 let stderr = "";
 
 const killTimer = setTimeout(() => {
@@ -355,56 +342,11 @@ child.stderr.on("data", (d) => {
 	stderr = (stderr + d).slice(-8000);
 });
 
+const collector = createStreamCollector({ summary, onCounted: enforceBudget });
+
 child.stdout.on("data", (chunk) => {
 	streamFile.write(chunk);
-	buffer += chunk;
-	const lines = buffer.split("\n");
-	buffer = lines.pop() ?? "";
-	for (const line of lines) {
-		if (!line.startsWith("{")) continue;
-		let event;
-		try {
-			event = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (event.type === "tool_execution_start") {
-			summary.toolCalls++;
-			summary.toolNames.push(event.toolName);
-		} else if (event.type === "tool_execution_end" && event.isError) {
-			summary.toolErrors++;
-			const text = (event.result?.content ?? []).map((c) => c.text ?? "").join(" ");
-			summary.errorMessages.push(text.slice(0, 300));
-		} else if (event.type === "message_end" && event.message?.role === "assistant") {
-			const message = event.message;
-			// A provider-side refusal is not a result. osint_intelligence_000 asks for
-			// typo-squat and exposed-service enumeration against a domain, which trips
-			// the refusal classifier: three retries, all refused, zero tool calls, and
-			// the run was recorded as `completed` at $0.02. Averaged in, a refusal pulls
-			// its cell's mean cost toward zero in whichever cells happen to refuse — the
-			// same shape as the rate-limited server whose 429s were counted as
-			// successful MCP responses.
-			if (message.stopReasonRaw === "refusal" || /\brefus/i.test(message.errorMessage ?? "")) {
-				summary.refusals = (summary.refusals ?? 0) + 1;
-			}
-			const texts = (message.content ?? []).filter((c) => c.type === "text" && c.text);
-			if (texts.length > 0) summary.finalText = texts.map((c) => c.text).join("");
-			const id = message.responseId;
-			if (id && !counted.has(id) && message.usage?.totalTokens) {
-				counted.add(id);
-				// Total context billed on the first turn: system prompt + tools + task.
-				// This is what residency actually controls, so it is what the guard checks.
-				if (summary.turns === 0) {
-					const u = message.usage;
-					summary.firstTurnPromptTokens = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
-				}
-				summary.turns++;
-				for (const k of ["input", "output", "cacheRead", "cacheWrite"]) summary[k] += message.usage[k] ?? 0;
-				summary.cost += message.usage.cost?.total ?? 0;
-				enforceBudget();
-			}
-		}
-	}
+	collector.write(chunk);
 });
 
 child.on("close", (code) => {

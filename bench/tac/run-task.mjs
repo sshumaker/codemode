@@ -30,6 +30,7 @@ import { promisify } from "node:util";
 
 import { buildTacPreamble } from "./prompts.mjs";
 import { makeArgv } from "../argv.mjs";
+import { createStreamCollector, newSummary } from "../stream-collector.mjs";
 
 const run = promisify(execFile);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -53,6 +54,17 @@ const arm = flag("arm", "codemode");
 const model = flag("model", "anthropic/claude-opus-5");
 const promptVariant = flag("prompt", arm === "codemode" ? "t1" : "w1");
 const timeoutSec = Number(flag("timeout", 2400));
+/**
+ * Budget cap, in dollars, checked as usage streams in. OFF by default.
+ *
+ * Parity of MECHANISM with the other two runners, not of value: `--max-cost`
+ * meant "kill the run" on MCP-Bench and AppWorld and meant nothing here, so the
+ * flag was a silent no-op on one of three benchmarks. TAC tasks legitimately run
+ * to $3-5 and no sweep so far has wanted a cap, so the default stays 0 (no cap)
+ * — a cap that binds one benchmark and not another stops being a control and
+ * starts truncating trajectories.
+ */
+const maxCost = Number(flag("max-cost", 0));
 const image = flag("image", `ghcr.io/theagentcompany/${taskName}-image:${VERSION}`);
 const runId = flag("run-id", `tac__${taskName}__${arm}__${promptVariant}__${model.replace(/\//g, "-")}`);
 const runDir = join(ROOT, ".run/tac", runId);
@@ -927,9 +939,7 @@ function runAgent() {
 		);
 
 		const events = [];
-		const summary = { turns: 0, toolCalls: 0, toolErrors: 0, toolNames: [], cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, finalText: "", timedOut: false };
-		const counted = new Set();
-		let buffer = "";
+		const summary = newSummary({ timedOut: false });
 		let stderr = "";
 
 		const killTimer = setTimeout(() => {
@@ -937,59 +947,47 @@ function runAgent() {
 			child.kill("SIGKILL");
 		}, timeoutSec * 1000);
 
+		function enforceBudget() {
+			if (maxCost > 0 && summary.cost >= maxCost) {
+				summary.budgetExceeded = true;
+				child.kill("SIGKILL");
+			}
+		}
+
 		child.stderr.on("data", (d) => {
 			stderr = (stderr + d).slice(-4000);
 			appendFileSync(join(runDir, "stderr.log"), d);
 		});
+		// The same accounting as the other two runners, from the same module: count
+		// completed messages rather than streamed deltas, dedup by responseId, and
+		// capture the first turn's prompt tokens. Summing content blocks across
+		// message_update events once counted one tool call nine times; three copies
+		// of the fix was one copy too many, and this one had drifted (no ctx0, no
+		// budget, error counts without error text).
+		const collector = createStreamCollector({
+			summary,
+			// Stamped on receipt. trajectory.json had 1 timestamp in 125 events, which
+			// is why locating a 2,300s hole took inference from durationMs instead of
+			// reading it off. stream.jsonl stays raw; this is the parsed view.
+			onEvent: (e) => events.push({ _t: new Date().toISOString(), ...e }),
+			onToolEnd: (_e, txt) => {
+				// A0 integrity: a wedged kernel answers every cell with "Kernel did
+				// not respond to kernel_info_request". Seven TAC runs scored a
+				// plausible 0–2/5 that way. Counting it here is what lets the run
+				// self-flag INVALID instead of reporting the number.
+				if (/kernel.*did not respond|Kernel did not respond/i.test(txt)) {
+					summary.kernelNoResponse = (summary.kernelNoResponse ?? 0) + 1;
+				}
+			},
+			onCounted: enforceBudget,
+		});
+
 		child.stdout.on("data", (chunk) => {
 			// The raw stream, before any parsing. trajectory.json is what this
 			// runner understood; stream.jsonl is what actually came back, which is
 			// what you want when the two disagree.
 			appendFileSync(join(runDir, "stream.jsonl"), chunk);
-			buffer += chunk;
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-			for (const line of lines) {
-				if (!line.startsWith("{")) continue;
-				let e;
-				try {
-					e = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				// Stamped on receipt. trajectory.json had 1 timestamp in 125 events, which
-				// is why locating a 2,300s hole took inference from durationMs instead of
-				// reading it off. stream.jsonl stays raw; this is the parsed view.
-				events.push({ _t: new Date().toISOString(), ...e });
-				// Same accounting as bench/run-task.mjs: count completed messages,
-				// not streamed deltas. Summing content blocks across message_update
-				// events counted one tool call nine times.
-				if (e.type === "tool_execution_start") {
-					summary.toolCalls++;
-					summary.toolNames.push(e.toolName);
-				} else if (e.type === "tool_execution_end") {
-					if (e.isError) summary.toolErrors++;
-					// A0 integrity: a wedged kernel answers every cell with "Kernel did
-					// not respond to kernel_info_request". Seven TAC runs scored a
-					// plausible 0–2/5 that way. Counting it here is what lets the run
-					// self-flag INVALID instead of reporting the number.
-					const txt = (e.result?.content ?? []).map((c) => c.text ?? "").join("");
-					if (/kernel.*did not respond|Kernel did not respond/i.test(txt)) {
-						summary.kernelNoResponse = (summary.kernelNoResponse ?? 0) + 1;
-					}
-				} else if (e.type === "message_end" && e.message?.role === "assistant") {
-					const m = e.message;
-					const texts = (m.content ?? []).filter((c) => c.type === "text" && c.text);
-					if (texts.length > 0) summary.finalText = texts.map((c) => c.text).join("");
-					const id = m.responseId;
-					if (id && !counted.has(id) && m.usage?.totalTokens) {
-						counted.add(id);
-						summary.turns++;
-						for (const k of ["input", "output", "cacheRead", "cacheWrite"]) summary[k] += m.usage[k] ?? 0;
-						summary.cost += m.usage.cost?.total ?? 0;
-					}
-				}
-			}
+			collector.write(chunk);
 		});
 
 		// `exit`, not `close`.
@@ -1007,6 +1005,10 @@ function runAgent() {
 			clearTimeout(killTimer);
 			summary.exitCode = code;
 			summary.stderrTail = stderr.split("\n").slice(-8).join("\n");
+			summary.maxCost = maxCost;
+			// Named the same way as the other two runners, so a run stopped by its
+			// allowance is never read as a run that failed.
+			summary.stopReason = summary.budgetExceeded ? "budget" : summary.timedOut ? "timeout" : "completed";
 			writeFileSync(join(runDir, "trajectory.json"), `${JSON.stringify(events, null, 2)}\n`);
 			writeFileSync(join(runDir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
 			resolve(summary);

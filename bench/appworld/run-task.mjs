@@ -55,6 +55,7 @@ import { loadRequiredDefaults } from "../required-defaults.mjs";
 import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
 import { seedPrimeSettings } from "../prime-settings.mjs";
 import { makeArgv } from "../argv.mjs";
+import { createStreamCollector, newSummary } from "../stream-collector.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const CLI = join(ROOT, "vendor/prime-agent/packages/coding-agent/dist/cli.js");
@@ -720,25 +721,14 @@ writeFileSync(join(runDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
 
 // --- run --------------------------------------------------------------------
 
-const summary = {
-	turns: 0,
-	toolCalls: 0,
-	toolNames: [],
-	toolErrors: 0,
-	errorMessages: [],
+const summary = newSummary({
 	// Populated only when --validate-args rendered a validator into the tree.
 	argumentErrors: [],
 	// Populated only under --read-gate: every refusal the gate issued, with the turn
 	// it landed on. A count alone cannot answer the question the variant exists to
 	// answer -- whether the correction was acted on next cell.
 	readFirstRaises: [],
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	cost: 0,
-	finalText: "",
-};
+});
 
 async function main() {
 	mark("worldStart");
@@ -853,8 +843,6 @@ async function main() {
 	// Every event stamped on receipt. On TAC exactly 1 of 125 events carried a
 	// timestamp, and locating a 2,300s hole had to be inferred from durationMs.
 	const trajectoryFile = createWriteStream(join(runDir, "trajectory.jsonl"));
-	const counted = new Set();
-	let buffer = "";
 	let stderr = "";
 	mark("agentStart");
 
@@ -874,66 +862,34 @@ async function main() {
 		stderr = (stderr + d).slice(-8000);
 	});
 
+	const collector = createStreamCollector({
+		summary,
+		onEvent: (event) => trajectoryFile.write(`${JSON.stringify({ _t: new Date().toISOString(), ...event })}\n`),
+		onToolEnd: (_event, text) => {
+			// Every ArgumentError the validator raised, with the turn it landed on and
+			// its full text. A count alone cannot answer the question the variant exists
+			// to answer — whether the correction in the error channel was acted on next
+			// cell — and CLAUDE.md's rule is to persist what a check saw, not only its
+			// verdict. Called outside the isError branch on purpose: an exception the
+			// agent caught inside its own cell is still a correction that was delivered.
+			// `api.<app>.<api>:` is required, because the string "ArgumentError:" also
+			// appears in _client.call's own Raises docstring, which IPython prints in
+			// every traceback through it — counting those would inflate the number by
+			// one per unrelated failure.
+			for (const m of text.matchAll(/ArgumentError: (api\.[\w.]+: [^\n]+)/g)) {
+				summary.argumentErrors.push({ turn: summary.turns, message: m[1].slice(0, 400) });
+			}
+			// Same treatment, same reason, for the read gate's refusals.
+			for (const m of text.matchAll(/ReadFirst: (api\.[\w.]+ has not been read[^\n]*)/g)) {
+				summary.readFirstRaises.push({ turn: summary.turns, message: m[1].slice(0, 300) });
+			}
+		},
+		onCounted: enforceBudget,
+	});
+
 	child.stdout.on("data", (chunk) => {
 		streamFile.write(chunk);
-		buffer += chunk;
-		const lines = buffer.split("\n");
-		buffer = lines.pop() ?? "";
-		for (const line of lines) {
-			if (!line.startsWith("{")) continue;
-			let event;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			trajectoryFile.write(`${JSON.stringify({ _t: new Date().toISOString(), ...event })}\n`);
-			if (event.type === "tool_execution_start") {
-				summary.toolCalls++;
-				summary.toolNames.push(event.toolName);
-			} else if (event.type === "tool_execution_end") {
-				const text = (event.result?.content ?? []).map((c) => c.text ?? "").join(" ");
-				if (event.isError) {
-					summary.toolErrors++;
-					summary.errorMessages.push(text.slice(0, 300));
-				}
-				// Every ArgumentError the validator raised, with the turn it landed on and
-				// its full text. A count alone cannot answer the question the variant exists
-				// to answer — whether the correction in the error channel was acted on next
-				// cell — and CLAUDE.md's rule is to persist what a check saw, not only its
-				// verdict. Outside the isError branch on purpose: an exception the agent
-				// caught inside its own cell is still a correction that was delivered.
-				// `api.<app>.<api>:` is required, because the string "ArgumentError:" also
-				// appears in _client.call's own Raises docstring, which IPython prints in
-				// every traceback through it — counting those would inflate the number by
-				// one per unrelated failure.
-				for (const m of text.matchAll(/ArgumentError: (api\.[\w.]+: [^\n]+)/g)) {
-					summary.argumentErrors.push({ turn: summary.turns, message: m[1].slice(0, 400) });
-				}
-				// Same treatment, same reason, for the read gate's refusals. Outside the
-				// isError branch on purpose: an exception the agent caught inside its own
-				// cell is still a refusal that was delivered.
-				for (const m of text.matchAll(/ReadFirst: (api\.[\w.]+ has not been read[^\n]*)/g)) {
-					summary.readFirstRaises.push({ turn: summary.turns, message: m[1].slice(0, 300) });
-				}
-			} else if (event.type === "message_end" && event.message?.role === "assistant") {
-				const message = event.message;
-				const texts = (message.content ?? []).filter((c) => c.type === "text" && c.text);
-				if (texts.length > 0) summary.finalText = texts.map((c) => c.text).join("");
-				const id = message.responseId;
-				if (id && !counted.has(id) && message.usage?.totalTokens) {
-					counted.add(id);
-					if (summary.turns === 0) {
-						const u = message.usage;
-						summary.firstTurnPromptTokens = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
-					}
-					summary.turns++;
-					for (const k of ["input", "output", "cacheRead", "cacheWrite"]) summary[k] += message.usage[k] ?? 0;
-					summary.cost += message.usage.cost?.total ?? 0;
-					enforceBudget();
-				}
-			}
-		}
+		collector.write(chunk);
 	});
 
 	const exitCode = await new Promise((resolve) => child.on("close", resolve));

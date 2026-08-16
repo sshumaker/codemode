@@ -36,6 +36,9 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUNNER = readFileSync(join(ROOT, "bench/appworld/run-task.mjs"), "utf8");
 const SWEEP = readFileSync(join(ROOT, "bench/appworld/sweep.mjs"), "utf8");
 const CLASSIFIER = readFileSync(join(ROOT, "bench/required-defaults.mjs"), "utf8");
+// The apparatus this pass shares with bench/enrich-catalogue.mjs. Pinned here as
+// well, because the I/O the isolation guarantee is asserted on now lives in it.
+const DRIVER = readFileSync(join(ROOT, "bench/enrich-driver.mjs"), "utf8");
 const PROBE = join(ROOT, "bench/test/fixtures/required_defaults_probe.py");
 const LIST = join(ROOT, "bench/data/appworld-required-defaults.json");
 const CATALOGUE_PATH = join(ROOT, "bench/data/appworld-schemas.json");
@@ -133,13 +136,34 @@ describe("the classifier cannot see task data", () => {
 		// The isolation guarantee is a property of the I/O, so it is asserted on the
 		// I/O. A future reader adding a second input has to change this test, which is
 		// the point of listing them rather than describing them.
+		//
+		// The pass's own only read is `loadRequiredDefaults`, which reads THIS pass's
+		// own output for codegen — not an input to the classification. Everything the
+		// pass reads while classifying is in the shared driver, so the driver carries
+		// the same pin: a second input added there would reach both passes at once.
 		const reads = [...CLASSIFIER.matchAll(/readFileSync\(([^)]*)\)/g)].map((m) => m[1].trim());
-		assert.deepEqual(reads, ["path, \"utf8\"", "inPath, \"utf8\"", "resolve(ROOT, replayPath", "inPath"], `unexpected reads: ${reads}`);
+		assert.deepEqual(reads, ["path, \"utf8\""], `unexpected reads: ${reads}`);
+		const driverReads = [...DRIVER.matchAll(/readFileSync\(([^)]*)\)/g)].map((m) => m[1].trim());
+		assert.deepEqual(driverReads, ["inPath", "resolve(ROOT, replayPath"], `unexpected driver reads: ${driverReads}`);
 		for (const forbiddenApi of ["readdirSync", "loadTasks", "globSync", "Task.load"]) {
 			assert.equal(CLASSIFIER.includes(forbiddenApi), false, `the classifier can enumerate files with ${forbiddenApi}`);
+			assert.equal(DRIVER.includes(forbiddenApi), false, `the driver can enumerate files with ${forbiddenApi}`);
 		}
-		const imports = [...CLASSIFIER.matchAll(/^import .* from "(\.[^"]+)";$/gm)].map((m) => m[1]);
-		assert.deepEqual(imports.sort(), ["./argv.mjs", "./enrich-catalogue.mjs", "./pool.mjs"]);
+		const imports = [...CLASSIFIER.matchAll(/^} from "(\.[^"]+)";$|^import .* from "(\.[^"]+)";$/gm)].map((m) => m[1] ?? m[2]);
+		assert.deepEqual(imports.sort(), ["./enrich-driver.mjs"]);
+	});
+
+	it("re-running the classifier over the same catalogue is safe — no idempotence guard needed", () => {
+		// The enricher REFUSES an already-enriched input, because its output is a
+		// catalogue of the same shape and a second pass would narrow an
+		// already-narrowed schema, compounding unverifiable edits. This pass has no
+		// analogous hazard and deliberately no analogous guard: it writes no
+		// property back into the catalogue it read, and its output is a LIST, not a
+		// catalogue — so feeding it its own output is not "enriching twice", it is a
+		// type error, and the driver says so instead of dying on `app.tools`.
+		assert.equal(/source\.enrichment/.test(CLASSIFIER), false, "the classifier grew an enrichment guard it does not need");
+		assert.equal(/\.properties\[[^\]]*\] *=/.test(CLASSIFIER), false, "the classifier mutates the catalogue it read");
+		assert.match(DRIVER, /is not a catalogue \(no top-level "catalogue" array\)/);
 	});
 });
 
