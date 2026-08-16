@@ -399,3 +399,48 @@ Every mechanism above is n=1 or n=2. None of these is a rate. The two with n=2
 (answer-discipline as a class, `complete_task` omission in vanilla) are the only
 candidates for a ratchet test; everything else is an existence proof pending
 recurrence.
+
+---
+
+## Post-crank sample-20 triage (2026-08-15 evening) — the "96 → 90" question
+
+Sample-20 seed-43 scored 18/20 after the day's hardening crank; the held-out
+had been 44/46. Trace-level comparison of both failures against same-task
+passing runs (Aug 13, `nav__rg__layout-consolidated__bp-v2` — one flag apart):
+
+**`a53a8fd_1` (7/10): AGENT, selection slip, n=1.** The failing run listed all
+8 drafts UNTRUNCATED — verified by re-extracting the exact tool-result text:
+draft_ids [518, 519, 522, 520, 521, 114, 523, 118], all five Accountant
+applications present — then hardcoded `[518,519,522]`: the three that appeared
+ADJACENT in display order, missing the two that appeared later. The Aug-13
+pass printed a compact one-line-per-draft summary sorted by -created_at and
+selected `targets = [518, 519, 522, 520, 521]`. Same information; different
+enumeration care. No crank surface involved (pagination explicit at
+page_limit=20; no schema-default reliance; gate behaved identically).
+
+**`9871968_1` (6/7): AGENT + grader-frame, n=1.** Failing check: `no_op_fail`
+on `amazon.WishListEntry` — "In right but not left: ['amazon.WishListEntry']".
+The failing run ordered every wish-list item via `add_product_to_cart` —
+semantically the same purchase, but the wish list never mutates, and
+WishListEntry is on the graded side of the cart/wishlist asymmetry this doc
+already records. The Aug-13 pass grepped api/amazon.py for "wishlist" (cell
+3), found `move_product_from_wish_list_to_cart`, and used it — which mutates
+both models. API-choice fork, both plausible, one graded.
+
+**Verdict: no regression signal.** Neither mechanism touches any surface the
+crank changed (sanitization, collisions, defaults-note, pagination text, gate,
+memoized generation). Both tasks are historically boundary-sitting (batch-2
+recorded BOTH as both-arm failures; their latest pre-crank runs passed): the
+stochastic class where an identical config once scored 8/8 then 3/8. The
+"96 vs 90" is two different samples (46 fresh-seed vs 20 seed-43) with two
+boundary tasks landing tails-up, n far below the ~20-cell bar.
+
+**Incidental true bug found by reading the traces:** `serverDefaultNote`
+rendered string defaults as `"success\".` (pyDocstring's end-escape applied to
+an embedded literal). Fixed same evening.
+
+**Process note:** today's runs OVERWROTE the pre-crank artifacts at the
+identical runId — the runId-collision class, applied to disk. The pre-crank
+same-tag evidence for these two tasks is gone; the comparison above uses the
+nearest-config runs. A date component in the run dir (or refusing to overwrite
+a dir with a different code version) would preserve the pair next time.
