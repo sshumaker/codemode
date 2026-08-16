@@ -19,6 +19,7 @@ proves nothing about whether a child is collectable.
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -258,6 +259,30 @@ class TestChildEnvironment(Base):
         # The child cannot spawn, so it is not told it can.
         self.assertNotIn("spawn(prompt", appended)
 
+    def test_the_boundary_travels_with_the_child(self):
+        # Under the broker the child inherits the BROKER's environment, so the
+        # sandbox settings and the env scrub that confine the parent's kernel have
+        # to travel in the spec or the child's kernel comes up less confined than
+        # its parent's — running model-authored code with a boundary nobody chose.
+        spawner = S.Subagents(
+            self.store,
+            env=dict(self.env,
+                     HARNESS_KERNEL_ENV_SCRUB="ANTHROPIC_API_KEY",
+                     HARNESS_KERNEL_SANDBOX_SETTINGS="/run/srt.json",
+                     HARNESS_KERNEL_SANDBOX_BIN="/run/srt",
+                     ANTHROPIC_API_KEY="present-here"),
+            node="node", python="python3",
+        )
+        spawner.spawn("a", name="scout")
+        env = self.spec("scout")["env"]
+        self.assertEqual(env["HARNESS_KERNEL_ENV_SCRUB"], "ANTHROPIC_API_KEY")
+        self.assertEqual(env["HARNESS_KERNEL_SANDBOX_SETTINGS"], "/run/srt.json")
+        self.assertEqual(env["HARNESS_KERNEL_SANDBOX_BIN"], "/run/srt")
+        # And nothing secret rides along: the spec is a file in the job directory,
+        # which is inside the sandbox.
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("present-here", json.dumps(self.spec("scout")))
+
     def test_a_child_without_a_kernel_gets_no_jobs_guidance(self):
         ipy = os.path.join(self.dir, "ipython")
         os.makedirs(os.path.join(ipy, "profile_default", "startup"))
@@ -360,6 +385,125 @@ class TestGuards(Base):
         self.spawner.spawn("a", name="scout")
         with self.assertRaises(J.JobError):
             self.spawner.spawn("b", name="scout")
+
+
+# ---------------------------------------------------------------------------------
+# brokered spawn — the child is started harness-side, not from the kernel
+# ---------------------------------------------------------------------------------
+
+class TestBrokeredSpawn(Base):
+    """
+    With `HARNESS_SUBAGENT_BROKER=1` the kernel records a REQUEST and forks
+    nothing. The agent-facing surface is unchanged by construction — same handle,
+    same name, same collection — so what these pin is the one thing that moved:
+    no process is created here, and enough is on disk for somebody else to create
+    it (docs/CLOUD-HARNESS-DESIGN.md §3.3).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.spawner = S.Subagents(
+            self.store, env=dict(self.env, HARNESS_SUBAGENT_BROKER="1"),
+            node="/usr/bin/node", python="/usr/bin/python3",
+        )
+
+    def request(self, name):
+        with open(os.path.join(self.dir, "requests", f"{name}.json")) as fh:
+            return json.load(fh)
+
+    def test_nothing_is_forked_from_the_kernel(self):
+        job = self.spawner.spawn("find the auth tests", name="scout")
+        self.assertEqual(self.world.spawned, [], "the kernel started the child itself")
+        self.assertEqual(job.state, "requested")
+        self.assertFalse(job.done, "a requested job is live, not finished")
+
+    def test_the_request_carries_everything_needed_to_start_it(self):
+        self.spawner.spawn("go", name="scout")
+        req = self.request("scout")
+        # The WRAPPED command, not the bare one: the pid file and the exit marker
+        # are what make a job observable from disk, and a broker that launched the
+        # raw command would produce a job nothing could refresh.
+        self.assertIn("subagent_run.py", req["wrapped"])
+        self.assertIn(req["pid_file"], req["wrapped"])
+        self.assertIn(req["exit_marker"], req["wrapped"])
+        self.assertEqual(req["cwd"], "/workspace")
+        self.assertEqual(req["kind"], "subagent")
+        self.assertEqual(req["log"], self.store._log_path("scout"))
+
+    def test_a_requested_child_counts_against_the_cap_and_shows_in_the_manifest(self):
+        # It has not started, but it is going to, and a cap that only counted
+        # started children would let a loop request a hundred of them.
+        self.spawner.spawn("a", name="one")
+        self.assertEqual(self.spawner.live_children(), ["one"])
+        self.assertIn("requested", self.store.manifest())
+        self.assertIn("subagent: a", self.store.manifest())
+
+    def test_the_name_is_claimed_the_moment_it_is_requested(self):
+        self.spawner.spawn("a", name="scout")
+        with self.assertRaises(J.JobError) as ctx:
+            self.spawner.spawn("b", name="scout")
+        self.assertIn("already requested", str(ctx.exception))
+
+    def test_killing_an_unclaimed_request_cancels_it_and_says_so(self):
+        self.spawner.spawn("a", name="scout")
+        self.assertTrue(self.store.kill("scout"))
+        rec = self.store._read("scout")
+        self.assertEqual(rec["state"], "killed")
+        self.assertIn("nothing was started", rec["reason"])
+        # And the request is gone, so a broker that scans later starts nothing.
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "requests", "scout.json")))
+        self.assertNotIn("unconfirmed", rec)
+
+    def test_an_unclaimed_request_fails_with_the_missing_component_named(self):
+        # The failure this converts: with no broker running, the job sits
+        # `requested` for its whole 30-minute timeout and then reports an ordinary
+        # deadline — a plausible number rather than an error.
+        store = J.JobStore(self.dir, now=self.world.now, spawn=self.world.spawn,
+                           kill=self.world.kill, probe=self.world.probe,
+                           cwd="/workspace", emit=self.emitted.append, claim_timeout=60)
+        spawner = S.Subagents(store, env=dict(self.env, HARNESS_SUBAGENT_BROKER="1"),
+                              node="node", python="python3")
+        spawner.spawn("a", name="scout")
+        self.world.advance(61)
+        job = store.get("scout")
+        self.assertTrue(job.done)
+        self.assertIn("no broker claimed this request", job.reason)
+        self.assertIn("subagent_broker.py", job.reason)
+
+
+class TestCredentialsGuard(Base):
+    """
+    A kernel whose credentials were taken away cannot start a brain.
+
+    Without this the child is spawned, reaches the provider with no key and dies
+    inside its own loop — a weak subagent rather than a harness fault, with every
+    check on the parent's side still green.
+    """
+
+    SCRUBBED = {"HARNESS_KERNEL_ENV_SCRUB": "ANTHROPIC_API_KEY"}
+
+    def test_a_scrubbed_kernel_refuses_to_spawn_directly(self):
+        spawner = S.Subagents(self.store, env=dict(self.env, **self.SCRUBBED),
+                              node="node", python="python3")
+        with self.assertRaises(J.JobError) as ctx:
+            spawner.spawn("a", name="scout")
+        msg = str(ctx.exception)
+        self.assertIn("ANTHROPIC_API_KEY", msg)
+        self.assertIn("HARNESS_SUBAGENT_BROKER", msg)
+        self.assertEqual(self.world.spawned, [], "it spawned anyway")
+
+    def test_the_same_kernel_may_request_one_through_the_broker(self):
+        spawner = S.Subagents(
+            self.store, env=dict(self.env, HARNESS_SUBAGENT_BROKER="1", **self.SCRUBBED),
+            node="node", python="python3")
+        self.assertEqual(spawner.spawn("a", name="scout").state, "requested")
+
+    def test_an_unscrubbed_kernel_is_untouched(self):
+        # The in-container runners put the whole brain inside the sandbox on
+        # purpose and have no harness side to broker from; nothing here may
+        # change for them.
+        self.spawner.spawn("a", name="scout")
+        self.assertEqual(len(self.world.spawned), 1)
 
 
 # ---------------------------------------------------------------------------------
@@ -625,6 +769,112 @@ class TestRealChild(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.store.get("hung").output != ""))
         self.assertTrue(self.store.kill("hung"))
         self.assertEqual(self.store.get("hung").state, "killed")
+
+
+class TestRealBrokeredChild(unittest.TestCase):
+    """
+    The brokered loop for real: request -> broker -> launcher -> result.
+
+    Same assertions the direct loop makes, because the parent's side is supposed
+    to be indistinguishable. The one new claim — that the child runs in the
+    BROKER's world rather than the kernel's — is provable offline: a variable that
+    exists only in the broker's environment appears in the child's if and only if
+    the broker started it.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="subagent-brokered-")
+        self.store = J.JobStore(self.dir, cwd=self.dir, emit=lambda m: None)
+        self.spawner = S.Subagents(
+            self.store,
+            env={"HARNESS_SUBAGENT_MODEL": "fake/model",
+                 "HARNESS_SUBAGENT_CLI": FIXTURE_AGENT,
+                 "HARNESS_SUBAGENT_BROKER": "1"},
+            node=sys.executable,
+            python=sys.executable,
+        )
+        self._saved = {k: os.environ.get(k) for k in
+                       ("FAKE_TURNS", "FAKE_WRITE", "FAKE_REPORT_ENV", "BROKER_ONLY_SECRET")}
+        os.environ.pop("BROKER_ONLY_SECRET", None)
+
+    def tearDown(self):
+        for rec in self.store._all():
+            if rec.get("state") in J.LIVE_STATES:
+                try:
+                    self.store.kill(rec["name"])
+                except Exception:
+                    pass
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def broker(self):
+        import subagent_broker
+
+        return subagent_broker.Broker(self.dir, log=lambda m: None)
+
+    def test_the_whole_loop_through_a_broker(self):
+        os.environ["FAKE_TURNS"] = "2"
+        job = self.spawner.spawn("what is in this directory?", name="scout")
+        self.assertEqual(job.state, "requested")
+
+        started = self.broker().scan_once()
+        self.assertEqual(started, ["scout"])
+
+        self.assertTrue(wait_until(lambda: job.done), f"child never finished: {job!r}")
+        s = self.store.get("scout")
+        self.assertTrue(s.ok, f"exit {s.exit_code}: {s.output[-500:]}")
+        # Collection is byte-for-byte the direct path's: the parent cannot tell.
+        self.assertIn("turn 2", s.result)
+        self.assertEqual(s.turns, 2)
+        self.assertEqual(s.tool_calls, 2)
+        self.assertIn("[subagent scout]", s.output)
+
+    def test_the_record_picks_up_the_pid_the_broker_started(self):
+        os.environ["FAKE_TURNS"] = "1"
+        os.environ["FAKE_DELAY"] = "1"
+        try:
+            self.spawner.spawn("slow", name="slow")
+            self.broker().scan_once()
+            # `requested` -> `running` happens by reading the pid file the job
+            # wrote about itself — the same route a job recovered from an
+            # interrupted submit takes, so a brokered job is killable and
+            # refreshable with no special case anywhere.
+            self.assertTrue(wait_until(lambda: self.store.get("slow").state == "running"))
+            rec = self.store._read("slow")
+            self.assertIsNotNone(rec["pid"])
+            self.assertIn("broker", rec["reason"])
+        finally:
+            os.environ.pop("FAKE_DELAY", None)
+
+    def test_the_child_inherits_the_brokers_environment_not_the_kernels(self):
+        # The architectural claim, as an assertion. The broker runs as a REAL
+        # separate process holding a variable this process does not have; if the
+        # child reports it, the child was started out there.
+        received = os.path.join(self.dir, "received.txt")
+        self.spawner.spawn("who started me?", name="scout")
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "FAKE_TURNS": "1",
+            "FAKE_WRITE": received,
+            "FAKE_REPORT_ENV": "BROKER_ONLY_SECRET",
+            "BROKER_ONLY_SECRET": "from-the-broker",
+        }
+        module = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subagent_broker.py")
+        out = subprocess.run([sys.executable, module, self.dir, "--once"],
+                             capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("started scout", out.stdout)
+
+        self.assertTrue(wait_until(lambda: self.store.get("scout").done))
+        with open(received) as fh:
+            body = fh.read()
+        self.assertIn("env:BROKER_ONLY_SECRET=from-the-broker", body)
+        self.assertNotIn("BROKER_ONLY_SECRET", os.environ,
+                         "the test process had the variable, so this proves nothing")
 
 
 class TestCli(unittest.TestCase):

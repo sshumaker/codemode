@@ -26,6 +26,22 @@ a prompt string in, final text plus files out — because sharing the parent's k
 namespace would destroy token attribution, race on concurrent children, and let a
 crashing child corrupt the parent (DESIGN §Subagents).
 
+Who STARTS it, and why that is not this process
+-----------------------------------------------
+The child is a brain, and a brain holds a real API credential. The architecture
+(docs/CLOUD-HARNESS-DESIGN.md §3.3) puts brains harness-side and leaves the sandbox
+running python cells only, so `spawn` may not fork the child from the kernel: it
+would place a credential-holding model loop inside the sandbox and hand it the
+kernel's environment. With `HARNESS_KERNEL_ENV_SCRUB` in force that environment no
+longer has a key at all, and the child fails as a *weak subagent* rather than as a
+harness error.
+
+So with `HARNESS_SUBAGENT_BROKER=1` this writes a REQUEST (`jobs.submit(via_broker=
+True)`) and `runtime/subagent_broker.py`, running in the loop's world, starts the
+child detached. Nothing about the agent-facing surface moves: `spawn` still returns
+immediately, and the result still arrives through `jobs.get(name)`, because a
+brokered job records itself on disk exactly like any other job.
+
 Two properties fall out of "the child is a separate process":
 
 *   The parent cannot be wedged by a child. `spawn` returns the moment the job is
@@ -89,6 +105,24 @@ DEFAULT_TOOLS = os.environ.get("HARNESS_SUBAGENT_TOOLS", "ipython")
 DEFAULT_TIMEOUT = int(os.environ.get("HARNESS_SUBAGENT_TIMEOUT", "1800"))
 
 LAUNCHER = "subagent_run.py"
+
+# Set by a harness that runs `runtime/subagent_broker.py` alongside its loop. Off
+# by default, because a request nobody services is a job that never starts: the
+# runners that stage subagents INSIDE a container (bench/tac/run-task.mjs,
+# bench/terminal/prime_agent.py) put the whole brain in there deliberately and
+# have no harness side to broker from. The runner that has the split turns it on.
+BROKER_VAR = "HARNESS_SUBAGENT_BROKER"
+
+# Environment the child's own kernel needs in order to get the SAME boundary the
+# parent's kernel has. Under the broker the child inherits the broker's
+# environment, not the kernel's, so anything that defines the sandbox has to
+# travel in the spec or the child would quietly run less confined than its parent
+# — the one difference that must never appear by accident.
+BOUNDARY_VARS = (
+    "HARNESS_KERNEL_ENV_SCRUB",
+    "HARNESS_KERNEL_SANDBOX_SETTINGS",
+    "HARNESS_KERNEL_SANDBOX_BIN",
+)
 
 
 def _runtime_dir() -> str:
@@ -328,6 +362,40 @@ class Subagents:
             if rec and rec.get("kind") == "subagent" and rec.get("state") in _jobs.LIVE_STATES
         ]
 
+    def brokered(self) -> bool:
+        """Whether this harness starts children out here, or in the kernel."""
+        return str(self._env.get(BROKER_VAR, "")).strip() == "1"
+
+    def _check_credentials(self) -> None:
+        """
+        Refuse to fork a brain out of a kernel that has had its credentials taken.
+
+        This is the failure the broker exists to prevent, and it is worth an error
+        rather than an attempt: a child spawned from a scrubbed kernel inherits the
+        scrubbed environment, so it reaches the provider with no key and dies
+        inside its own loop. Measured shape of that (the smoke that motivated the
+        sandbox's provider allowance): "Connection error" x3 in the child, every
+        mechanism check on the parent's side green — a weak subagent, not a
+        harness fault, and nothing says otherwise.
+
+        Named vars only, and only ones the harness itself removed: this must not
+        start guessing which environment variable a provider needs.
+        """
+        if self.brokered():
+            return
+        scrubbed = [n.strip() for n in
+                    (self._env.get("HARNESS_KERNEL_ENV_SCRUB") or "").split(",") if n.strip()]
+        missing = [n for n in scrubbed if not self._env.get(n)]
+        if missing:
+            raise JobError(
+                f"this kernel cannot start a subagent: the harness removed {', '.join(missing)} "
+                f"from its environment, so a child started from here would run without "
+                f"credentials and fail inside its own loop.\n"
+                f"That is a harness configuration problem, not something to work around from a "
+                f"cell — the harness must run runtime/subagent_broker.py and set "
+                f"{BROKER_VAR}=1. Report it and do the work here instead."
+            )
+
     def _check_concurrency(self) -> None:
         live = self.live_children()
         if len(live) >= self._max_concurrent:
@@ -374,6 +442,7 @@ class Subagents:
         name = name.strip()
 
         self._check_depth()
+        self._check_credentials()
         self._check_concurrency()
 
         cfg = Agent.coerce(agent).merge(
@@ -408,6 +477,10 @@ class Subagents:
             expect="once",
             cwd=spec["cwd"],
             kind="subagent",
+            # The only line where the architecture shows through. Everything else
+            # — the argv, the spec, the caps, the collection — is identical either
+            # way, which is the point: what moved is who forks the child.
+            via_broker=self.brokered(),
             meta={
                 "model": spec["model"],
                 "tools": spec["tools"],
@@ -512,14 +585,26 @@ class Subagents:
         `_default_job_dir` exists to prevent) and its own agent home. The depth
         counter is what makes the grandchild guard work at all — the child reads it
         from here.
+
+        The boundary variables are carried for a different reason. Under the broker
+        the child's environment comes from the BROKER's process, not from this
+        kernel, so the sandbox settings and the env scrub that confine the parent's
+        kernel would not reach the child's unless they travel in the spec. A child
+        whose kernel is less confined than its parent's is the one divergence that
+        must never appear by accident — the child runs model-authored code too.
         """
-        return {
+        env = {
             DEPTH_VAR: str(self.depth() + 1),
             "HARNESS_JOB_DIR": os.path.join(child_dir, "jobs"),
             "HARNESS_JOB_CWD": "",  # inherit the child's own --cwd
             "PRIME_AGENT_CODING_AGENT_DIR": os.path.join(child_dir, "agent-home"),
             "HARNESS_PRELUDE_MARKER": os.path.join(child_dir, "prelude-status.txt"),
         }
+        for var in BOUNDARY_VARS:
+            value = self._env.get(var)
+            if value:
+                env[var] = value
+        return env
 
     def _inherited_prompt(self, tools: str) -> str:
         """

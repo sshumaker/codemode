@@ -116,8 +116,24 @@ DEATH_CONFIRM_SECONDS = float(os.environ.get("HARNESS_DEATH_CONFIRM_SECONDS", "1
 VALID_EXPECT = ("once", "stream")
 
 # States in which a job's process may exist. `starting` is the interval between
-# claiming the name on disk and recording the pid — see submit().
-LIVE_STATES = ("running", "starting")
+# claiming the name on disk and recording the pid — see submit(). `requested` is
+# the brokered equivalent: the record and the request file exist, and a
+# harness-side broker has not started the work yet (see submit(via_broker=True)
+# and runtime/subagent_broker.py).
+LIVE_STATES = ("running", "starting", "requested")
+
+# Where brokered requests live, under the job directory. A SUBDIRECTORY, because
+# `_all()` treats every `*.json` sibling of a job record as a job record — the
+# same trap a subagent's `<name>.meta.json` fell into and took the manifest down
+# with it.
+REQUESTS_DIR = "requests"
+
+# How long a request may sit unclaimed before the job is failed with an
+# explanation. Without this a run whose harness forgot to start a broker hangs
+# for the job's whole max_runtime (30 minutes for a subagent) and then reports an
+# ordinary deadline — a plausible number rather than an error, which is the
+# failure mode this project keeps paying for.
+CLAIM_TIMEOUT = int(os.environ.get("HARNESS_BROKER_CLAIM_TIMEOUT", "120"))
 
 
 class JobError(RuntimeError):
@@ -724,6 +740,7 @@ class JobStore:
         emit: Callable[[str], None] = print,
         max_wait: Optional[int] = None,
         min_wait: Optional[int] = None,
+        claim_timeout: Optional[int] = None,
     ):
         # Resolved HERE, not at import: module-level defaults froze the config at
         # class-definition time, so a host that re-targets HARNESS_JOB_DIR before
@@ -737,6 +754,8 @@ class JobStore:
         self._emit = emit
         self._max_wait = max_wait if max_wait is not None else int(os.environ.get("HARNESS_MAX_WAIT_SECONDS", "3600"))
         self._min_wait = min_wait if min_wait is not None else int(os.environ.get("HARNESS_MIN_WAIT_SECONDS", "60"))
+        self._claim_timeout = claim_timeout if claim_timeout is not None else int(
+            os.environ.get("HARNESS_BROKER_CLAIM_TIMEOUT", str(CLAIM_TIMEOUT)))
         # Intern handles by name so aliases resolve to one object (§5 aliasing).
         self._handles: Dict[str, Job] = {}
         os.makedirs(self.job_dir, exist_ok=True)
@@ -763,6 +782,86 @@ class JobStore:
         reported by anything held in memory.
         """
         return os.path.join(self.job_dir, f"{name}.pid")
+
+    # -- brokered requests ------------------------------------------------------
+    #
+    # A brokered job is recorded here and STARTED SOMEWHERE ELSE. The reason is
+    # architectural rather than mechanical (docs/CLOUD-HARNESS-DESIGN.md §3.3):
+    # a subagent is a brain, brains hold the real credentials, and the kernel is
+    # the one place where model-authored code runs. `spawn` therefore may not fork
+    # the child from the kernel — it leaves a request, and the harness-side broker
+    # starts it in the loop's world.
+    #
+    # The request file IS the exactly-once token: a broker claims it by renaming
+    # it, and rename is the only primitive here that two processes cannot both
+    # win. Same shape as the scheduler's `wake.json` -> `wake.json.fired`.
+
+    def _requests_dir(self) -> str:
+        return os.path.join(self.job_dir, REQUESTS_DIR)
+
+    def _request_path(self, name: str) -> str:
+        return os.path.join(self._requests_dir(), f"{name}.json")
+
+    def _write_request(self, rec: dict, wrapped: str) -> str:
+        """
+        Everything a broker needs to start this job, and nothing it has to infer.
+
+        Self-contained on purpose: the broker never parses a job record, so the
+        two sides cannot disagree about what was asked for, and the request is
+        replayable evidence after the fact.
+        """
+        os.makedirs(self._requests_dir(), exist_ok=True)
+        payload = {
+            "name": rec["name"],
+            "kind": rec.get("kind", "job"),
+            # The wrapper, not the bare command: the pid file and the exit marker
+            # are how a job becomes observable from disk, and a broker that
+            # launched the raw command would produce a job nothing can refresh.
+            "wrapped": wrapped,
+            "cmd": rec["cmd"],
+            "log": rec["log"],
+            "exit_marker": rec["exit_marker"],
+            "pid_file": rec["pid_file"],
+            "cwd": rec.get("cwd"),
+            "job_dir": self.job_dir,
+            "record": self._path(rec["name"]),
+            "requested_at": rec["started_at"],
+            "max_runtime": rec.get("max_runtime"),
+        }
+        path = self._request_path(rec["name"])
+        tmp = f"{path}.writing"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dfd = os.open(self._requests_dir(), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+        return path
+
+    def _cancel_request(self, rec: dict) -> bool:
+        """
+        Void an unclaimed request. True only if THIS call voided it.
+
+        By rename, for the same reason a broker claims by rename: kill() and a
+        broker can race, and exactly one of them must win. A cancel that lost the
+        race means the work was already started, which the caller must then
+        report honestly rather than claiming nothing happened.
+        """
+        path = rec.get("request_file")
+        if not path:
+            return False
+        try:
+            os.rename(path, f"{path}.cancelled")
+            return True
+        except OSError:
+            return False
 
     def _read(self, name: str) -> Optional[dict]:
         try:
@@ -859,37 +958,86 @@ class JobStore:
         # only two things that can say are written by the job itself: its pid file and
         # its exit marker. Adopt the pid the moment it appears, so a recovered job is an
         # ordinary running job — killable, and not a special case anywhere else.
-        if rec.get("state") == "starting":
+        #
+        # A `requested` record is the brokered case, and it adopts the pid by the
+        # same route for the same reason: the process was started by a broker this
+        # kernel never saw, so the only thing that can name it is the file the job
+        # writes about itself. One mechanism, two ways of being started.
+        if rec.get("state") in ("starting", "requested"):
             try:
                 with open(self._pid_path(rec["name"])) as fh:
                     rec["pid"] = int(fh.read().strip())
                 rec["pid_start"] = self._probe(rec["pid"])[1]
+                rec["reason"] = (
+                    "started by the harness-side broker"
+                    if rec["state"] == "requested"
+                    else "recovered: submit was interrupted after this job started"
+                )
                 rec["state"] = "running"
-                rec["reason"] = "recovered: submit was interrupted after this job started"
                 self._write(rec)
             except (OSError, ValueError):
                 pass
         marker = rec.get("exit_marker")
         if marker and os.path.exists(marker):
+            # An EMPTY marker is not an exit code — it is a marker mid-write.
+            # `echo $? > marker` creates the file and fills it an instant later,
+            # so a refresh landing in between used to read `int("" or "-1")` and
+            # record `done, exit -1, exited non-zero` for a perfectly healthy job,
+            # permanently, because a terminal state is never refreshed again.
+            # Measured as an intermittent failure of the subagent CLI round-trip:
+            # exitCode -1 from a child that had exited 0, which appeared only once
+            # the suite ran enough processes to make the window likely.
+            #
+            # Empty therefore means "not finished YET" and falls through to the
+            # checks below — including the liveness fallback, so a marker that
+            # never fills becomes `died` with the log as evidence rather than
+            # hanging. (An early return here does hang: my first version of this
+            # skipped the fallback, and the test for it caught that.)
+            #
+            # Non-empty but unparseable is a different thing: `echo $?` writes
+            # digits, so garbage is corruption rather than a partial write, and it
+            # stays `done` with a null exit code — the job is over and the code is
+            # unknown, which is what the caller needs to hear.
+            text = ""
             try:
                 with open(marker) as fh:
-                    rec["exit_code"] = int((fh.read().strip() or "-1"))
-            except (OSError, ValueError):
-                rec["exit_code"] = None
-            rec["state"] = "done"
-            rec["reason"] = "completed" if rec.get("exit_code") == 0 else "exited non-zero"
-            rec["finished_at"] = self._now()
-            # Also on the way out, not only while running. Otherwise the byte count
-            # freezes at whatever the last refresh saw — and a job never observed
-            # while running is reported as "0 bytes" forever, which reads as "it
-            # produced nothing" about a job that produced everything. Visible the
-            # moment subagents made the log worth reading.
-            rec["events"] = self._log_bytes(rec)
-            rec["output_tail"] = self._read_log(rec)[-4000:]
-            self._write(rec)
-            return rec
+                    text = fh.read().strip()
+            except OSError:
+                text = ""
+            if text:
+                try:
+                    rec["exit_code"] = int(text)
+                except ValueError:
+                    rec["exit_code"] = None
+                rec["state"] = "done"
+                rec["reason"] = "completed" if rec.get("exit_code") == 0 else "exited non-zero"
+                rec["finished_at"] = self._now()
+                # Also on the way out, not only while running. Otherwise the byte
+                # count freezes at whatever the last refresh saw — and a job never
+                # observed while running is reported as "0 bytes" forever, which
+                # reads as "it produced nothing" about a job that produced
+                # everything. Visible the moment subagents made the log worth
+                # reading.
+                rec["events"] = self._log_bytes(rec)
+                rec["output_tail"] = self._read_log(rec)[-4000:]
+                self._write(rec)
+                return rec
 
         elapsed = self._now() - rec["started_at"]
+
+        # A request nobody claimed. The record is real, the work is not, and the
+        # difference is invisible from the manifest — "requested" reads like
+        # "about to start" for as long as you leave it. Say it instead, and say
+        # what is missing, because the fix is on the harness side and the agent
+        # cannot make it.
+        if rec.get("state") == "requested" and elapsed >= self._claim_timeout:
+            if os.path.exists(rec.get("request_file") or ""):
+                self._terminate(rec, state="deadline", reason=(
+                    f"no broker claimed this request in {int(elapsed)}s, so it never started. "
+                    f"The harness must run runtime/subagent_broker.py against {self.job_dir} "
+                    f"(it is what starts brokered jobs; the kernel deliberately cannot)"))
+                return self._read(rec["name"]) or rec
+
         limit = rec.get("max_runtime")
         if limit and elapsed > limit:
             # max_runtime is about the work, not the agent's attention. A deadline
@@ -964,7 +1112,12 @@ class JobStore:
                     self._kill(pid)
                 except OSError:
                     pass
-        elif rec.get("state") == "starting":
+        elif self._cancel_request(rec):
+            # Won the race against the broker: the request is void and no process
+            # was ever started. This is the one branch that can say "nothing is
+            # running" and mean it.
+            reason = f"{reason}; the request was cancelled before any broker claimed it, so nothing was started"
+        elif rec.get("state") in ("starting", "requested"):
             # Nothing to signal, and saying "killed" without qualification would be a
             # lie in the one case where it matters: the job may be running and simply
             # never got as far as writing its pid. Record what was actually done.
@@ -990,6 +1143,7 @@ class JobStore:
         strict: bool = True,
         kind: str = "job",
         meta: Optional[dict] = None,
+        via_broker: bool = False,
     ) -> Job:
         """
         Start work that outlives this cell and this kernel.
@@ -1002,6 +1156,14 @@ class JobStore:
         subagent as `kind="subagent"` with the child's paths in `meta`, which is what
         makes a subagent a job rather than a parallel mechanism. Both are recorded
         verbatim and are not part of the agent-facing surface.
+
+        `via_broker` records the job and leaves a REQUEST instead of forking it
+        here. Everything downstream — the handle, `get`, `wait`, the manifest,
+        recovery in a fresh kernel — is unchanged, because a brokered job records
+        itself on disk exactly like any other. What changes is who starts it, and
+        that is the whole point: the kernel is where model-authored code runs, so
+        it must not be where a process holding real credentials is forked
+        (docs/CLOUD-HARNESS-DESIGN.md §3.3).
         """
         if callable(payload):
             raise TypeError(
@@ -1023,6 +1185,11 @@ class JobStore:
         if existing and existing.get("state") == "running":
             raise JobError(
                 f"job {name!r} is already running. Use a different name, or jobs.kill({name!r}) first."
+            )
+        if existing and existing.get("state") == "requested":
+            raise JobError(
+                f"job {name!r} was already requested and is waiting for the harness to start it. "
+                f"Use a different name, or jobs.kill({name!r}) to cancel it first."
             )
         # `starting` means a previous submit of this name was interrupted, and whether
         # its work is running is unknown. Refusing is the whole protection: silently
@@ -1074,7 +1241,9 @@ class JobStore:
             "log": log,
             "exit_marker": marker,
             "pid_file": pidfile,
-            "state": "starting",
+            "cwd": cwd or self._cwd,
+            "state": "requested" if via_broker else "starting",
+            "request_file": self._request_path(name) if via_broker else None,
             "reason": None,
             "started_at": self._now(),
             "max_runtime": parse_duration(max_runtime) if max_runtime is not None else None,
@@ -1112,6 +1281,27 @@ class JobStore:
             f"echo $$ > {shlex.quote(pidfile)} ; "
             f"( {command} ) ; echo $? > {shlex.quote(marker)}"
         )
+
+        if via_broker:
+            # Record first, request second — the same asymmetry as record-before-
+            # spawn, one level up. A request with no record would be work nothing
+            # knows about; a record with no request is a job that visibly never
+            # started, which `_refresh`'s claim timeout then explains.
+            try:
+                self._write_request(rec, wrapped)
+            except OSError as exc:
+                self._terminate(rec, state="killed",
+                                reason=f"the broker request could not be written: {exc}")
+                raise JobError(
+                    f"jobs.submit({name!r}) could not leave a request for the harness "
+                    f"to start ({exc}), so nothing will run."
+                ) from exc
+            if problems and not strict:
+                for code, msg in problems:
+                    self._emit(f"[warn {code}] {msg}")
+            self._emit(f"requested {name}; the harness will start it. log {log}")
+            return self._handle(name)
+
         try:
             pid = self._spawn(wrapped, log, cwd or self._cwd)
         except BaseException:

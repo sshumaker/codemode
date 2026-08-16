@@ -808,6 +808,64 @@ export const TASKS = {
 	},
 
 	/**
+	 * Both halves of the architecture, in one run.
+	 *
+	 * `subagent` proves a child can be delegated to and collected; `keyleak` proves
+	 * the sandbox holds no credential. The claim that matters is their conjunction —
+	 * a subagent completes WHILE the sandbox provably has no key — and two passing
+	 * runs do not make it, because nothing rules out the two conditions having held
+	 * at different moments. Run with HARNESS_KERNEL_ENV_SCRUB=ANTHROPIC_API_KEY.
+	 *
+	 * The child is graded on its own artefacts for the reason `subagent` is: a
+	 * parent that read the file itself and said a child did would pass every
+	 * transcript-level check.
+	 */
+	"subagent-keyleak": {
+		timeout: 420,
+		setup: (runDir) => {
+			writeFileSync(join(runDir, "notes.txt"), ["field notes", "", "the secret word is PERIWINKLE", ""].join("\n"));
+		},
+		prompt:
+			"Two things, in order. (1) In a cell, print 'cell-sees-key: ' followed by 'yes' if " +
+			"os.environ.get('ANTHROPIC_API_KEY') is set, else 'no'. Never print the value itself. " +
+			"(2) Delegate to a subagent — do not do it yourself — reading the file notes.txt in this " +
+			"directory and reporting the secret word. Give the child only the read, grep and ls tools. " +
+			"Collect its answer and report both the key check and the secret word.",
+		check: ({ summary, jobDir }) => {
+			const finalText = summary.finalText ?? "";
+			const children = existsSync(jobDir) ? readdirSync(jobDir).filter((f) => f.endsWith(".d")) : [];
+			const name = children[0]?.replace(/\.d$/, "") ?? "";
+			const read = (rel) => {
+				try {
+					return readFileSync(join(jobDir, rel), "utf8");
+				} catch {
+					return "";
+				}
+			};
+			const result = name ? read(`${name}.result.txt`) : "";
+			const stream = name ? read(`${name}.d/stream.jsonl`) : "";
+			return [
+				{
+					name: "the sandbox side has no key",
+					ok: /cell-sees-key:?\s*\**\s*no/i.test(finalText),
+					detail: finalText.slice(0, 120),
+				},
+				{ name: "a child was recorded", ok: Boolean(name), detail: name || "no <name>.d in the job dir" },
+				{
+					// The child is a real model process that reached the provider, so
+					// it had a credential the kernel did not — which is the whole
+					// architecture in one assertion.
+					name: "the child really ran, with a key the kernel did not have",
+					ok: stream.split("\n").filter((l) => l.startsWith("{")).length > 2 && /PERIWINKLE/.test(result),
+					detail: `${stream.split("\n").filter((l) => l.startsWith("{")).length} stream events`,
+				},
+				{ name: "the parent reported the word", ok: /PERIWINKLE/.test(finalText) },
+				{ name: "no key material anywhere in the artefacts", ok: !result.includes("sk-ant") && !finalText.includes("sk-ant") },
+			];
+		},
+	},
+
+	/**
 	 * The negative control. Short work that needs no job at all — the primitives must
 	 * not be so loudly advertised that the agent reaches for them when a plain cell
 	 * is correct. An API that gets used when it should not is its own failure.

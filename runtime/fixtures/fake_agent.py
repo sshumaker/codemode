@@ -13,6 +13,11 @@ Behaviour is driven by the environment so one fixture covers every case:
     FAKE_EXIT=2     exit with this code
     FAKE_DELAY=0.5  seconds between turns
     FAKE_WRITE=path write the received prompt here (proves argv delivery and cwd)
+    FAKE_REPORT_ENV=VAR  also record this variable's value from the child's own
+                    environment. Which environment a child inherits is the whole
+                    subagent-broker question, and it is answerable offline: a
+                    variable present only in the broker's environment shows up
+                    here if and only if the broker started the child.
 
 The trailing argument is the prompt, exactly as the real CLI takes it.
 """
@@ -35,8 +40,12 @@ def main():
     print("(node:1) ExperimentalWarning: fake agent", flush=True)
 
     if os.environ.get("FAKE_WRITE"):
+        reported = ""
+        if os.environ.get("FAKE_REPORT_ENV"):
+            var = os.environ["FAKE_REPORT_ENV"]
+            reported = f"\n---\nenv:{var}={os.environ.get(var, '')}"
         with open(os.environ["FAKE_WRITE"], "w") as fh:
-            fh.write(prompt + "\n---\n" + " ".join(args) + "\n---\ncwd=" + os.getcwd())
+            fh.write(prompt + "\n---\n" + " ".join(args) + "\n---\ncwd=" + os.getcwd() + reported)
 
     turns = int(os.environ.get("FAKE_TURNS", "1"))
     delay = float(os.environ.get("FAKE_DELAY", "0"))

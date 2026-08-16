@@ -116,6 +116,47 @@ from the base-harness audit: prime's `resolve-config-value.ts:29-33` executes
 credential values beginning with `!` as shell — the coupled pattern's
 credential story is exactly what we must not inherit.)
 
+### 3.4 Subagent spawn is a request, not a fork
+
+The credential rule above has one consequence sharp enough to name: **a subagent
+is a brain**, so it may not be started from the kernel. `spawn()` originally
+`Popen`'d the child's prime loop as a descendant of the kernel, which put a
+credential-holding model loop inside the sandbox and handed it the kernel's
+environment — and once that environment is scrubbed (`HARNESS_KERNEL_ENV_SCRUB`,
+eval task `keyleak`) the child fails as a *weak subagent* rather than as a
+harness error, which is the failure shape this project keeps paying for.
+
+So `spawn()` writes a REQUEST (`jobs.submit(via_broker=True)`, job state
+`requested`) and `runtime/subagent_broker.py` — running in the loop's world, with
+the loop's environment — claims it and starts the child `setsid`-detached, so it
+outlives the broker, the loop and the kernel. **The agent-facing API does not
+move**: `spawn` still returns immediately, and the result still arrives through
+`jobs.get(name)`, because a brokered job records itself on disk exactly like any
+other job (pid file, exit marker, log).
+
+Exactly-once is the request file itself: brokers claim by `rename`, which two
+processes cannot both win — the same token the scheduler's `wake.json` ->
+`wake.json.fired` uses. A pre-fork *intent* marker makes the one genuinely
+ambiguous window nameable from disk, so recovery never has to guess:
+
+| a dead broker left | what a fresh broker does |
+|---|---|
+| claim, no intent | nothing was forked — reclaim and launch |
+| intent + pid file / exit marker | it launched — adopt, never relaunch |
+| intent, neither | unknowable — fail the job and say so, do not retry |
+
+The last row is `submit`'s `starting` rule one level up: refuse to double-run, and
+make the ambiguity visible instead of resolving it by guessing. Pinned by
+`runtime/test_chaos.py::TestBrokerServicesEachRequestExactlyOnce`, including a
+real broker SIGKILLed at each stage of the chain.
+
+Wired today in `runtime/eval/run.mjs` only. The in-container runners
+(`bench/tac/run-task.mjs`, `bench/terminal/prime_agent.py`) put the whole brain
+inside the sandbox deliberately and have no harness side to broker from, so they
+keep the direct path; a kernel that has had credentials scrubbed and no broker
+configured now refuses to spawn rather than producing a child that cannot reach
+the provider.
+
 ## 4. What we take from prime, what we drop
 
 **Take:**

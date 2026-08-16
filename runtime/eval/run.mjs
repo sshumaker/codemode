@@ -174,15 +174,16 @@ if (sandboxed) {
 					// The kernel needs nothing off-box. Anything it reaches for is either a
 					// tool-surface bypass or an accident, and both are worth recording.
 					//
-					// EXCEPT a subagent. `spawn` starts a real model process as a child of
-					// the kernel, so it inherits this sandbox — and on Linux srt removes the
-					// network namespace entirely, so the child cannot reach the provider AT
-					// ALL. That surfaces inside the child as an API error, i.e. as a weak
-					// subagent rather than as a harness fault — measured: the first real
-					// smoke's child died on "Connection error" x3 while every mechanism
-					// check passed. So when subagents are ON, the provider domain (and
-					// only it) is allowed; with them off the list stays empty.
-					allowedDomains: subagents ? ["api.anthropic.com"] : [],
+					// Empty even with subagents on, which it could not be before the
+					// broker. `spawn` used to fork the child FROM the kernel, so the child
+					// inherited this sandbox and could not reach the provider at all —
+					// measured: the first real smoke's child died on "Connection error" x3
+					// while every mechanism check on the parent passed. The hole that
+					// bought was a real one: a cell could reach the provider directly.
+					// Now the child is started by the harness-side broker and is not
+					// inside this sandbox at all, so nothing on this side needs the
+					// provider and the allowance goes away.
+					allowedDomains: [],
 					deniedDomains: [],
 					// ipykernel speaks ZMQ over loopback to the agent, so local binding has
 					// to stay open or the kernel cannot be reached at all.
@@ -230,12 +231,7 @@ let stderr = "";
 const counted = new Set();
 
 // The agent itself is NOT wrapped — only the kernel it spawns is (see above).
-const child = spawn(
-	"bash",
-	[launchScript],
-	{
-		cwd: runDir,
-		env: {
+const runEnv = {
 			...process.env,
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_TELEMETRY: "0",
@@ -250,7 +246,13 @@ const child = spawn(
 			// environment variable. `spawn` refuses rather than guessing, so this is
 			// what makes it usable at all. The CLI resolves from the repo checkout;
 			// naming it here means a run is reproducible from its own env dump.
-			...(subagents ? { HARNESS_SUBAGENTS: "1", HARNESS_SUBAGENT_MODEL: model, HARNESS_SUBAGENT_CLI: CLI } : {}),
+			// HARNESS_SUBAGENT_BROKER: the kernel leaves a request and the broker
+			// below starts the child out here. The kernel deliberately cannot do
+			// it — a subagent is a brain holding a real credential, and this run's
+			// kernel may have had that credential scrubbed away.
+			...(subagents
+				? { HARNESS_SUBAGENTS: "1", HARNESS_SUBAGENT_MODEL: model, HARNESS_SUBAGENT_CLI: CLI, HARNESS_SUBAGENT_BROKER: "1" }
+				: {}),
 			...(argv.includes("--adopt-bg") || argv.includes("--adopt-quiet") ? { HARNESS_ADOPT_BACKGROUND: "1" } : {}),
 			...(argv.includes("--adopt-quiet") ? { HARNESS_ADOPT_QUIET: "1" } : {}),
 			// Read by the patched kernel spawn; absent means no sandbox.
@@ -277,14 +279,46 @@ const child = spawn(
 			// work, which is the only thing that actually forces a poll loop — see the
 			// note on that task.
 			...(task.env ?? {}),
-		},
-		stdio: ["ignore", "pipe", "pipe"],
-	},
-);
+};
+
+/**
+ * The broker: the harness-side half of `spawn()` (runtime/subagent_broker.py).
+ *
+ * It runs out here, in the loop's world, for the reason the whole change exists:
+ * it starts model processes, and a model process holds a real credential while
+ * the kernel must not. Through its own launch script so it gets the same env
+ * FILE as the agent — `process.env` does not contain the key (launch.sh sources
+ * it), and a broker without it would start children that die on "Connection
+ * error" inside their own loops, which reads as a weak subagent rather than as a
+ * misconfigured harness.
+ *
+ * The children it starts are setsid-detached, so they outlive it, this process,
+ * and the kernel.
+ */
+let brokerProc;
+if (subagents) {
+	const brokerScript = join(runDir, "broker.sh");
+	writeFileSync(
+		brokerScript,
+		`#!/bin/bash\nset -a\n. ${shq(envFile)}\nset +a\n` +
+			`exec python3 ${shq(join(RUNTIME, "subagent_broker.py"))} ${shq(jobDir)} --interval 0.5\n`,
+		{ mode: 0o755 },
+	);
+	const brokerOut = createWriteStream(join(runDir, "broker.log"));
+	brokerProc = spawn("bash", [brokerScript], { cwd: runDir, env: runEnv, stdio: ["ignore", "pipe", "pipe"] });
+	brokerProc.stdout.pipe(brokerOut);
+	brokerProc.stderr.pipe(brokerOut);
+}
+const stopBroker = () => {
+	if (brokerProc && brokerProc.exitCode === null) brokerProc.kill("SIGKILL");
+};
+
+const child = spawn("bash", [launchScript], { cwd: runDir, env: runEnv, stdio: ["ignore", "pipe", "pipe"] });
 
 const killer = setTimeout(() => {
 	summary.timedOut = true;
 	child.kill("SIGKILL");
+	stopBroker();
 }, timeoutSec * 1000);
 
 // --- killing the kernel out from under the agent --------------------------------
@@ -496,6 +530,8 @@ function blockingShellSleep(sources) {
 child.on("close", (code) => {
 	clearTimeout(killer);
 	if (kernelWatchdog) clearInterval(kernelWatchdog);
+	// The broker is per-run; the children it started are not (setsid).
+	stopBroker();
 	summary.sandboxed = sandboxed;
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;
