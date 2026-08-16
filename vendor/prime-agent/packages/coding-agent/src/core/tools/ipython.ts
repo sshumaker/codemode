@@ -858,7 +858,16 @@ export function createIpythonToolDefinition(
 						waitMatch[0],
 						`[wait armed: this process now exits; you will be re-invoked the moment the job finishes or the deadline passes]`,
 					);
-					setTimeout(() => process.exit(0), Number(process.env.HARNESS_WAIT_EXIT_GRACE_MS ?? 1500));
+					setTimeout(() => {
+						// Take the kernel down with us: a bare process.exit orphans the
+						// ipykernel child — harmless per bench run, a per-wake process
+						// leak on a long-lived host. dispose() also drops an in-flight
+						// boot; the race caps a hung shutdown so the exit is never held.
+						void Promise.race([
+							provisioner.dispose(),
+							new Promise((resolve) => setTimeout(resolve, 3000)),
+						]).finally(() => process.exit(0));
+					}, Number(process.env.HARNESS_WAIT_EXIT_GRACE_MS ?? 1500));
 				} else if (waitMatch) {
 					const secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));
 					setToolWorkingMessage(`waiting ${secs}s (kernel released)`);

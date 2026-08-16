@@ -341,7 +341,16 @@ sub(
 		"\t\t\t\t\t\twaitMatch[0],\n" +
 		"\t\t\t\t\t\t`[wait armed: this process now exits; you will be re-invoked the moment the job finishes or the deadline passes]`,\n" +
 		"\t\t\t\t\t);\n" +
-		"\t\t\t\t\tsetTimeout(() => process.exit(0), Number(process.env.HARNESS_WAIT_EXIT_GRACE_MS ?? 1500));\n" +
+		"\t\t\t\t\tsetTimeout(() => {\n" +
+		"\t\t\t\t\t\t// Take the kernel down with us: a bare process.exit orphans the\n" +
+		"\t\t\t\t\t\t// ipykernel child — harmless per bench run, a per-wake process\n" +
+		"\t\t\t\t\t\t// leak on a long-lived host. dispose() also drops an in-flight\n" +
+		"\t\t\t\t\t\t// boot; the race caps a hung shutdown so the exit is never held.\n" +
+		"\t\t\t\t\t\tvoid Promise.race([\n" +
+		"\t\t\t\t\t\t\tprovisioner.dispose(),\n" +
+		"\t\t\t\t\t\t\tnew Promise((resolve) => setTimeout(resolve, 3000)),\n" +
+		"\t\t\t\t\t\t]).finally(() => process.exit(0));\n" +
+		"\t\t\t\t\t}, Number(process.env.HARNESS_WAIT_EXIT_GRACE_MS ?? 1500));\n" +
 		"\t\t\t\t} else if (waitMatch) {\n" +
 		"\t\t\t\t\tconst secs = Math.min(Number(waitMatch[1]), Number(process.env.HARNESS_MAX_WAIT_SECONDS ?? 3600));\n" +
 		"\t\t\t\t\tsetToolWorkingMessage(`waiting ${secs}s (kernel released)`);\n" +
