@@ -444,3 +444,10 @@ identical runId — the runId-collision class, applied to disk. The pre-crank
 same-tag evidence for these two tasks is gone; the comparison above uses the
 nearest-config runs. A date component in the run dir (or refusing to overwrite
 a dir with a different code version) would preserve the pair next time.
+
+**Aggregate confirmation (same evening):** fresh 46-task draw (seed 77), same
+config, post-crank tree: **TGC 46/46, $0.4569/task, ctx0 6565, 16.0 turns** —
+vs the pre-crank held-out's 44/46 @ ~$0.45. `a53a8fd_1` appears in this draw
+and PASSED 10/10 with unchanged code, directly confirming the selection-slip/
+noise diagnosis above. Both directions of n-discipline apply: 46/46 is the
+happy side of the same noise band, not an improvement claim.
