@@ -157,7 +157,7 @@ const BUSY_KERNEL_PROMPT = [
 ].join("\n");
 const KERNEL_DEATH_NOTICE = [
 	"<ipython_kernel_restarted>",
-	"The IPython kernel process died and a fresh one was started. Every variable, import and in-memory object defined before this point is gone; recreate anything you still need.",
+	"The IPython kernel process died and a fresh one was started. Every variable, import and in-memory object defined before this point is gone; recreate anything you still need. Nothing outside the process was lost: your files and this working directory are intact on disk, and background jobs kept running — `jobs.manifest()` lists them, `jobs.get('<name>')` reaches one.",
 	"</ipython_kernel_restarted>",
 ].join("\n");
 const KERNEL_RESTART_NOTICE = [

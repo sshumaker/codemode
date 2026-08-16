@@ -303,6 +303,118 @@ export const TASKS = {
 	},
 
 	/**
+	 * 1b. EVICTION. Kernel death with BOTH kinds of survivor: running jobs AND disk state.
+	 *
+	 * `kernel-death` proves a single job outlives the kernel. A pruned/evicted kernel in
+	 * the hosted design (CLOUD-HARNESS-DESIGN.md §3.2) additionally strands the agent's
+	 * own files — and the announcement now promises they survived. This task makes that
+	 * promise load-bearing: the agent mints a random token to a file BEFORE the kill, so
+	 * after the restart the token exists nowhere but on disk (memory is gone by
+	 * construction). Reporting the right token at the end is proof the agent trusted the
+	 * announcement and read its file back rather than regenerating.
+	 *
+	 * Two jobs instead of one, so the recovery isn't "poll the one thing I remember":
+	 * the fresh kernel's manifest names both, and both must finish exactly once. Every
+	 * script appends a START line to its own trace, so a redo is a property of the
+	 * artefact, not an inference from the transcript.
+	 */
+	eviction: {
+		killKernel: true,
+		timeout: 480,
+		prompt:
+			"First run `bash mktoken.sh` — it prints a session token and saves it to token.txt; " +
+			"you will need to report that token at the very end. Then run the two analyses, " +
+			"`bash analyse-a.sh` and `bash analyse-b.sh`, as jobs — they take roughly 40 and 55 " +
+			"seconds and are independent, so run them concurrently. When both have finished, " +
+			"report the token and each analysis's RESULT line exactly. All three scripts are " +
+			"expensive and non-reproducible: each must run exactly once.",
+		setup: (runDir) => {
+			// Same nonce-trace pattern as kernel-death: outputs are unguessable, redos are
+			// countable. The token is the files-survived probe; the analyses are the
+			// jobs-survived probe.
+			writeFileSync(
+				join(runDir, "mktoken.sh"),
+				"#!/bin/bash\n" +
+					'echo "START $(date +%s) pid=$$" >> token.trace\n' +
+					"tok=\"TOKEN-$(od -An -N4 -tx1 /dev/urandom | tr -d ' ')\"\n" +
+					'echo "$tok" > token.txt\n' +
+					'echo "$tok"\n',
+				{ mode: 0o755 },
+			);
+			for (const [name, secs] of [["a", 8], ["b", 11]]) {
+				writeFileSync(
+					join(runDir, `analyse-${name}.sh`),
+					"#!/bin/bash\n" +
+						`echo "START $(date +%s) pid=$$" >> ${name}.trace\n` +
+						`for i in $(seq 1 ${secs}); do echo "step-$i"; sleep 5; done\n` +
+						`echo "RESULT-${name.toUpperCase()}-$(od -An -N3 -tx1 /dev/urandom | tr -d ' ')" > ${name}.out\n` +
+						`echo "FINISH $(date +%s)" >> ${name}.trace\n`,
+					{ mode: 0o755 },
+				);
+			}
+		},
+		check: ({ summary, runDir }) => {
+			const read = (f) => (existsSync(join(runDir, f)) ? readFileSync(join(runDir, f), "utf8") : "");
+			const starts = (f) => (read(f).match(/^START /gm) ?? []).length;
+			const token = read("token.txt").trim();
+			const outA = read("a.out").trim();
+			const outB = read("b.out").trim();
+			const finalText = summary.finalText ?? "";
+			return [
+				{ name: "used jobs.submit", ok: summary.used.submit },
+				{
+					name: "the kernel was actually killed",
+					ok: (summary.kernelKill?.killed ?? []).length > 0,
+					detail: summary.kernelKill
+						? `${summary.kernelKill.killed.length} pid(s) at cell ${summary.kernelKill.atCell}`
+						: "watchdog never fired — no kernel process matched",
+				},
+				{
+					name: "was told the kernel restarted",
+					ok: summary.restartNotices.length > 0,
+					detail: `restart notices ${summary.restartNotices.length}, prelude announcements ${summary.preludeAnnouncements.length}`,
+				},
+				{
+					// The prelude's stdout announcement never reaches the model (startup
+					// output has no parent cell), so the death notice is the ONLY channel
+					// for "here is what survived". An agent with a compacted context has
+					// nothing else. Grep the stream the model actually received.
+					name: "the notice it saw named the survivors (jobs + files)",
+					ok: (() => {
+						const s = read("stream.jsonl");
+						return /kernel_restarted[\s\S]{0,600}?jobs\.manifest\(\)/.test(s) && /kernel_restarted[\s\S]{0,600}?intact/.test(s);
+					})(),
+				},
+				{
+					name: "cells kept succeeding after the kill",
+					ok: (summary.cellsAfterKernelKill ?? 0) > 0,
+					detail: `${summary.cellsAfterKernelKill ?? 0} ok / ${summary.failedCellsAfterKernelKill ?? 0} failed after the kill`,
+				},
+				{
+					// The files-survived probe. The kill destroyed every variable, so a
+					// correct token in the final answer has exactly one possible source:
+					// token.txt, minted once (START count) and read back after the restart.
+					name: "reported the pre-kill token from disk, minted exactly once",
+					ok: token.length > 0 && finalText.includes(token) && starts("token.trace") === 1,
+					detail: `token ${token || "missing"}, minted ${starts("token.trace")} time(s)`,
+				},
+				{
+					name: "analysis A ran exactly once and its result was reported",
+					ok: starts("a.trace") === 1 && outA.length > 0 && finalText.includes(outA),
+					detail: `${starts("a.trace")} start(s), out=${outA || "missing"}`,
+				},
+				{
+					name: "analysis B ran exactly once and its result was reported",
+					ok: starts("b.trace") === 1 && outB.length > 0 && finalText.includes(outB),
+					detail: `${starts("b.trace")} start(s), out=${outB || "missing"}`,
+				},
+				{ name: "did not block a cell with sleep", ok: !summary.used.sleep },
+				{ name: "did not spawn a thread", ok: !summary.used.thread },
+			];
+		},
+	},
+
+	/**
 	 * 2. CONCURRENCY. Four jobs that must genuinely overlap.
 	 *
 	 * `broadcast` above already asks three colleagues at once, but the work is done by

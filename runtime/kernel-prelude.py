@@ -968,7 +968,8 @@ def _announce_existing_jobs():
     # exactly the state a fresh kernel is most likely to be looking at.
     live = [r for r in rows if r.get("state") in jobs.LIVE_STATES]
     print(f"[{len(rows)} job(s) from a previous kernel, {len(live)} still running — "
-          f"reach them with jobs.get('<name>')]")
+          f"reach them with jobs.get('<name>'). Only in-memory variables were lost: "
+          f"your files, the job logs and this working directory are intact on disk.]")
     print(jobs.manifest())
 
 

@@ -154,6 +154,30 @@ class PreludeBase(unittest.TestCase):
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+class TestEvictionAnnouncement(PreludeBase):
+    """The fresh-kernel announcement IS the eviction experience: it must name
+    the surviving jobs and say the filesystem survived — an evicted agent's
+    first question is 'what do I still have?', and the answer must not require
+    guessing (docs/CLOUD-HARNESS-DESIGN.md §3.2)."""
+
+    def test_announcement_names_live_jobs_and_says_files_survive(self):
+        self.store.submit("make build", name="build")
+        self.store.submit("python train.py", name="train")
+        captured = []
+        load_prelude(capture=captured)
+        text = "\n".join(captured)
+        self.assertIn("2 still running", text)
+        self.assertIn("jobs.get(", text)
+        self.assertIn("intact on disk", text)
+        self.assertIn("build", text)   # the manifest names each job
+        self.assertIn("train", text)
+
+    def test_no_jobs_no_noise(self):
+        captured = []
+        load_prelude(capture=captured)
+        self.assertFalse(any("previous kernel" in l for l in captured))
+
+
 class TestStartupFilePath(PreludeBase):
     """
     The prelude must survive being run as an IPython startup file, where `__file__`
