@@ -63,14 +63,37 @@ Tests at handoff: **489 JS + 301 Python, green** (ran ×2–3 for flake checks).
    (100 api) both PASS · final assembled-tree canary 2/2 PASS. ctx0 ~6.5k and
    costs in the normal band throughout.
 
+## Scheduler demo: DONE — Phase 3 accepted (2026-08-15)
+
+`compile-compcert`, `--wait-mode exit`, run `scheduler-compcert-demo5`:
+**PASS, tier CLEAN** — 27 turns / 27 tool calls / **$0.387** / 643s,
+**wakes=6 (every one evidence-driven — including a wake on a FAILED opam job
+the agent then diagnosed and recovered)**, 0 blocking sleeps, 0 kernel
+restarts, 12 jobs cells, clean drain ("nothing left waiting"). The harness
+process exited at every wait (~13 separate prime processes across the task);
+`prime -c` + the wake message is the resume seam. Compare sleep-mode campaign
+PASS at $0.726 and claude-code FAIL at $0.902 (n=1 each; not a ranking).
+
+It took five attempts, each finding a real defect from artifacts:
+(1) stale volume — exit mode now REQUIRES its own build marker in preflight;
+(2+3) the model busy-polled instant wait returns through two escalations of
+stop-language — **the run now ends by MECHANISM** (`process.exit` after a
+grace period; HARNESS_WAIT_EXIT_GRACE_MS), and the kernel-side wait message is
+mode-aware (it used to say "the host waits Ns and calls you again", directly
+contradicting the stop);
+(4) wake writes lost to ENOENT — session dir now exists from staging, jobs.py
+makedirs defensively, and a wake-less drain records drainNote;
+(5) scheduler stdout was block-buffered under the pipe — now `python3 -u`.
+The measured generalization: **a deviation the prose requests, the mechanism
+must enforce** — prompt-escalation lost to the sampling prior twice.
+
 ## Open threads, in priority order
 
-1. **Scheduler-driven compcert demo** (Phase 3 acceptance, ~30 min docker):
-   session dir + `session.json` invoking prime `--resume`; env
-   `HARNESS_WAIT_MODE=exit HARNESS_WAKE_FILE=<session>/wake.json
-   HARNESS_JOB_DIR=<session>/jobs`; `python3 runtime/scheduler.py <root>`.
-   Assert: the harness process EXITS during the build; scheduler re-invokes on
-   job completion; survives a scheduler kill -9 mid-build.
+1. **Scheduler hardening follow-ups**: orphaned kernel per wake (the exiting
+   prime leaves its ipykernel child in-container — harmless per-run, a leak
+   for long-lived hosts); a scheduler kill -9 mid-build resilience run (the
+   unit suite covers replay; the live variant is unrun); steer vs follow_up
+   delivery modes.
 2. **Phase 4 remainder**: in-src excision (interactive 24k, agents-view, ACP,
    refinement, telemetry) — needs a scripted slim step so pristine-replay
    keeps refereeing. The base-harness audit in CODE-REVIEW-2026-08-15.md §base
