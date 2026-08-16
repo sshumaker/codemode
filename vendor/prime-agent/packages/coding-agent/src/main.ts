@@ -84,7 +84,6 @@ import {
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
-	type AgentsViewScopeKey,
 	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
@@ -95,9 +94,6 @@ import {
 	InProcessAgentConnection,
 	InteractiveMode,
 	resolveAttachModelFallbackMessage,
-	runAcpMode,
-	runAcpModeWithConnection,
-	runAgentsViewMode,
 	runDaemonMode,
 	runDaemonSupervisorMode,
 	runPrintMode,
@@ -191,6 +187,12 @@ function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 
 function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "acp" | "daemon"> {
 	return appMode === "json" ? "json" : "text";
+}
+
+/** Inlined from the removed agents-view module. See scripts/slim-prime.mjs. */
+interface AgentsViewScopeKey {
+	sessionId: string;
+	activeSessionId?: string;
 }
 
 // `prime-agent agents` opens the agents view directly.
@@ -1135,8 +1137,17 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 	}
 
-	// Run migrations (pass cwd for project-local migrations)
-	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
+	// Migrations rewrite agent-dir state AND `cwd` state — they move sessions,
+	// rewrite auth.json, relocate tools, and rewrite the extension config next to
+	// wherever the agent was invoked — on every single `-p` run. For a benchmark
+	// that is the harness mutating the task's working directory before the task
+	// starts; for a hosted runtime it is a write to someone else's filesystem.
+	// Off by default; set PRIME_AGENT_RUN_MIGRATIONS=1 to restore.
+	// See scripts/slim-prime.mjs.
+	const { migratedAuthProviders: migratedProviders, deprecationWarnings } =
+		process.env.PRIME_AGENT_RUN_MIGRATIONS === "1"
+			? runMigrations(cwd)
+			: { migratedAuthProviders: [] as string[], deprecationWarnings: [] as string[] };
 	time("runMigrations");
 
 	const agentDir = getAgentDir();
@@ -1387,39 +1398,15 @@ export async function main(args: string[], options?: MainOptions) {
 			services,
 			sessionManager,
 		});
-		const launchAgentsView = async (initialSession?: SessionSummary, initialScopeKey?: AgentsViewScopeKey) => {
-			await runAgentsViewMode({
-				socketPath: daemonSocketPath,
-				config: defaultSessionConfig,
-				uiServices: daemonUiServices,
-				recoverDaemon: () => ensureInteractiveDaemonRunning(daemonSocketPath),
-				createUiServicesForSession: async (summary) => {
-					const attachedSessionManager = createSessionManagerForActiveDaemonSummary(
-						summary,
-						sessionManager.getCwd(),
-					);
-					const attachedPrepared = await prepareRuntimeServices({
-						config: mergeAgentSessionRuntimeConfig(defaultSessionConfig, {
-							cwd: attachedSessionManager.getCwd(),
-						}),
-						cwd: attachedSessionManager.getCwd(),
-						agentDir,
-						sessionManager: attachedSessionManager,
-						extensionFactories: options?.extensionFactories,
-					});
-					return createInteractiveModeUiServicesFromServices({
-						services: attachedPrepared.services,
-						sessionManager: attachedSessionManager,
-					});
-				},
-				migratedProviders,
-				modelFallbackMessage: startupModel.modelFallbackMessage,
-				promptStashStore,
-				startupModelId: startupModel.model?.id,
-				initialSession,
-				initialScopeKey,
-				verbose: parsed.verbose,
-			});
+		// The agents view was removed in the slim build (scripts/slim-prime.mjs).
+		// Its two call sites below are the daemon-interactive startup path, which a
+		// print-mode harness never reaches; failing loudly beats a silent no-op that
+		// would leave an interactive user staring at nothing.
+		const launchAgentsView = async (
+			_initialSession?: SessionSummary,
+			_initialScopeKey?: AgentsViewScopeKey,
+		): Promise<void> => {
+			throw new Error("agents view removed in slim build");
 		};
 		if (
 			shouldOpenAgentsViewForDaemonInteractive({
@@ -1563,7 +1550,7 @@ export async function main(args: string[], options?: MainOptions) {
 			return await runRpcModeWithConnection(connection);
 		}
 		if (appMode === "acp") {
-			return await runAcpModeWithConnection(connection);
+			throw new Error("acp mode removed in slim build");
 		}
 		const exitCode = await runPrintModeWithConnection(connection, {
 			mode: toPrintOutputMode(appMode),
@@ -1642,8 +1629,7 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "acp") {
-		printTimings();
-		await runAcpMode(runtime);
+		throw new Error("acp mode removed in slim build");
 	} else if (appMode === "interactive") {
 		if (explicitAgentsView) {
 			console.error(chalk.yellow("Warning: the agents view needs the daemon; opening a normal chat instead"));

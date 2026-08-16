@@ -115,6 +115,38 @@ describe("neutralize-prime.mjs has been applied", () => {
 	});
 });
 
+describe("slim-prime.mjs has been applied", () => {
+	// The product subsystems excised in Phase 4 (docs/CLOUD-HARNESS-DESIGN.md §4).
+	// These assert the observable effect, not the presence of the script: a tree
+	// that still ships agents-view is a tree the script never ran on.
+	it("the excised subsystems are gone from the tree", () => {
+		for (const rel of ["modes/agents-view", "modes/acp", "core/refinement/refinement.ts"]) {
+			assert.ok(!existsSync(join(SRC, rel)), `${rel} is still present — run: node scripts/slim-prime.mjs`);
+		}
+	});
+
+	it("telemetry and trace upload are inert, not merely gated", () => {
+		// neutralize-prime gates the trace-upload *install site*; this asserts the
+		// thing behind the gate is also a no-op, so an env var cannot turn a
+		// full-transcript upload back on.
+		assert.match(read("core/telemetry.ts"), /scripts\/slim-prime\.mjs/, "core/telemetry.ts is not the stub");
+		assert.match(read("core/agent-traces.ts"), /scripts\/slim-prime\.mjs/, "core/agent-traces.ts is not the stub");
+		assert.match(
+			read("core/agent-session-services.ts"),
+			/process\.env\.PRIME_AGENT_TRACES === "1"/,
+			"neutralize-prime's trace-upload gate was lost — the two scripts have drifted",
+		);
+	});
+
+	it("migrations no longer rewrite agent-dir and cwd state on every -p", () => {
+		assert.match(
+			read("main.ts"),
+			/PRIME_AGENT_RUN_MIGRATIONS === "1"\s*\?\s*runMigrations\(cwd\)/,
+			"runMigrations is still unconditional — run: node scripts/slim-prime.mjs",
+		);
+	});
+});
+
 describe("the compiled harness is current", () => {
 	it("dist exists", () => {
 		assert.ok(
@@ -151,18 +183,28 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 	// byte-for-byte. The 2026-08-15 review found it had diverged four ways —
 	// including a marker collision that silently dropped the namespace patch —
 	// and every divergence was invisible to the marker-grep assertions above.
-	// This is the control: git-archive the base commit, run both scripts against
-	// it, and diff the result against what is committed. Any hand edit to the
-	// vendored src that skips the scripts, or any script edit that no longer
-	// reproduces the tree, fails here.
+	// This is the control: git-archive the base commit, run every script against
+	// it in pipeline order, and diff the result against what is committed. Any
+	// hand edit to the vendored src that skips the scripts, or any script edit
+	// that no longer reproduces the tree, fails here.
+	//
+	// Order matters and is the shipped order: port-vanilla-tools restores the
+	// five deleted built-ins, neutralize-prime makes runs reproducible, and
+	// slim-prime excises the product subsystems last — it stubs modules that
+	// neutralize has already patched around.
 	const BASE = "80cb7f8"; // "Vendor prime-agent @a18809e and pi-mono @e47b8e3"
 	const REL = "vendor/prime-agent/packages/coding-agent/src";
+	// slim-prime removes the export-html assets from copy-assets, so the patched
+	// surface is no longer src-only. A build that copies files the tree no longer
+	// has fails at `npm run build`, not here — but the replay must still own the
+	// edit, or the package.json change is a hand edit with no script behind it.
+	const PKG_JSON = "vendor/prime-agent/packages/coding-agent/package.json";
 
-	it("replaying both scripts on the base commit reproduces coding-agent/src", () => {
+	it("replaying the patch scripts on the base commit reproduces the vendored tree", () => {
 		const scratch = mkdtempSync(join(tmpdir(), "pristine-replay-"));
 		try {
 			mkdirSync(join(scratch, "vendor"), { recursive: true });
-			execSync(`git archive ${BASE} ${REL} | tar -x -C ${JSON.stringify(scratch)}`, {
+			execSync(`git archive ${BASE} ${REL} ${PKG_JSON} | tar -x -C ${JSON.stringify(scratch)}`, {
 				cwd: ROOT,
 				shell: "/bin/bash",
 				stdio: "pipe",
@@ -170,16 +212,19 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 			const env = { ...process.env, HARNESS_VENDOR_DIR: join(scratch, "vendor") };
 			execSync(`node ${join(ROOT, "scripts/port-vanilla-tools.mjs")}`, { env, stdio: "pipe" });
 			execSync(`node ${join(ROOT, "scripts/neutralize-prime.mjs")}`, { env, stdio: "pipe" });
-			try {
-				execSync(`diff -ru ${JSON.stringify(join(scratch, REL))} ${JSON.stringify(join(ROOT, REL))}`, {
-					stdio: "pipe",
-				});
-			} catch (e) {
-				const diff = e.stdout?.toString() ?? "";
-				assert.fail(
-					`scripts do not reproduce the committed tree — the mechanisms have diverged.\n` +
-						`Fix the script (or the tree) until replay is byte-identical:\n${diff.slice(0, 4000)}`,
-				);
+			execSync(`node ${join(ROOT, "scripts/slim-prime.mjs")}`, { env, stdio: "pipe" });
+			for (const rel of [REL, PKG_JSON]) {
+				try {
+					execSync(`diff -ru ${JSON.stringify(join(scratch, rel))} ${JSON.stringify(join(ROOT, rel))}`, {
+						stdio: "pipe",
+					});
+				} catch (e) {
+					const diff = e.stdout?.toString() ?? "";
+					assert.fail(
+						`scripts do not reproduce ${rel} — the mechanisms have diverged.\n` +
+							`Fix the script (or the tree) until replay is byte-identical:\n${diff.slice(0, 4000)}`,
+					);
+				}
 			}
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });
