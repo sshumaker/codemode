@@ -1181,6 +1181,10 @@ class JobStore:
         wake_file = os.environ.get("HARNESS_WAKE_FILE")
         if wake_file:
             try:
+                # The kernel is usually the FIRST thing to touch the session dir
+                # (demo4: five ENOENT wake writes, zero wakes, and the grader ran
+                # against a 35-second build). Same pattern as _record's makedirs.
+                os.makedirs(os.path.dirname(wake_file) or ".", exist_ok=True)
                 tmp = f"{wake_file}.tmp"
                 with open(tmp, "w") as fh:
                     json.dump({

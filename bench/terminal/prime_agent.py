@@ -412,6 +412,10 @@ file you have already looked at.\
         # The wake scheduler travels with the runtime it schedules (exit mode).
         session.copy_to_container(
             [REPO / "runtime" / "scheduler.py"], container_dir=RUNTIME_DIR)
+        # The session dir must exist BEFORE the first cell: the kernel writes
+        # wake.json into it, and demo4 lost every wake to ENOENT here.
+        if self._wait_mode == "exit":
+            self._exec(session, ["mkdir", "-p", SESSION_DIR])
         # Subagents travel with the flag that advertises them. The prompt is
         # generated on the HOST (where `import subagents` always succeeds), so
         # without this the guidance said `spawn(...)` while the container had no
@@ -559,7 +563,10 @@ file you have already looked at.\
         feeds the SAME accumulator, so turns/cost/cells span the whole task."""
         r = self._exec(session, ["test", "-f", f"{SESSION_DIR}/wake.json"])
         if r.exit_code != 0:
-            return  # the first run never waited; nothing to drain
+            # Recorded, not silent: "never waited" and "wake writes failed" look
+            # identical from here, and demo4 was the second one.
+            summary["drainNote"] = "no wake.json after the first run — nothing drained"
+            return
         remaining = max(60, int(remaining) - 30)
         resume_argv = [
             "timeout", "-k", "10", str(remaining),
