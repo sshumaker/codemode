@@ -64,6 +64,48 @@ function sub(relPath, find, replace, label, marker) {
 
 log("neutralizing prime-agent for reproducible runs\n");
 
+// ---- kernel env scrub: the sandbox boundary ------------------------------
+// The brain (loop) holds ANTHROPIC_API_KEY; the kernel and everything agent
+// code spawns from it must not (docs/CLOUD-HARNESS-DESIGN.md). Opt in per run
+// with HARNESS_KERNEL_ENV_SCRUB=<comma-separated var names>.
+sub(
+	"core/kernel/index.ts",
+	'} from "./state-snapshot.js";',
+	'} from "./state-snapshot.js";\n\n' +
+		"// Sandbox boundary (docs/CLOUD-HARNESS-DESIGN.md): the brain holds the real\n" +
+		"// credentials; the kernel must not. HARNESS_KERNEL_ENV_SCRUB names env vars\n" +
+		"// (comma-separated) to remove from the kernel process env — the loop keeps\n" +
+		"// them, only the spawned kernel (and everything it spawns) loses them.\n" +
+		"function scrubKernelEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {\n" +
+		'\tconst names = (process.env.HARNESS_KERNEL_ENV_SCRUB ?? "")\n' +
+		'\t\t.split(",")\n' +
+		"\t\t.map((s) => s.trim())\n" +
+		"\t\t.filter(Boolean);\n" +
+		"\tif (names.length === 0) return env;\n" +
+		"\tconst out = { ...env };\n" +
+		"\tfor (const n of names) delete out[n];\n" +
+		"\treturn out;\n" +
+		"}",
+	"kernel env scrub helper",
+	"function scrubKernelEnv",
+);
+sub(
+	"core/kernel/index.ts",
+	"env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },",
+	"env: scrubKernelEnv(this.options.env ? { ...process.env, ...this.options.env } : { ...process.env }),",
+	"fork-path kernel env goes through the scrub",
+);
+sub(
+	"core/kernel/index.ts",
+	"env: this.options.env ? { ...process.env, ...this.options.env } : process.env,",
+	// Keeps the bare process.env else-branch (scrub copies before deleting), so
+	// this patched text differs from the fork-path's and the presence check
+	// cannot mistake one site's patch for the other's.
+	"env: scrubKernelEnv(this.options.env ? { ...process.env, ...this.options.env } : process.env),",
+	"direct-spawn kernel env goes through the scrub",
+);
+
+
 // The continual-harness state injected into the system prompt. Opt back in with
 // PRIME_HARNESS_STATE=1 if we ever want to measure it as its own variable.
 sub(

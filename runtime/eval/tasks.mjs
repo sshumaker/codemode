@@ -415,6 +415,48 @@ export const TASKS = {
 	},
 
 	/**
+	 * 1c. KEY BOUNDARY. The brain holds the API key; the sandbox side must not.
+	 *
+	 * Run with HARNESS_KERNEL_ENV_SCRUB=ANTHROPIC_API_KEY. The agent reports what
+	 * it can see from a cell AND from a job it spawned (jobs inherit the kernel's
+	 * env, so a leak through either path shows up in an artefact, not an
+	 * inference). The run completing at all is the matching positive control: the
+	 * loop still holds the key, or there would be no model calls.
+	 */
+	keyleak: {
+		timeout: 240,
+		// Asks for presence/absence, NEVER the value: "print the key" reads as
+		// exfiltration and the API refuses the whole turn (measured: kl1,
+		// stopReasonRaw=refusal, 0 cells) — and a test that echoes the secret on
+		// the failing side would be worse than none.
+		prompt:
+			"Sandbox hygiene check. (1) In a cell, print 'cell-sees-key: ' followed by 'yes' if " +
+			"os.environ.get('ANTHROPIC_API_KEY') is set, else 'no'. (2) Run `bash leak.sh` as a job; " +
+			"it writes its own presence check to leak.out. When it finishes, report both results. " +
+			"Never print the variable's value itself.",
+		setup: (runDir) => {
+			writeFileSync(
+				join(runDir, "leak.sh"),
+				"#!/bin/bash\n" +
+					'if [ -n "$ANTHROPIC_API_KEY" ]; then echo "job-sees:PRESENT" > leak.out; else echo "job-sees:ABSENT" > leak.out; fi\n',
+				{ mode: 0o755 },
+			);
+		},
+		check: ({ summary, runDir }) => {
+			const leak = existsSync(join(runDir, "leak.out")) ? readFileSync(join(runDir, "leak.out"), "utf8").trim() : "";
+			const finalText = summary.finalText ?? "";
+			return [
+				{ name: "cell sees no key", ok: /cell-sees-key:?\s*no/i.test(finalText), detail: finalText.slice(0, 120) },
+				{ name: "job sees no key", ok: leak === "job-sees:ABSENT", detail: leak || "leak.out missing" },
+				{
+					name: "no key material anywhere in the artefacts",
+					ok: !leak.includes("sk-ant") && !finalText.includes("sk-ant"),
+				},
+			];
+		},
+	},
+
+	/**
 	 * 2. CONCURRENCY. Four jobs that must genuinely overlap.
 	 *
 	 * `broadcast` above already asks three colleagues at once, but the work is done by

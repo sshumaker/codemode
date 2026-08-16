@@ -22,6 +22,21 @@ import {
 	type SnapshotResult,
 } from "./state-snapshot.js";
 
+// Sandbox boundary (docs/CLOUD-HARNESS-DESIGN.md): the brain holds the real
+// credentials; the kernel must not. HARNESS_KERNEL_ENV_SCRUB names env vars
+// (comma-separated) to remove from the kernel process env — the loop keeps
+// them, only the spawned kernel (and everything it spawns) loses them.
+function scrubKernelEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const names = (process.env.HARNESS_KERNEL_ENV_SCRUB ?? "")
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	if (names.length === 0) return env;
+	const out = { ...env };
+	for (const n of names) delete out[n];
+	return out;
+}
+
 const DELIM = Buffer.from("<IDS|MSG>");
 const PROTOCOL_VERSION = "5.3";
 const PORTS_RESOLVE_TIMEOUT_MS = 5000;
@@ -622,7 +637,7 @@ export class KernelManager {
 					// Match the direct-spawn env exactly: merge the current host env with
 					// the per-kernel overrides, applied fresh in the child (the template's
 					// inherited env snapshot may be stale by fork time).
-					env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },
+					env: scrubKernelEnv(this.options.env ? { ...process.env, ...this.options.env } : { ...process.env }),
 				});
 				forked = true;
 			} catch (err) {
@@ -655,7 +670,7 @@ export class KernelManager {
 				: [python, ["-m", "ipykernel_launcher", "-f", connection.path]];
 			const kernel = spawn(kernelArgv[0], kernelArgv[1], {
 				cwd: this.options.cwd,
-				env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
+				env: scrubKernelEnv(this.options.env ? { ...process.env, ...this.options.env } : process.env),
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			this.kernel = kernel;
