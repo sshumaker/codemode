@@ -361,7 +361,7 @@ print(j.done, j.ok)
       <p>Claude Code has the easy version of this problem. It is a <em>local</em> harness — it runs on your machine and can hold a process open on your own computer for as long as it likes; the compute is already there and already yours. A harness you <em>host</em> — one remote runtime serving many users — cannot. It can't run unbounded compute, and it can't keep a VM pinned open for thirty minutes waiting on a build. Held-open sessions are precisely what make hosting an agent expensive.</p>
       <p>The jobs framework was designed for that constraint. Because <code>wait</code> <em>ends the turn</em> instead of blocking, the agent releases its compute the instant it begins waiting. A job is a file-backed process with a bounded lifetime, and it is <b>awaitable and resumable</b> — so a scheduler can put the whole session to sleep and wake it, on a different machine, when the job signals done. Nothing is pinned to one long-lived host.</p>
       <div class="principle">The wait that ends a turn is also the wait that releases a VM.<span class="who">the design goal</span></div>
-      <p>That is what lets the runtime live on <b>small, short-lived micro-VMs</b> instead of one giant always-on box: the VM can be torn down while a job runs on managed compute, and rebuilt only when there is a result to collect. And because the kernel's state is recoverable — jobs persist on disk, and the agent can re-fetch anything a fresh kernel has lost — you can <b>evict the REPL under memory pressure</b> and let the agent rebuild. It pays a small re-fetch cost and carries on; and because its context is small, there is little to rebuild.</p>
+      <p>That is what lets the runtime live on <b>small, short-lived micro-VMs</b> instead of one giant always-on box: the VM can be torn down while a job runs on managed compute, and rebuilt only when there is a result to collect. And because the kernel's state is recoverable — jobs persist on disk, and the agent can re-fetch anything a fresh kernel has lost — you can <b>evict the REPL under memory pressure</b> and let the agent rebuild. That claim is now measured, not asserted: in a live injection test the kernel is SIGKILLed mid-task with two jobs running and state the agent had saved to disk; the fresh kernel's death notice names what survived (<em>files intact, jobs still running, reach them by name</em>), and the agent reads its state back and collects both jobs — each run exactly once, 10/10 checks, $0.07 a run. The scheduler is equally real: the full CompCert build ran under it end to end — six wakes (one of them on a <em>failed</em> job the agent then recovered from), about thirteen short-lived harness processes spanning a single task, $0.39.</p>
       <p>There is a compounding effect here that is easy to miss: <b>the representation choice makes the hosted architecture cheap.</b> Decoupling the agent loop from its execution environment puts a boundary between them, and every action pays a trip across it. A tool-calling agent making ~40 calls per task pays that toll ~40 times — for it, colocating loop and compute is load-bearing. Codemode measures <b>1.00 actions per turn, ~9 turns per task</b>: the same boundary costs it ~9 trips. And the stateless-harness move — rebuild the loop from the transcript on every wake — is nearly free when each turn's transcript is one code cell plus what the code chose to print, rather than a 100k-token catalogue re-read. The properties that make codemode cheap per task are the same properties that make it cheap to <em>host</em>.</p>
       <p>The host side of this is deliberately small. Between turns, the only durable truth is what is on disk — the transcript, the jobs manifest, the artifacts — and everything else is rebuilt from it. That one invariant (tested by killing every process mid-flight and replaying from disk alone) replaces the recovery journals, hand-off manifests, and live-worker coordination that a stateful session server accretes: the wake scheduler that re-invokes a sleeping session when its job finishes or its deadline passes is <b>~200 lines</b>, with single-writer leases and exactly-once wakes derived from files rather than coordinated across processes.</p>
       <p>This is exactly where ad-hoc backgrounding falls down. A <code>nohup … &amp;</code> process is pinned to the machine that spawned it — no durable handle, no way to resume it on another host — so it dies the moment a hosted harness reclaims the VM. To make backgrounding survive being hosted, you end up rebuilding precisely this: durable, named, awaitable, resumable jobs. And the payoff is not hypothetical — the remote setting is the <em>harder</em> one, and codemode still outperformed Claude Code, whose own background-and-monitor tooling was available and did not close the gap.</p>
@@ -371,10 +371,26 @@ print(j.done, j.ok)
 
 <hr class="rule">
 
-<!-- 5. THE API -->
+<!-- 5. THE BOUNDARY -->
 <section>
   <div class="bleed">
-    <div class="sechead"><span class="num">05</span><div><h2>The surface the agent sees</h2><div class="sub">designed to be what you'd write anyway</div></div></div>
+    <div class="sechead"><span class="num">05</span><div><h2>Cells in a sandbox, brains in the harness</h2><div class="sub">every credential harness-side · every byte of egress through one proxy</div></div></div>
+    <div class="prose">
+      <p>A hosted runtime executes code the model wrote, so the security question is not "is the model trustworthy" but "what can the code it writes reach." Codemode's answer is a hard split between two kinds of process. The <b>brain</b> — the agent loop — is stateless, lives harness-side, and holds the real credentials. The <b>cells</b> — everything the model authors — run in an OS sandbox with no network, a filesystem confined to the task, and an environment constructed from an explicit allow-list rather than inherited. Agent code has no execution surface on the harness side at all, so a credential in the harness's environment is unreachable the way a database password is unreachable from SQL.</p>
+      <p>The one network route out of the sandbox is the <b>egress proxy</b>: a route table of whatever APIs the deployment chooses to expose. Each route forwards to one upstream and injects that upstream's credentials at the boundary, so no credential of any kind exists sandbox-side; every request is audited — session, route, status, bytes — never a key, never a body. Notably, there is <em>no route to the model provider</em>, and the proxy refuses to configure one: <b>intelligence is a capability, not an endpoint.</b> Code that wants more intelligence calls <code>spawn()</code>, which is priced, capped, and leaves a transcript — a raw provider call from a cell would be unmetered spend that never appears in the trace.</p>
+      <p>Subagents follow the same rule. <code>spawn()</code> does not fork a child from the kernel — it is an API call on the proxy's control surface; a harness-side broker claims the request (an atomic rename two processes cannot both win) and starts the child's brain in the harness's world, with the child's own kernel back in the sandbox. Exactly-once is enforced from disk and tested by SIGKILLing the broker at every stage of the chain — a request is never lost and a model run is never duplicated.</p>
+      <p>The boundary is proven from inside, live, as a permanent test: the agent itself reports what it can see from a cell and from a job it spawned — both come back empty — while the run's own API spend is the positive control that the brain still holds the key. The test never echoes a value: its first wording asked the agent to print the credential, and the API refused the entire turn as exfiltration — which is the correct behaviour, and the absence-only test is also the safer one.</p>
+      <div class="principle">The agent only ever emits; it never executes where the secrets live. Everything it can run lands in the sandbox, and the sandbox can reach exactly one address.<span class="who">the boundary, in one rule</span></div>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- 6. THE API -->
+<section>
+  <div class="bleed">
+    <div class="sechead"><span class="num">06</span><div><h2>The surface the agent sees</h2><div class="sub">designed to be what you'd write anyway</div></div></div>
     <div class="prose">
       <p>The guiding rule for every primitive: write down what a competent engineer would type <em>without</em> the new thing, then get as close to that as the constraints allow. A bespoke API is a tax the model pays on every task, because it appears in zero pretraining tokens. So the surface is deliberately ordinary — imports, function calls, and one unavoidable deviation.</p>
     </div>
@@ -389,7 +405,7 @@ print(j.done, j.ok)
       </div>
       <div class="apicard">
         <div class="sig"><span class="fn">spawn</span>(prompt, name, agent={"tools":[…], "model":…, "max_turns":…}) → Job</div>
-        <p>Subagents, built <em>on</em> the jobs substrate — a child is a job. It returns immediately, runs a real agent process with its own kernel and its own tool grant, and its result is collected like any other job. Nine tool schemas in a tool-calling harness; one module here.</p>
+        <p>Subagents, built <em>on</em> the jobs substrate — a child is a job. It returns immediately; a harness-side broker starts the child (the kernel never forks a brain), it runs with its own sandboxed kernel and its own tool grant, and its result is collected like any other job. Nine tool schemas in a tool-calling harness; one module here.</p>
       </div>
       <div class="apicard">
         <div class="sig"><span class="fn">bash</span> &nbsp;·&nbsp; <span class="fn">read</span> &nbsp;·&nbsp; <span class="fn">grep</span> &nbsp;<span class="muted">· first-class tools, guarded</span></div>
@@ -404,10 +420,10 @@ print(j.done, j.ok)
 <!-- 5. SYSTEMS -->
 <section>
   <div class="bleed">
-    <div class="sechead"><span class="num">06</span><div><h2>The systems underneath</h2><div class="sub">what makes the surface safe and fast</div></div></div>
+    <div class="sechead"><span class="num">07</span><div><h2>The systems underneath</h2><div class="sub">what makes the surface safe and fast</div></div></div>
     <div class="prose"><p>A persistent kernel that an agent writes arbitrary code into is a sharp instrument. Most of the engineering is the machinery that keeps it from cutting the wrong way — and that makes the good idioms the easy ones.</p></div>
     <div class="sys">
-      <div class="item"><div class="h"><span class="ix">◆</span><h4>The jobs runtime</h4></div><p>File-backed submit / wait / get. Jobs survive a kernel restart because they are processes on disk, not objects in memory; a fresh kernel is told what is still running and recovers it by name. The substrate under both background work and subagents.</p><span class="tag">durable · recoverable · one abstraction</span></div>
+      <div class="item"><div class="h"><span class="ix">◆</span><h4>The jobs runtime</h4></div><p>File-backed submit / wait / get. Jobs survive a kernel restart because they are processes on disk, not objects in memory; a fresh kernel is told what is still running and recovers it by name. The substrate under both background work and subagents.</p><span class="tag">durable · recoverable · eviction-tested live</span></div>
       <div class="item"><div class="h"><span class="ix">◆</span><h4>Kernel guards + cell watchdog</h4></div><p>The in-process shapes a Python programmer reaches for — <code>threading</code>, <code>subprocess</code>, a long <code>sleep</code> — fail loudly at the point of use, each error naming the job primitive to use instead. A wall-clock watchdog catches anything that blocks past the ceiling and rewrites the interrupt into the same redirect.</p><span class="tag">correction lives in the error, not the prompt</span></div>
       <div class="item"><div class="h"><span class="ix">◆</span><h4>MCP → API compiler</h4></div><p>Schemas become typed Python: unions, enums, required-ness. A one-time, schema-only enrichment pass promotes constraints stated in prose ("a number, a yes/no") into the type system — narrowing-only, every proposal logged and verified against the source. Runtime validation then checks each call <em>at the call site</em>, in-process, before the request leaves — where a tool-calling arm learns of a bad argument a provider round-trip later.</p><span class="tag">the contract, enforced in the language</span></div>
       <div class="item"><div class="h"><span class="ix">◆</span><h4>The catalogue is ordinary API docs</h4></div><p>Any API description compiles in — an MCP server, an OpenAPI spec, a typed client. Our convention lays each service out the way an SDK is, <code>api/gmail.py</code> rather than a schema per call, so one read delivers a whole service's contract, its conventions, and the sibling it should have called instead.</p><span class="tag">MCP · OpenAPI · SDK — same target</span></div>
@@ -422,7 +438,7 @@ print(j.done, j.ok)
 <!-- 6. METRICS -->
 <section>
   <div class="bleed">
-    <div class="sechead"><span class="num">07</span><div><h2>What it costs, measured</h2><div class="sub">Opus 5 · AppWorld challenge + terminal-bench · paired</div></div></div>
+    <div class="sechead"><span class="num">08</span><div><h2>What it costs, measured</h2><div class="sub">Opus 5 · AppWorld challenge + terminal-bench · paired</div></div></div>
     <div class="prose">
       <p>Two baselines, and they are different things. The first is <b>the same harness in tool-calling mode</b> — identical machinery, but the tools exposed as ordinary JSON tool-calls instead of code. Comparing against it isolates the one variable: code versus tool-calling. The second is <b>Claude Code</b> — a separate, real product — which answers whether codemode holds up against a strong agent people actually use. Score is reported as underpowered: frontier models saturate these suites, so an identical config can score 8/8 then 3/8 on a re-run. Cost, context, and latency are the endpoints that move.</p>
     </div>
@@ -479,7 +495,7 @@ print(j.done, j.ok)
 <!-- 7. LEARNINGS -->
 <section>
   <div class="bleed">
-    <div class="sechead"><span class="num">08</span><div><h2>What we learned building it</h2><div class="sub">principles, not process</div></div></div>
+    <div class="sechead"><span class="num">09</span><div><h2>What we learned building it</h2><div class="sub">principles, not process</div></div></div>
     <div class="prose">
       <h3>Match the idiom; deviate on exactly one verb.</h3>
       <p>Given a REPL, the model reaches for what every Python corpus taught it — <code>time.sleep</code>, <code>subprocess.Popen</code>, <code>threading.Thread</code>. Fighting that prior is a losing battle; the win is to make the natural idiom durable underneath, and to force a deviation only where one is unavoidable. The single forced deviation is <code>wait</code> — because a wait needs wall-clock to pass, and a single-threaded kernel serving a turn-based agent cannot both hold and yield. Everything else is ordinary code.</p>
@@ -501,7 +517,7 @@ print(j.done, j.ok)
 <!-- 8. INTEGRATION -->
 <section>
   <div class="bleed">
-    <div class="sechead"><span class="num">09</span><div><h2>Integrating codemode</h2><div class="sub">what you need, where it wins, the honest trade</div></div></div>
+    <div class="sechead"><span class="num">10</span><div><h2>Integrating codemode</h2><div class="sub">what you need, where it wins, the honest trade</div></div></div>
     <div class="prose">
       <p><b>What it takes.</b> A kernel per session, a one-time compile step from your API schemas to the typed module tree, and the guard layer. The one operational cost to plan for is the kernel's environment. A warm kernel starts in about <b>five seconds</b>; the very first boot has to page a few hundred MB of interpreter and libraries in from disk — about 70s cold, and worse if many kernels boot at once and contend for I/O. But this is <b>one-time and global</b>: the pages stay warm in the OS cache, so every kernel after the first is fast. A prewarm step — boot one throwaway kernel to warm the cache — erases it, and with it codemode is faster end to end than tool-calling, because latency is dominated by prefill and prefill by context. A warm pool is a launch requirement for a hosted service, not an optimization.</p>
       <p><b>Where it wins.</b> The advantage scales with the work: tasks that make many calls, carry a large tool catalogue, or run long enough to need background work. On short, shell-dominated tasks the representation has little to grip and a competent bash-tool arm is a wash — codemode's edge there is only the jobs runtime, and only when a wait is real.</p>
