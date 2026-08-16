@@ -596,16 +596,35 @@ file you have already looked at.\
         spec_path.write_text(json.dumps(spec, indent=2) + "\n")
         self._exec(session, ["mkdir", "-p", SESSION_DIR])
         session.copy_to_container([spec_path], container_dir=SESSION_DIR)
-        _, stream = self._exec(
-            session,
-            # -u: stdout is a pipe here, and block-buffered prints held every
-            # "[scheduler] waking" line until exit — the wakes were invisible in
-            # the live stream (demo5) even while they were happening.
-            ["python3", "-u", f"{RUNTIME_DIR}/scheduler.py", SESSIONS_ROOT,
-             "--drain", "--interval", "5", "--deadline", str(remaining)],
-            environment=self._env(), workdir=cwd, stream=True, demux=False,
-        )
-        self._consume(stream, raw, traj, summary)
+        # The drain is RELAUNCHED while a wake is still pending and time remains:
+        # the scheduler process is cattle like everything else in this design —
+        # a SIGKILL (host eviction, oom, the resilience test) must cost a poll
+        # interval, not the task. Every decision it makes derives from disk, so
+        # a fresh drain resumes correctly by construction (test_scheduler pins
+        # the replay; this loop is the live seam).
+        drain_started = time.time()
+        relaunches = 0
+        while True:
+            left = int(remaining - (time.time() - drain_started))
+            if left <= 0:
+                summary["drainNote"] = f"drain deadline exhausted after {relaunches} relaunches"
+                break
+            _, stream = self._exec(
+                session,
+                # -u: stdout is a pipe here, and block-buffered prints held every
+                # "[scheduler] waking" line until exit — the wakes were invisible
+                # in the live stream (demo5) even while they were happening.
+                ["python3", "-u", f"{RUNTIME_DIR}/scheduler.py", SESSIONS_ROOT,
+                 "--drain", "--interval", "5", "--deadline", str(left)],
+                environment=self._env(), workdir=cwd, stream=True, demux=False,
+            )
+            self._consume(stream, raw, traj, summary)
+            r = self._exec(session, ["test", "-f", f"{SESSION_DIR}/wake.json"])
+            if r.exit_code != 0:
+                break  # nothing left waiting: the drain finished its job
+            relaunches += 1
+            summary["drainRelaunches"] = relaunches
+        
 
     # ------------------------------------------------------------------ main
 
