@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -382,6 +383,33 @@ func newHandler(sess *sessions, aud *auditor, routes map[string]*route, spawnDir
 
 // ---- main -------------------------------------------------------------------
 
+// listenAndAnnounce binds, then publishes the address it actually got.
+//
+// A per-run proxy asks for port 0: a fixed port collides the moment two runs
+// overlap, and this harness pools benchmark tasks. But the kernel needs the
+// resolved port in its environment before it boots, so the port has to travel
+// back to the parent — hence a file, written temp-then-rename so a parent
+// polling for it can never read half an address and dial a truncated port.
+func listenAndAnnounce(addr, addrFile string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if addrFile == "" {
+		return ln, nil
+	}
+	tmp := addrFile + ".writing"
+	if err := os.WriteFile(tmp, []byte(ln.Addr().String()), 0o600); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("write --addr-file: %w", err)
+	}
+	if err := os.Rename(tmp, addrFile); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("rename --addr-file: %w", err)
+	}
+	return ln, nil
+}
+
 func newToken() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -391,7 +419,8 @@ func newToken() string {
 }
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8091", "address to listen on")
+	listen := flag.String("listen", "127.0.0.1:8091", "address to listen on (port 0 picks a free one)")
+	addrFile := flag.String("addr-file", "", "write the bound address here once listening")
 	configPath := flag.String("config", "", "route table JSON (required)")
 	auditPath := flag.String("audit", "", "JSONL audit file (default: stderr)")
 	tokensPath := flag.String("tokens", "", "file of '<name> <token>' lines minted with --mint")
@@ -410,6 +439,14 @@ func main() {
 	var cfg config
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		log.Fatalf("parse --config: %v", err)
+	}
+	// Zero routes is a legitimate configuration — the eval loop runs the proxy
+	// purely for /control/spawn, and "the sandbox reaches nothing off-box" is
+	// exactly the posture those tasks are measured under. Zero of BOTH is not:
+	// it comes up, authenticates, and 404s everything, which reads as a working
+	// boundary until someone notices nothing ever crossed it.
+	if len(cfg.Routes) == 0 && cfg.SpawnDir == "" {
+		log.Fatal("config exposes nothing: no routes and no spawn_dir")
 	}
 
 	aud := &auditor{out: os.Stderr}
@@ -452,7 +489,11 @@ func main() {
 		log.Fatal("no session tokens loaded; mint with --mint and pass --tokens")
 	}
 
+	ln, err := listenAndAnnounce(*listen, *addrFile)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
 	log.Printf("egress listening on %s: %d route(s), spawn=%v, %d session(s)",
-		*listen, len(routes), cfg.SpawnDir != "", len(sess.byTok))
-	log.Fatal(http.ListenAndServe(*listen, newHandler(sess, aud, routes, cfg.SpawnDir)))
+		ln.Addr(), len(routes), cfg.SpawnDir != "", len(sess.byTok))
+	log.Fatal(http.Serve(ln, newHandler(sess, aud, routes, cfg.SpawnDir)))
 }

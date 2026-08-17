@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -208,6 +209,82 @@ func TestSpawnRejectsBadNames(t *testing.T) {
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {
 		t.Fatalf("rejected spawns left %d files", len(entries))
+	}
+}
+
+// The eval loop's configuration: spawn and nothing else. Zero routes is the
+// point there — those tasks are measured under "the sandbox reaches nothing
+// off-box" — so the control surface has to work with an empty route table
+// rather than requiring a decorative route to bring the proxy up.
+func TestSpawnOnlyWithZeroRoutes(t *testing.T) {
+	dir := t.TempDir()
+	aud := &auditor{out: io.Discard}
+	sess := &sessions{byTok: map[string]string{goodTok: "eval"}, spends: map[string]int64{}}
+	srv := httptest.NewServer(newHandler(sess, aud, map[string]*route{}, dir))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/control/spawn",
+		strings.NewReader(`{"name":"child","body":{"cmd":"echo hi"}}`))
+	req.Header.Set(egressTokenHeader, goodTok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("spawn with no routes: got %d, want 201", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "child.json")); err != nil {
+		t.Fatalf("request file not written: %v", err)
+	}
+
+	// And with no routes, every /r/ path is still a 404 rather than a panic on
+	// the nil map.
+	req2, _ := http.NewRequest("GET", srv.URL+"/r/anything/x", nil)
+	req2.Header.Set(egressTokenHeader, goodTok)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("route lookup with empty table: got %d, want 404", resp2.StatusCode)
+	}
+}
+
+// The parent needs the port before it can put it in the kernel's environment,
+// and a per-run proxy binds port 0 to avoid colliding with a concurrent run.
+func TestListenAndAnnounceWritesResolvedPort(t *testing.T) {
+	dir := t.TempDir()
+	addrFile := filepath.Join(dir, "addr")
+	ln, err := listenAndAnnounce("127.0.0.1:0", addrFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	raw, err := os.ReadFile(addrFile)
+	if err != nil {
+		t.Fatalf("addr file not written: %v", err)
+	}
+	if string(raw) != ln.Addr().String() {
+		t.Fatalf("addr file says %q, listener is on %q", raw, ln.Addr())
+	}
+	// The announced address must be the one that actually answers — a resolved
+	// port that nothing is listening on is worse than no file at all.
+	if _, _, err := net.SplitHostPort(string(raw)); err != nil {
+		t.Fatalf("announced address is not host:port: %q", raw)
+	}
+	conn, err := net.Dial("tcp", string(raw))
+	if err != nil {
+		t.Fatalf("nothing listening at the announced address %q: %v", raw, err)
+	}
+	conn.Close()
+
+	// No leftover temp file for a parent's directory scan to trip over.
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("addr-file write left %d entries, want 1", len(entries))
 	}
 }
 

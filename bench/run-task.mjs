@@ -18,7 +18,9 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, createWriteStream, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { KERNEL_ENV_ALLOW, pythonPrefixes, srtSettings, startEgress } from "../runtime/posture.mjs";
 import { loadCatalogue, loadGenerated } from "./catalogue.mjs";
 import { generate, renderFullDocs } from "./generate.mjs";
 import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./prompts.mjs";
@@ -230,6 +232,64 @@ if (arm === "notools") {
 }
 const tools = toolList.join(",");
 meta.toolCount = toolList.length;
+
+/**
+ * The boundary posture, off by default.
+ *
+ * What it turns on is the eval loop's boundary applied to a benchmark run: the
+ * kernel inside an srt sandbox, its environment BUILT from an allow-list rather
+ * than scrubbed, and one egress route out — MCP traffic through the proxy's
+ * /r/mcp rather than straight at bench/mcp-proxy.mjs.
+ *
+ * OFF by default, and that is not timidity. Every number this repo has reported
+ * was measured without it, and the posture changes things the benchmark is
+ * sensitive to: what the kernel can read, whether a cell can reach the network,
+ * and one extra hop on every MCP call. Turning it on silently would move a
+ * measured condition under a label that says nothing moved — the exact failure
+ * the fairness tests exist to catch. It is a condition, so it is recorded in
+ * meta.json alongside residency and the prompt variant.
+ */
+const posture = argv.includes("--posture") || process.env.HARNESS_POSTURE === "boundary";
+meta.posture = posture ? "boundary" : "off";
+
+let egress;
+let srtSettingsPath;
+if (posture) {
+	// One route out for MCP. The upstream is the MCP proxy this runner already
+	// talks to, so the servers, the logging and the grounding check are all
+	// unchanged — what changes is that the kernel reaches them through a door
+	// that authenticates and audits, instead of by knowing a port number.
+	//
+	// No spawn_dir: MCP-Bench has no jobs runtime, so /control/spawn stays off
+	// rather than being enabled decoratively.
+	egress = startEgress({
+		runDir,
+		spawnDir: "",
+		routes: [{ name: "mcp", upstream: PROXY }],
+		session: runId,
+	});
+
+	const kernelPython = process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
+	srtSettingsPath = join(runDir, "srt-settings.json");
+	writeFileSync(
+		srtSettingsPath,
+		`${JSON.stringify(
+			srtSettings({
+				runDir,
+				home: homedir(),
+				// The generated api/ tree lives under runDir, so the codemode kernel's
+				// own surface is already covered by it.
+				readable: [runDir, join(ROOT, "bench"), dirname(CLI), ...pythonPrefixes(kernelPython), "/tmp", tmpdir()],
+				writable: ["/tmp", tmpdir()],
+			}),
+			null,
+			2,
+		)}\n`,
+	);
+	meta.egress = { url: egress.url, audit: egress.auditPath, routes: ["mcp"] };
+	console.log(`[posture] sandbox + env allow-list + egress ${egress.url} -> ${egress.auditPath}`);
+}
+
 writeFileSync(join(runDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
 const cliArgs = [
 	CLI,
@@ -272,7 +332,20 @@ const child = spawn(
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_TELEMETRY: "0",
 			PRIME_AGENT_CODING_AGENT_DIR: seedPrimeSettings(join(runDir, "agent-home")),
-			HARNESS_MCP_PROXY: PROXY,
+			// Under the posture both arms' transports are pointed at the egress
+			// route instead of at the MCP proxy directly — one door, whichever
+			// representation is under test. Off-posture this is the bare proxy and
+			// the request is byte-identical to every run already reported.
+			HARNESS_MCP_PROXY: posture ? `${egress.url}/r/mcp` : PROXY,
+			...(posture
+				? {
+						HARNESS_EGRESS_PROXY: egress.url,
+						HARNESS_EGRESS_TOKEN: egress.token,
+						HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettingsPath,
+						HARNESS_KERNEL_SANDBOX_BIN: join(ROOT, "node_modules/.bin/srt"),
+						HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW,
+					}
+				: {}),
 			HARNESS_MCP_CATALOGUE: SCHEMAS,
 			HARNESS_MCP_SERVERS: task.exposedServers.join(","),
 			HARNESS_RUN_ID: runId,
@@ -352,6 +425,9 @@ child.stdout.on("data", (chunk) => {
 child.on("close", (code) => {
 	clearTimeout(killTimer);
 	streamFile.end();
+	// The proxy is per-run and holds a port; a pooled sweep that leaked one per
+	// task would run out of them long before it ran out of tasks.
+	egress?.stop();
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;
 	summary.stderrTail = stderr.split("\n").slice(-8).join("\n");

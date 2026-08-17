@@ -13,6 +13,7 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { readEgressAudit } from "../posture.mjs";
 
 /** A check that a file exists and (optionally) contains text. */
 const fileHas = (runDir, rel, needle) => {
@@ -761,6 +762,15 @@ export const TASKS = {
 			const children = existsSync(jobDir)
 				? readdirSync(jobDir).filter((f) => f.endsWith(".d"))
 				: [];
+			// Which door the spawn came through, asserted against the evidence that
+			// door leaves. The job records look identical either way, so a check
+			// that just said "a child was recorded" would pass on a run where the
+			// egress proxy was up and completely unused — the transport silently
+			// falling back to the request file, which is the exact shape of
+			// "labelled sandboxed, actually not".
+			const spawnAudit = summary.egress
+				? readEgressAudit(summary.egress.audit).filter((l) => l.verdict === "spawn")
+				: [];
 			const name = children[0]?.replace(/\.d$/, "") ?? "";
 			const read = (rel) => {
 				try {
@@ -804,6 +814,19 @@ export const TASKS = {
 					name: "did not block a cell with sleep",
 					ok: !summary.used.sleep,
 				},
+				summary.egress
+					? {
+							name: "the spawn crossed the egress boundary",
+							ok: spawnAudit.length > 0,
+							detail: spawnAudit.length
+								? `${spawnAudit.length} spawn line(s), status ${spawnAudit.map((l) => l.status).join(",")}`
+								: "egress was up but no spawn reached it — the request went round the boundary",
+						}
+					: {
+							name: "the spawn was written as a request file",
+							ok: existsSync(join(jobDir, "requests", `${name}.json`)),
+							detail: "--no-egress: the file transport",
+						},
 			];
 		},
 	},

@@ -35,6 +35,7 @@ import { fileURLToPath } from "node:url";
 import { TASKS } from "./tasks.mjs";
 import { pollShape } from "./poll-shape.mjs";
 import { seedPrimeSettings } from "../../bench/prime-settings.mjs";
+import { KERNEL_ENV_ALLOW, pythonPrefixes, srtSettings as buildSrtSettings, startEgress } from "../posture.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUNTIME = join(ROOT, "runtime");
@@ -167,103 +168,29 @@ const srtSettings = join(runDir, "srt-settings.json");
 /**
  * What the kernel is allowed to READ.
  *
- * srt (0.0.71) has no read allow-list field: reads are permitted everywhere by
- * default and the only shape it offers is deny-then-allow — `denyRead` takes a
- * broad region and `allowRead` re-allows inside it (read precedence is the
- * opposite of write's, README §Filesystem). So an allow-list is expressed as
- * "deny the region that holds every credential, name what the kernel needs".
+ * The shape of the answer — deny the region holding every credential, allow
+ * back what the kernel needs — lives in runtime/posture.mjs, because the
+ * benchmark runners must be able to say they ran the same boundary and that is
+ * only true if there is one implementation of it. What stays here is the list
+ * of paths, which is this loop's own:
  *
- * The denied region is the whole home directory, because that is where all of
- * them live: ~/.ssh, ~/.aws, ~/.claude, and — the one this run is about — the
- * loop's own env file, which run.mjs sources in launch.sh and which was
- * readable from a cell until now. System directories stay readable: python's
- * interpreter and dyld need them, and no credential of ours is there.
- *
- * Everything re-allowed is code or scratch, never a secret:
  *   runDir      the task's own world (also the only writable place)
  *   RUNTIME     the prelude and jobs.py, loaded into the kernel at boot
  *   CLI's dir   subagents.py stats HARNESS_SUBAGENT_CLI from inside the kernel
  *   venv/base   the kernel interpreter, and the install its symlinks resolve to
  *   tmp         ipykernel's connection file, and font/matplotlib caches
  *
- * Not used here: srt's `credentials.files`, which masks a named file with a
- * sentinel rather than denying it. Masking is per-file and this needs to hold
- * for files nobody has enumerated yet — the same fail-closed argument as the
- * env allow-list below.
+ * os.tmpdir() as well as "/tmp": on macOS TMPDIR is a per-user /var/folders/...
+ * path and that is where ipykernel's connection file lives, so allowing only
+ * /tmp left the kernel unable to reach it.
  */
 const kernelPython = process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
-
-/**
- * Every prefix the interpreter is reachable through: the venv, and the base
- * install its `bin/python` symlinks into (where the stdlib actually lives).
- *
- * EVERY hop of the symlink chain, not just the endpoint, because seatbelt
- * matches the path as SPELLED rather than as resolved. Measured: uv's venv
- * points at `.../uv/python/cpython-3.11-macos-aarch64-none`, itself a symlink
- * to `cpython-3.11.15-...`; allowing only the realpath produced
- * "/bin/bash: .../python: Operation not permitted" — the kernel could not exec
- * its own interpreter, and every probe in sandbox-check failed at once, which
- * reads as a broken sandbox rather than as one missing spelling.
- */
-function pythonPrefixes(python) {
-	const roots = new Set([resolve(python, "../..")]);
-	let p = python;
-	for (let hop = 0; hop < 8; hop++) {
-		let target;
-		try {
-			target = readlinkSync(p);
-		} catch {
-			break; // not a symlink, or gone: end of the chain
-		}
-		p = resolve(dirname(p), target);
-		roots.add(resolve(p, "../.."));
-	}
-	try {
-		roots.add(resolve(realpathSync(python), "../.."));
-	} catch {
-		// No venv yet (the first run builds it); the spellings above still hold.
-	}
-	return [...roots];
-}
 const kernelReadable = [runDir, RUNTIME, dirname(CLI), ...pythonPrefixes(kernelPython), "/tmp", tmpdir()];
 if (sandboxed) {
 	writeFileSync(
 		srtSettings,
 		`${JSON.stringify(
-			{
-				filesystem: {
-					// Allow-only: an empty list means no write access, so the default
-					// direction is the safe one. /tmp is needed by ipykernel's connection
-					// files and by matplotlib/font caches.
-					// os.tmpdir() rather than "/tmp": on macOS TMPDIR is a per-user
-					// /var/folders/... path, and that is where ipykernel's connection file
-					// lives. Allowing only /tmp left the kernel unable to reach it.
-					allowWrite: [runDir, "/tmp", tmpdir()],
-					denyWrite: [],
-					denyRead: [homedir()],
-					allowRead: kernelReadable,
-				},
-				network: {
-					// The kernel needs nothing off-box. Anything it reaches for is either a
-					// tool-surface bypass or an accident, and both are worth recording.
-					//
-					// Empty even with subagents on, which it could not be before the
-					// broker. `spawn` used to fork the child FROM the kernel, so the child
-					// inherited this sandbox and could not reach the provider at all —
-					// measured: the first real smoke's child died on "Connection error" x3
-					// while every mechanism check on the parent passed. The hole that
-					// bought was a real one: a cell could reach the provider directly.
-					// Now the child is started by the harness-side broker and is not
-					// inside this sandbox at all, so nothing on this side needs the
-					// provider and the allowance goes away.
-					allowedDomains: [],
-					deniedDomains: [],
-					// ipykernel speaks ZMQ over loopback to the agent, so local binding has
-					// to stay open or the kernel cannot be reached at all.
-					allowLocalBinding: true,
-					allowAllUnixSockets: true,
-				},
-			},
+			buildSrtSettings({ runDir, home: homedir(), readable: kernelReadable, writable: ["/tmp", tmpdir()] }),
 			null,
 			2,
 		)}\n`,
@@ -304,33 +231,37 @@ let stderr = "";
 const counted = new Set();
 
 /**
- * What the kernel is allowed to INHERIT.
- *
- * An allow-list, not a scrub. The deny-list posture (HARNESS_KERNEL_ENV_SCRUB)
- * names what to remove, so it is only ever as good as the list — it fails open,
- * and the next credential to appear in the loop's environment is in the kernel
- * the day it is added, silently. This names what may survive instead: the
- * kernel's environment is BUILT from these, so anything unlisted is absent by
- * construction, including things nobody has thought of yet.
- *
- * The list is short because the kernel needs little: enough to run a process
- * (PATH/HOME/TMPDIR and the locale), the IPython profile that installs the
- * prelude, and the HARNESS_* settings that ARE the runtime's configuration —
- * job directory, wait ceilings, the subagent model and CLI, the egress proxy
- * and its token. `HARNESS_*` is a prefix, so a new runtime setting works
- * without an edit here while a new credential still does not.
+ * What the kernel is allowed to INHERIT — the allow-list from posture.mjs.
  *
  * --env-inherit turns the whole thing off (kernel inherits the loop's env, the
  * pre-boundary behaviour) for debugging a run that dies for want of a variable.
  */
-const KERNEL_ENV_ALLOW = [
-	"PATH", "HOME", "TMPDIR", "TMP", "TEMP",
-	"USER", "LOGNAME", "SHELL", "TERM", "TZ",
-	"LANG", "LC_ALL", "LC_CTYPE",
-	"IPYTHONDIR",
-	"HARNESS_*",
-].join(",");
 const envInherit = argv.includes("--env-inherit");
+
+/**
+ * The egress proxy, live, for the length of the run.
+ *
+ * `spawn()` from a cell now leaves by the same door as everything else: the
+ * kernel POSTs /control/spawn and the proxy — which runs out here, where the
+ * jobs directory lives — writes the request file the broker already services.
+ * The durability story is unchanged; only the transport moved, from a shared
+ * filesystem the sandbox had to be able to write to, to the one network route
+ * it already has.
+ *
+ * No routes. These tasks reach nothing off-box, and an empty route table is the
+ * honest expression of that rather than a decorative entry to make the proxy
+ * come up. --no-egress falls back to the request FILE (jobs.py writes it
+ * directly when HARNESS_EGRESS_PROXY is unset), which is how the two transports
+ * stay comparable.
+ */
+const egressOn = !argv.includes("--no-egress");
+const requestsDir = join(jobDir, "requests");
+let egress;
+if (egressOn) {
+	mkdirSync(requestsDir, { recursive: true });
+	egress = startEgress({ runDir, spawnDir: requestsDir, routes: [], session: runId });
+	console.log(`[egress] ${egress.url} (pid ${egress.pid}) -> ${egress.auditPath}`);
+}
 
 // The agent itself is NOT wrapped — only the kernel it spawns is (see above).
 const runEnv = {
@@ -361,6 +292,10 @@ const runEnv = {
 			...(sandboxed ? { HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettings, HARNESS_KERNEL_SANDBOX_BIN: srtBin } : {}),
 			// Also read by the patched kernel spawn (scripts/patches/kernel-env.ts).
 			...(envInherit ? {} : { HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW }),
+			// The one route out. Both survive the allow-list above on the HARNESS_*
+			// prefix, so a cell — and the brokered child's own kernel, which is
+			// given the same spec — can reach the control surface.
+			...(egress ? { HARNESS_EGRESS_PROXY: egress.url, HARNESS_EGRESS_TOKEN: egress.token } : {}),
 			// Deliberately low so a blocked cell is interrupted quickly and the eval
 			// can observe whether the interrupt teaches `submit`.
 			HARNESS_CELL_TIMEOUT_MS: String(Number(flag("cell-timeout", String(task.cellTimeout ?? 60))) * 1000),
@@ -423,6 +358,7 @@ const killer = setTimeout(() => {
 	summary.timedOut = true;
 	child.kill("SIGKILL");
 	stopBroker();
+	egress?.stop();
 }, timeoutSec * 1000);
 
 // --- killing the kernel out from under the agent --------------------------------
@@ -641,6 +577,12 @@ child.on("close", (code) => {
 	// settings are already a file in runDir; this is the env half, and without it
 	// a keyleak PASS cannot be told from a run that simply had no key to leak.
 	summary.kernelEnvAllow = envInherit ? null : KERNEL_ENV_ALLOW;
+	// Which transport spawn() actually used, and where the evidence is. A
+	// brokered chain looks identical from the job records whether the request
+	// arrived over HTTP or as a file, so the distinction has to be recorded here
+	// or it is unrecoverable once the run directory is all that is left.
+	summary.egress = egress ? { url: egress.url, audit: egress.auditPath } : null;
+	egress?.stop();
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;
 	summary.stderrTail = stderr.split("\n").slice(-6).join("\n");

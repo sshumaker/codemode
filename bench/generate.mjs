@@ -1279,6 +1279,10 @@ _PROXY = os.environ.get("HARNESS_MCP_PROXY", "http://127.0.0.1:8765")
 # is simply wrong. Deduplication has to be the agent's judgement call per tool,
 # which is what the q6 ledger prompt asks for.
 _RUN_ID = os.environ.get("HARNESS_RUN_ID", "")
+# Set only under the boundary posture, where _PROXY points at the egress proxy's
+# /r/mcp route rather than straight at the MCP proxy. Empty otherwise, and the
+# request is then byte-identical to the pre-posture one.
+_EGRESS_TOKEN = os.environ.get("HARNESS_EGRESS_TOKEN", "")
 _TIMEOUT = 180
 
 
@@ -1308,10 +1312,13 @@ async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: 
         "args": ${validateArgs ? "sent" : "{k: v for k, v in (args or {}).items() if v is not None}"},
         "meta": {"arm": "codemode", "runId": _RUN_ID},
     }
+    headers = {"content-type": "application/json"}
+    if _EGRESS_TOKEN:
+        headers["x-egress-token"] = _EGRESS_TOKEN
     request = urllib.request.Request(
         _PROXY + "/call",
         data=json.dumps(payload).encode(),
-        headers={"content-type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:

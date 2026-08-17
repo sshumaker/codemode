@@ -24,6 +24,12 @@ const CATALOGUE = process.env.HARNESS_MCP_CATALOGUE ?? "";
 const PROXY = process.env.HARNESS_MCP_PROXY ?? "http://127.0.0.1:8765";
 const SERVERS = (process.env.HARNESS_MCP_SERVERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 const RUN_ID = process.env.HARNESS_RUN_ID ?? "";
+/**
+ * Set only under the boundary posture, where PROXY points at the egress proxy's
+ * /r/mcp route rather than straight at the MCP proxy. Both arms send it, so the
+ * route is the one door for MCP traffic whichever representation is under test.
+ */
+const EGRESS_TOKEN = process.env.HARNESS_EGRESS_TOKEN ?? "";
 const RESIDENCY = process.env.HARNESS_RESIDENCY ?? "L4";
 /**
  * Optional explicit subset of wire names to expose, comma-separated.
@@ -60,7 +66,10 @@ const firstLine = (text?: string) => (text ?? "").trim().split("\n")[0] ?? "";
 async function invoke(server: string, tool: string, args: unknown) {
 	const response = await fetch(`${PROXY}/call`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: {
+			"content-type": "application/json",
+			...(EGRESS_TOKEN ? { "x-egress-token": EGRESS_TOKEN } : {}),
+		},
 		body: JSON.stringify({ server, tool, args: args ?? {}, meta: { arm: "vanilla", residency: RESIDENCY, runId: RUN_ID } }),
 	});
 	const body = (await response.json()) as { ok: boolean; text?: string; error?: string };
