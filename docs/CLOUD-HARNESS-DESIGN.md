@@ -306,3 +306,91 @@ labelled confined, demonstrably sandboxed, and leaking the key throughout. Both
 container runners therefore check the volume's build for the marker and **fail
 preflight** rather than run under a boundary they do not have. Re-provision
 (`bench/*/provision-agent-volume.sh`) before using `posture=boundary` there.
+
+## 8. Hosted topology (agreed 2026-08-16): orchestrator, worker pool, provider abstraction
+
+The single-machine harness above generalizes to a hosted service along three
+pillars. Every interface needed already exists; what changes is where each
+piece runs.
+
+### 8.1 Brains are a queue, sandboxes are a pool
+
+The brain is stateless and rebuilds from the session log, so "a brain" is not
+a resident process — it is a function any worker executes when a wake fires.
+Brains need a **work queue**, not registration.
+
+The sandbox is the thing with placement: files and running jobs live on a
+machine. **Sandbox workers register with the orchestrator**, which owns the
+session→worker mapping and routes a session's turns to wherever its sandbox
+lives. The scheduler (runtime/scheduler.py) is the single-node miniature of
+this orchestrator: its lease primitive (pid + process-start identity)
+generalizes to worker heartbeats, its directory scan to a real queue, and its
+exactly-once rename-claims carry over unchanged. The session log moves to
+shared storage (object store) so a brain on any machine can rebuild — a
+storage swap, not a redesign, because the log was already the only truth.
+
+Spawn-as-API-call and the egress token (§7) were the load-bearing changes:
+they removed the last assumptions that kernel and harness share a filesystem
+or an environment.
+
+### 8.2 The sandbox is an abstraction ("hands"), with a certification suite
+
+What the brain needs from hands is five verbs; everything else is backend
+implementation detail:
+
+1. **run code** — a kernel/exec channel
+2. **stage and read files** — runtime in, artifacts and job records out
+3. **run processes that outlive a turn** — and observe them from outside
+   (jobs are files + pids inside the sandbox, deliberately)
+4. **enforce the network posture** — egress-only-to-proxy, however the
+   backend does it
+5. **lifecycle** — create, evict, destroy
+
+`SandboxProvider` implementations: **local-srt** (eval, built), **docker**
+(TAC/terminal-bench — the in-container harness install is this backend,
+built once already), **SaaS** (Daytona/E2B/Modal-shaped: their SDKs are
+exactly create/exec/fs; posture is their network-policy config). The pattern
+that makes any backend identical: a small self-contained payload runs inside
+the sandbox (kernel + jobs.py + prelude — dependency-free Python), and the
+harness talks to it over one channel. A provider only has to answer "can you
+run a process and expose a socket." On Linux that channel must respect §7.2
+(bwrap netns: unix socket or domain-alias, never bare loopback).
+
+The certification suite already exists: `sandbox-check` plus the
+keyleak/eviction/subagent live tasks run *from inside* and report what the
+boundary actually holds. Point them at a backend and get pass/fail on
+whether it delivers the posture — that is the acceptance gate for any
+provider, instead of its marketing page. The scheduler's one assumption to
+break is "I can read the sandbox's files locally": behind the provider it
+becomes `provider.fs.read`, and wake-on-job-completion becomes a poll or
+webhook per backend — contained, because everything is already files.
+
+### 8.3 Survivorship: one recovery experience, computed, never promised
+
+"Machine died" reuses the kernel-death experience — same notice, different
+survivor set. Three configurations of one message:
+
+| lost | memory | files | running jobs | session log |
+|---|---|---|---|---|
+| kernel died (tested live) | gone | intact | intact | intact |
+| machine died, no replication | gone | **gone** | **gone** | intact (off-machine) |
+| machine died, files replicated | gone | intact | dead ("machine lost") | intact |
+
+The discipline — the lesson the eviction work taught once already — is that
+the notice **reports what is verifiably there, not a promise**. The current
+notice hardcodes "your files are intact," true for kernel eviction and a lie
+after unreplicated machine loss. The fix: the fresh sandbox enumerates the
+job records and files it can actually see, and the notice says exactly that.
+Jobs on a dead machine are marked "machine lost" rather than silently
+vanishing; the agent decides what is worth re-running. Replication is then a
+deployment knob (shared FS buys a better survivorship report), while the
+invariant — *the agent is never lied to about what survived* — holds in
+every configuration.
+
+Two hard prerequisites: the session log always lives off-machine, and job
+records carry enough off-machine (name, command, purpose) that the loss
+report is meaningful even when the job's files went with the machine.
+
+Testable the same way eviction was: destroy the sandbox, create a fresh one
+under the chosen storage policy, assert the notice matches reality, assert
+the agent completes.
