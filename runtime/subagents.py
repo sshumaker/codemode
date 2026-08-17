@@ -32,9 +32,10 @@ The child is a brain, and a brain holds a real API credential. The architecture
 (docs/CLOUD-HARNESS-DESIGN.md §3.3) puts brains harness-side and leaves the sandbox
 running python cells only, so `spawn` may not fork the child from the kernel: it
 would place a credential-holding model loop inside the sandbox and hand it the
-kernel's environment. With `HARNESS_KERNEL_ENV_SCRUB` in force that environment no
-longer has a key at all, and the child fails as a *weak subagent* rather than as a
-harness error.
+kernel's environment. With the kernel env allow-list in force
+(`HARNESS_KERNEL_ENV_ALLOW`, or the older deny-list `HARNESS_KERNEL_ENV_SCRUB`) that
+environment no longer has a key at all, and the child fails as a *weak subagent*
+rather than as a harness error.
 
 So with `HARNESS_SUBAGENT_BROKER=1` this writes a REQUEST (`jobs.submit(via_broker=
 True)`) and `runtime/subagent_broker.py`, running in the loop's world, starts the
@@ -119,6 +120,7 @@ BROKER_VAR = "HARNESS_SUBAGENT_BROKER"
 # travel in the spec or the child would quietly run less confined than its parent
 # — the one difference that must never appear by accident.
 BOUNDARY_VARS = (
+    "HARNESS_KERNEL_ENV_ALLOW",
     "HARNESS_KERNEL_ENV_SCRUB",
     "HARNESS_KERNEL_SANDBOX_SETTINGS",
     "HARNESS_KERNEL_SANDBOX_BIN",
@@ -380,9 +382,26 @@ class Subagents:
 
         Named vars only, and only ones the harness itself removed: this must not
         start guessing which environment variable a provider needs.
+
+        Under an allow-list there is no such list to check — the environment was
+        BUILT from the allowed names, so what is missing is everything nobody
+        named, which cannot be enumerated from in here. That posture is itself
+        the answer: a harness that constructs the kernel's environment has
+        decided the kernel holds no credentials, and forking a brain out of it
+        is the configuration error either way.
         """
         if self.brokered():
             return
+        allowed = (self._env.get("HARNESS_KERNEL_ENV_ALLOW") or "").strip()
+        if allowed:
+            raise JobError(
+                "this kernel cannot start a subagent: the harness built its environment "
+                f"from an allow-list ({allowed}), so a child started from here would run "
+                "without provider credentials and fail inside its own loop.\n"
+                "That is a harness configuration problem, not something to work around from a "
+                "cell — the harness must run runtime/subagent_broker.py and set "
+                f"{BROKER_VAR}=1. Report it and do the work here instead."
+            )
         scrubbed = [n.strip() for n in
                     (self._env.get("HARNESS_KERNEL_ENV_SCRUB") or "").split(",") if n.strip()]
         missing = [n for n in scrubbed if not self._env.get(n)]

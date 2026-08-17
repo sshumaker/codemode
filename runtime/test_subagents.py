@@ -264,9 +264,14 @@ class TestChildEnvironment(Base):
         # sandbox settings and the env scrub that confine the parent's kernel have
         # to travel in the spec or the child's kernel comes up less confined than
         # its parent's — running model-authored code with a boundary nobody chose.
+        # Brokered, which is the configuration the boundary vars exist for: the
+        # child is started out here by a process whose environment is the loop's,
+        # so the confinement has to arrive in the spec or it does not arrive.
         spawner = S.Subagents(
             self.store,
             env=dict(self.env,
+                     HARNESS_SUBAGENT_BROKER="1",
+                     HARNESS_KERNEL_ENV_ALLOW="PATH,HOME,HARNESS_*",
                      HARNESS_KERNEL_ENV_SCRUB="ANTHROPIC_API_KEY",
                      HARNESS_KERNEL_SANDBOX_SETTINGS="/run/srt.json",
                      HARNESS_KERNEL_SANDBOX_BIN="/run/srt",
@@ -275,6 +280,9 @@ class TestChildEnvironment(Base):
         )
         spawner.spawn("a", name="scout")
         env = self.spec("scout")["env"]
+        # The allow-list above all: a child whose kernel inherits the broker's
+        # environment unfiltered is a sandbox with the loop's credentials in it.
+        self.assertEqual(env["HARNESS_KERNEL_ENV_ALLOW"], "PATH,HOME,HARNESS_*")
         self.assertEqual(env["HARNESS_KERNEL_ENV_SCRUB"], "ANTHROPIC_API_KEY")
         self.assertEqual(env["HARNESS_KERNEL_SANDBOX_SETTINGS"], "/run/srt.json")
         self.assertEqual(env["HARNESS_KERNEL_SANDBOX_BIN"], "/run/srt")
@@ -504,6 +512,28 @@ class TestCredentialsGuard(Base):
         # change for them.
         self.spawner.spawn("a", name="scout")
         self.assertEqual(len(self.world.spawned), 1)
+
+    ALLOWED = {"HARNESS_KERNEL_ENV_ALLOW": "PATH,HOME,HARNESS_*"}
+
+    def test_an_allow_list_kernel_refuses_to_spawn_directly(self):
+        # The allow-list posture has no list of removed names to check — the
+        # environment was built from the allowed ones — so the refusal keys on
+        # the posture itself. A kernel constructed this way holds no credential
+        # by design, whatever the provider's variable happens to be called.
+        spawner = S.Subagents(self.store, env=dict(self.env, **self.ALLOWED),
+                              node="node", python="python3")
+        with self.assertRaises(J.JobError) as ctx:
+            spawner.spawn("a", name="scout")
+        msg = str(ctx.exception)
+        self.assertIn("allow-list", msg)
+        self.assertIn("HARNESS_SUBAGENT_BROKER", msg)
+        self.assertEqual(self.world.spawned, [], "it spawned anyway")
+
+    def test_an_allow_list_kernel_may_request_one_through_the_broker(self):
+        spawner = S.Subagents(
+            self.store, env=dict(self.env, HARNESS_SUBAGENT_BROKER="1", **self.ALLOWED),
+            node="node", python="python3")
+        self.assertEqual(spawner.spawn("a", name="scout").state, "requested")
 
 
 # ---------------------------------------------------------------------------------

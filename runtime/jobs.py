@@ -828,6 +828,15 @@ class JobStore:
             "requested_at": rec["started_at"],
             "max_runtime": rec.get("max_runtime"),
         }
+        proxy = os.environ.get("HARNESS_EGRESS_PROXY")
+        if proxy:
+            # API call as the transport, the same file as the durability log: the
+            # egress proxy runs harness-side where the jobs directory lives, and
+            # its /control/spawn writes this exact payload into requests/ (see
+            # proxy/egress/main.go). The sandbox needs no shared filesystem with
+            # the harness for spawn — only the one network route it already has.
+            self._post_request(proxy, payload)
+            return f"{proxy}/control/spawn"
         path = self._request_path(rec["name"])
         tmp = f"{path}.writing"
         with open(tmp, "w") as fh:
@@ -844,6 +853,41 @@ class JobStore:
         except OSError:
             pass
         return path
+
+    def _post_request(self, proxy: str, payload: dict) -> None:
+        """
+        POST the request to the egress proxy's control surface. Raises OSError on
+        any failure so submit()'s existing no-request-means-no-job path fires.
+
+        201 = requested; 200 = already_requested, which is SUCCESS — a retried
+        POST after a lost response must not fail the job the first POST started.
+        Anything else is refusal or breakage, and a spawn that was refused must
+        be an error now, not a job that silently never starts.
+        """
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps({"name": payload["name"], "body": payload}).encode()
+        req = urllib.request.Request(
+            proxy.rstrip("/") + "/control/spawn",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "x-egress-token": os.environ.get("HARNESS_EGRESS_TOKEN", ""),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status not in (200, 201):
+                    raise OSError(f"egress proxy answered {resp.status}")
+        except urllib.error.HTTPError as exc:
+            # HTTPError IS the response; closing it keeps a refused spawn from
+            # leaving a dangling socket (and a ResourceWarning) behind.
+            exc.close()
+            raise OSError(f"egress proxy refused the spawn: {exc.code} {exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise OSError(f"egress proxy unreachable: {exc.reason}") from exc
 
     def _cancel_request(self, rec: dict) -> bool:
         """
@@ -1288,7 +1332,14 @@ class JobStore:
             # knows about; a record with no request is a job that visibly never
             # started, which `_refresh`'s claim timeout then explains.
             try:
-                self._write_request(rec, wrapped)
+                # Where the request actually went. Under the egress transport
+                # there is no local file, and a record still naming one would
+                # send anyone diagnosing a stuck job to a path that was never
+                # written — the request's own evidence, pointing at nothing.
+                locator = self._write_request(rec, wrapped)
+                if locator != rec["request_file"]:
+                    rec["request_file"] = locator
+                    self._write(rec)
             except OSError as exc:
                 self._terminate(rec, state="killed",
                                 reason=f"the broker request could not be written: {exc}")

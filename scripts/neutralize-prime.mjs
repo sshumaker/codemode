@@ -62,47 +62,48 @@ function sub(relPath, find, replace, label, marker) {
 	log(`  patched ${relPath} :: ${label}`);
 }
 
+/**
+ * A patch body, read from scripts/patches/ as real TypeScript.
+ *
+ * Embedding a multi-line snippet as an escaped string here mangled every
+ * backslash — `\n` became a literal newline and `\w` became `w` — and produced
+ * a file that did not compile (CLAUDE.md).
+ */
+const patch = (name) => readFileSync(join(ROOT, "scripts/patches", name), "utf8").trimEnd();
+
 log("neutralizing prime-agent for reproducible runs\n");
 
-// ---- kernel env scrub: the sandbox boundary ------------------------------
+// ---- kernel env: the sandbox boundary ------------------------------------
 // The brain (loop) holds ANTHROPIC_API_KEY; the kernel and everything agent
-// code spawns from it must not (docs/CLOUD-HARNESS-DESIGN.md). Opt in per run
-// with HARNESS_KERNEL_ENV_SCRUB=<comma-separated var names>.
+// code spawns from it must not (docs/CLOUD-HARNESS-DESIGN.md). The helper is
+// the whole boundary, so it lives in scripts/patches/kernel-env.ts as real
+// TypeScript rather than as an escaped string; it supports an allow-list
+// (HARNESS_KERNEL_ENV_ALLOW, fails closed) and the older deny-list
+// (HARNESS_KERNEL_ENV_SCRUB, fails open).
 sub(
 	"core/kernel/index.ts",
 	'} from "./state-snapshot.js";',
-	'} from "./state-snapshot.js";\n\n' +
-		"// Sandbox boundary (docs/CLOUD-HARNESS-DESIGN.md): the brain holds the real\n" +
-		"// credentials; the kernel must not. HARNESS_KERNEL_ENV_SCRUB names env vars\n" +
-		"// (comma-separated) to remove from the kernel process env — the loop keeps\n" +
-		"// them, only the spawned kernel (and everything it spawns) loses them.\n" +
-		"function scrubKernelEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {\n" +
-		'\tconst names = (process.env.HARNESS_KERNEL_ENV_SCRUB ?? "")\n' +
-		'\t\t.split(",")\n' +
-		"\t\t.map((s) => s.trim())\n" +
-		"\t\t.filter(Boolean);\n" +
-		"\tif (names.length === 0) return env;\n" +
-		"\tconst out = { ...env };\n" +
-		"\tfor (const n of names) delete out[n];\n" +
-		"\treturn out;\n" +
-		"}",
-	"kernel env scrub helper",
-	"function scrubKernelEnv",
+	`} from "./state-snapshot.js";\n\n${patch("kernel-env.ts")}`,
+	"kernel env allow-list/scrub helper",
+	"function kernelSpawnEnv",
 );
+// Both spawn sites pass the inherited environment and KernelOptions.env
+// SEPARATELY, because the allow-list filters the first and must not touch the
+// second. They keep upstream's own asymmetry — a copy on the fork path, the
+// live object on the direct path — which is also what makes the two patched
+// texts differ, so sub()'s presence check cannot mistake one site for the other
+// (that collision is how the direct-spawn site went unpatched in a546017).
 sub(
 	"core/kernel/index.ts",
 	"env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },",
-	"env: scrubKernelEnv(this.options.env ? { ...process.env, ...this.options.env } : { ...process.env }),",
-	"fork-path kernel env goes through the scrub",
+	"env: kernelSpawnEnv({ ...process.env }, this.options.env),",
+	"fork-path kernel env is built by the boundary helper",
 );
 sub(
 	"core/kernel/index.ts",
 	"env: this.options.env ? { ...process.env, ...this.options.env } : process.env,",
-	// Keeps the bare process.env else-branch (scrub copies before deleting), so
-	// this patched text differs from the fork-path's and the presence check
-	// cannot mistake one site's patch for the other's.
-	"env: scrubKernelEnv(this.options.env ? { ...process.env, ...this.options.env } : process.env),",
-	"direct-spawn kernel env goes through the scrub",
+	"env: kernelSpawnEnv(process.env, this.options.env),",
+	"direct-spawn kernel env is built by the boundary helper",
 );
 
 
@@ -211,12 +212,8 @@ sub(
 // Gated on HARNESS_SHOW_NAMESPACE=1 so it can be A/B'd against the prompt-only
 // fix (variant q7) rather than silently becoming part of the arm.
 //
-// The snippets live in scripts/patches/*.ts as real TypeScript. Embedding them
-// as escaped strings here mangled every backslash — `\n` became a literal
-// newline and `\w` became `w` — and produced a file that did not compile.
+// The snippets live in scripts/patches/*.ts as real TypeScript (see `patch`).
 log("\nnamespace injection:");
-
-const patch = (name) => readFileSync(join(ROOT, "scripts/patches", name), "utf8").trimEnd();
 
 sub(
 	"core/tools/ipython.ts",

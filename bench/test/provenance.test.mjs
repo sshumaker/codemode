@@ -167,6 +167,18 @@ describe("the compiled harness is current", () => {
 		);
 	});
 
+	it("the kernel env boundary is in the COMPILED harness", () => {
+		// The credential boundary is the one patch where a stale or mis-built dist
+		// is not a wrong measurement but an open sandbox: src can carry the
+		// allow-list while the bundle the run executes still inherits everything.
+		// Both branches, because a build that dropped either leaves a posture the
+		// harness thinks it has.
+		const kernel = readFileSync(join(DIST, "core/kernel/index.js"), "utf8");
+		for (const marker of ["HARNESS_KERNEL_ENV_ALLOW", "HARNESS_KERNEL_ENV_SCRUB", "kernelSpawnEnv"]) {
+			assert.match(kernel, new RegExp(marker), `${marker} missing from dist/core/kernel/index.js`);
+		}
+	});
+
 	it("the compiled registry builds all eight tools", async () => {
 		const registry = await import(join(DIST, "core/tools/index.js"));
 		const built = registry.createAllToolDefinitions(ROOT, {});

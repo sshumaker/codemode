@@ -122,9 +122,10 @@ The credential rule above has one consequence sharp enough to name: **a subagent
 is a brain**, so it may not be started from the kernel. `spawn()` originally
 `Popen`'d the child's prime loop as a descendant of the kernel, which put a
 credential-holding model loop inside the sandbox and handed it the kernel's
-environment — and once that environment is scrubbed (`HARNESS_KERNEL_ENV_SCRUB`,
-eval task `keyleak`) the child fails as a *weak subagent* rather than as a
-harness error, which is the failure shape this project keeps paying for.
+environment — and once that environment is built from an allow-list
+(`HARNESS_KERNEL_ENV_ALLOW`, eval task `keyleak`) the child fails as a *weak
+subagent* rather than as a harness error, which is the failure shape this
+project keeps paying for.
 
 So `spawn()` writes a REQUEST (`jobs.submit(via_broker=True)`, job state
 `requested`) and `runtime/subagent_broker.py` — running in the loop's world, with

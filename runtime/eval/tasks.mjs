@@ -417,7 +417,8 @@ export const TASKS = {
 	/**
 	 * 1c. KEY BOUNDARY. The brain holds the API key; the sandbox side must not.
 	 *
-	 * Run with HARNESS_KERNEL_ENV_SCRUB=ANTHROPIC_API_KEY. The agent reports what
+	 * run.mjs builds the kernel's environment from an allow-list, so no flag is
+	 * needed and nothing has to name the key. The agent reports what
 	 * it can see from a cell AND from a job it spawned (jobs inherit the kernel's
 	 * env, so a leak through either path shows up in an artefact, not an
 	 * inference). The run completing at all is the matching positive control: the
@@ -814,7 +815,8 @@ export const TASKS = {
 	 * the sandbox holds no credential. The claim that matters is their conjunction —
 	 * a subagent completes WHILE the sandbox provably has no key — and two passing
 	 * runs do not make it, because nothing rules out the two conditions having held
-	 * at different moments. Run with HARNESS_KERNEL_ENV_SCRUB=ANTHROPIC_API_KEY.
+	 * at different moments — the kernel env allow-list run.mjs sets makes the
+	 * second half true by construction.
 	 *
 	 * The child is graded on its own artefacts for the reason `subagent` is: a
 	 * parent that read the file itself and said a child did would pass every

@@ -11,8 +11,8 @@ architecture (docs/CLOUD-HARNESS-DESIGN.md §3.3, and Scott 2026-08-16) says the
 brain is stateless, harness-side, and holds the credentials, while the sandbox
 runs python cells and nothing else. `spawn()` used to fork the child straight
 out of the kernel, which put a brain inside the sandbox and handed it the
-kernel's environment — so the moment the kernel env was scrubbed of
-`ANTHROPIC_API_KEY` (`HARNESS_KERNEL_ENV_SCRUB`, eval task `keyleak`) that child
+kernel's environment — so the moment the kernel env stopped carrying
+`ANTHROPIC_API_KEY` (`HARNESS_KERNEL_ENV_ALLOW`, eval task `keyleak`) that child
 became a subagent with no key: a *weak subagent* rather than a harness error,
 which is the failure mode this project keeps paying for.
 

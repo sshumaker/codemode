@@ -19,9 +19,18 @@
  * Generated rather than copied, so none of them can drift from the implementation.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, createWriteStream } from "node:fs";
-import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
+import {
+	mkdirSync,
+	writeFileSync,
+	readFileSync,
+	readdirSync,
+	existsSync,
+	createWriteStream,
+	readlinkSync,
+	realpathSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { TASKS } from "./tasks.mjs";
 import { pollShape } from "./poll-shape.mjs";
@@ -154,6 +163,69 @@ mkdirSync(jobDir, { recursive: true });
 const sandboxed = !argv.includes("--no-sandbox");
 const srtBin = join(ROOT, "node_modules/.bin/srt");
 const srtSettings = join(runDir, "srt-settings.json");
+
+/**
+ * What the kernel is allowed to READ.
+ *
+ * srt (0.0.71) has no read allow-list field: reads are permitted everywhere by
+ * default and the only shape it offers is deny-then-allow — `denyRead` takes a
+ * broad region and `allowRead` re-allows inside it (read precedence is the
+ * opposite of write's, README §Filesystem). So an allow-list is expressed as
+ * "deny the region that holds every credential, name what the kernel needs".
+ *
+ * The denied region is the whole home directory, because that is where all of
+ * them live: ~/.ssh, ~/.aws, ~/.claude, and — the one this run is about — the
+ * loop's own env file, which run.mjs sources in launch.sh and which was
+ * readable from a cell until now. System directories stay readable: python's
+ * interpreter and dyld need them, and no credential of ours is there.
+ *
+ * Everything re-allowed is code or scratch, never a secret:
+ *   runDir      the task's own world (also the only writable place)
+ *   RUNTIME     the prelude and jobs.py, loaded into the kernel at boot
+ *   CLI's dir   subagents.py stats HARNESS_SUBAGENT_CLI from inside the kernel
+ *   venv/base   the kernel interpreter, and the install its symlinks resolve to
+ *   tmp         ipykernel's connection file, and font/matplotlib caches
+ *
+ * Not used here: srt's `credentials.files`, which masks a named file with a
+ * sentinel rather than denying it. Masking is per-file and this needs to hold
+ * for files nobody has enumerated yet — the same fail-closed argument as the
+ * env allow-list below.
+ */
+const kernelPython = process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
+
+/**
+ * Every prefix the interpreter is reachable through: the venv, and the base
+ * install its `bin/python` symlinks into (where the stdlib actually lives).
+ *
+ * EVERY hop of the symlink chain, not just the endpoint, because seatbelt
+ * matches the path as SPELLED rather than as resolved. Measured: uv's venv
+ * points at `.../uv/python/cpython-3.11-macos-aarch64-none`, itself a symlink
+ * to `cpython-3.11.15-...`; allowing only the realpath produced
+ * "/bin/bash: .../python: Operation not permitted" — the kernel could not exec
+ * its own interpreter, and every probe in sandbox-check failed at once, which
+ * reads as a broken sandbox rather than as one missing spelling.
+ */
+function pythonPrefixes(python) {
+	const roots = new Set([resolve(python, "../..")]);
+	let p = python;
+	for (let hop = 0; hop < 8; hop++) {
+		let target;
+		try {
+			target = readlinkSync(p);
+		} catch {
+			break; // not a symlink, or gone: end of the chain
+		}
+		p = resolve(dirname(p), target);
+		roots.add(resolve(p, "../.."));
+	}
+	try {
+		roots.add(resolve(realpathSync(python), "../.."));
+	} catch {
+		// No venv yet (the first run builds it); the spellings above still hold.
+	}
+	return [...roots];
+}
+const kernelReadable = [runDir, RUNTIME, dirname(CLI), ...pythonPrefixes(kernelPython), "/tmp", tmpdir()];
 if (sandboxed) {
 	writeFileSync(
 		srtSettings,
@@ -168,7 +240,8 @@ if (sandboxed) {
 					// lives. Allowing only /tmp left the kernel unable to reach it.
 					allowWrite: [runDir, "/tmp", tmpdir()],
 					denyWrite: [],
-					denyRead: ["~/.ssh", "~/.aws"],
+					denyRead: [homedir()],
+					allowRead: kernelReadable,
 				},
 				network: {
 					// The kernel needs nothing off-box. Anything it reaches for is either a
@@ -230,6 +303,35 @@ let buffer = "";
 let stderr = "";
 const counted = new Set();
 
+/**
+ * What the kernel is allowed to INHERIT.
+ *
+ * An allow-list, not a scrub. The deny-list posture (HARNESS_KERNEL_ENV_SCRUB)
+ * names what to remove, so it is only ever as good as the list — it fails open,
+ * and the next credential to appear in the loop's environment is in the kernel
+ * the day it is added, silently. This names what may survive instead: the
+ * kernel's environment is BUILT from these, so anything unlisted is absent by
+ * construction, including things nobody has thought of yet.
+ *
+ * The list is short because the kernel needs little: enough to run a process
+ * (PATH/HOME/TMPDIR and the locale), the IPython profile that installs the
+ * prelude, and the HARNESS_* settings that ARE the runtime's configuration —
+ * job directory, wait ceilings, the subagent model and CLI, the egress proxy
+ * and its token. `HARNESS_*` is a prefix, so a new runtime setting works
+ * without an edit here while a new credential still does not.
+ *
+ * --env-inherit turns the whole thing off (kernel inherits the loop's env, the
+ * pre-boundary behaviour) for debugging a run that dies for want of a variable.
+ */
+const KERNEL_ENV_ALLOW = [
+	"PATH", "HOME", "TMPDIR", "TMP", "TEMP",
+	"USER", "LOGNAME", "SHELL", "TERM", "TZ",
+	"LANG", "LC_ALL", "LC_CTYPE",
+	"IPYTHONDIR",
+	"HARNESS_*",
+].join(",");
+const envInherit = argv.includes("--env-inherit");
+
 // The agent itself is NOT wrapped — only the kernel it spawns is (see above).
 const runEnv = {
 			...process.env,
@@ -257,6 +359,8 @@ const runEnv = {
 			...(argv.includes("--adopt-quiet") ? { HARNESS_ADOPT_QUIET: "1" } : {}),
 			// Read by the patched kernel spawn; absent means no sandbox.
 			...(sandboxed ? { HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettings, HARNESS_KERNEL_SANDBOX_BIN: srtBin } : {}),
+			// Also read by the patched kernel spawn (scripts/patches/kernel-env.ts).
+			...(envInherit ? {} : { HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW }),
 			// Deliberately low so a blocked cell is interrupted quickly and the eval
 			// can observe whether the interrupt teaches `submit`.
 			HARNESS_CELL_TIMEOUT_MS: String(Number(flag("cell-timeout", String(task.cellTimeout ?? 60))) * 1000),
@@ -533,6 +637,10 @@ child.on("close", (code) => {
 	// The broker is per-run; the children it started are not (setsid).
 	stopBroker();
 	summary.sandboxed = sandboxed;
+	// The boundary the run actually had, recorded next to what it did. The srt
+	// settings are already a file in runDir; this is the env half, and without it
+	// a keyleak PASS cannot be told from a run that simply had no key to leak.
+	summary.kernelEnvAllow = envInherit ? null : KERNEL_ENV_ALLOW;
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;
 	summary.stderrTail = stderr.split("\n").slice(-6).join("\n");

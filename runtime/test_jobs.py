@@ -16,6 +16,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 import jobs as J
 
@@ -973,3 +974,148 @@ class TestBashGuardCLI(unittest.TestCase):
     def test_quoted_text_is_not_mistaken_for_a_wait(self):
         # shlex, not a regex over raw source. `echo "sleep 300"` prints a string.
         self.assertFalse(J.check_blocking('echo "sleep 300"')["blocking"])
+
+
+# ---------------------------------------------------------------------------------
+# the brokered request as an API call
+# ---------------------------------------------------------------------------------
+
+class TestBrokerRequestOverEgress(Base):
+    """
+    `spawn` over the egress proxy (proxy/egress, POST /control/spawn).
+
+    The hosted shape has no filesystem in common between the sandbox and the
+    harness, so the request cannot be a file the broker finds — it is a POST to
+    the one network route the sandbox has, and the proxy writes the file on the
+    other side. The durability story is unchanged, but the failure modes move:
+    a refused POST must become a JobError and a terminated record, because a
+    request that was never accepted is a job that will never start, and
+    "requested" would report it as about to.
+
+    Against a REAL server on a real socket rather than a patched urlopen: the
+    thing under test is a request crossing a boundary, and a mocked transport
+    would prove the call site and nothing about what arrives.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import http.server
+        import threading
+
+        self.received = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                outer.received.append({
+                    "path": self.path,
+                    # Lower-cased: urllib sends "X-egress-token", Go reads it
+                    # canonically, and HTTP header names are case-insensitive —
+                    # asserting on the wire casing would pin urllib, not us.
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": json.loads(body.decode()),
+                })
+                status = outer.status
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"requested"}')
+
+            def log_message(self, *a):
+                pass
+
+        self.status = 201
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.proxy = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        super().tearDown()
+
+    def env(self, **kw):
+        return unittest.mock.patch.dict(
+            os.environ,
+            {"HARNESS_EGRESS_PROXY": self.proxy, "HARNESS_EGRESS_TOKEN": "egr-testtoken", **kw},
+        )
+
+    def requests_dir(self):
+        return os.path.join(self.dir, J.REQUESTS_DIR)
+
+    def test_the_request_is_posted_and_no_local_file_is_written(self):
+        with self.env():
+            job = self.store.submit("echo hi", name="scout", via_broker=True)
+        self.assertEqual(job.state, "requested")
+        self.assertEqual(len(self.received), 1)
+        sent = self.received[0]
+        self.assertEqual(sent["path"], "/control/spawn")
+        self.assertEqual(sent["body"]["name"], "scout")
+        # The wrapper, not the bare command: the broker starts what the payload
+        # says, and a job started without the pid/exit-marker wrapper is one
+        # nothing can refresh.
+        self.assertIn("echo hi", sent["body"]["body"]["wrapped"])
+        self.assertEqual(sent["body"]["body"]["log"], os.path.join(self.dir, "scout.log"))
+        # Nothing local: no requests/ file, and nothing forked either.
+        self.assertFalse(os.path.exists(os.path.join(self.requests_dir(), "scout.json")))
+        self.assertEqual(self.world.spawned, [])
+        # The record names where the request went, so a stuck job is diagnosable
+        # without knowing which transport the run used.
+        with open(os.path.join(self.dir, "scout.json")) as fh:
+            self.assertEqual(json.load(fh)["request_file"], f"{self.proxy}/control/spawn")
+
+    def test_the_session_token_travels_with_the_request(self):
+        with self.env():
+            self.store.submit("echo hi", name="scout", via_broker=True)
+        self.assertEqual(self.received[0]["headers"]["x-egress-token"], "egr-testtoken")
+
+    def test_a_retried_request_the_proxy_already_has_is_success(self):
+        # 200 already_requested. A POST whose response was lost is retried by the
+        # caller, and failing the second one would kill a job the first started.
+        self.status = 200
+        with self.env():
+            job = self.store.submit("echo hi", name="scout", via_broker=True)
+        self.assertEqual(job.state, "requested")
+
+    def test_a_refused_request_is_an_error_and_the_job_is_terminated(self):
+        for status in (400, 500):
+            with self.subTest(status=status):
+                self.status = status
+                name = f"scout{status}"
+                with self.env(), self.assertRaises(J.JobError) as ctx:
+                    self.store.submit("echo hi", name=name, via_broker=True)
+                self.assertIn("nothing will run", str(ctx.exception))
+                # The record must not survive as `requested`: that reads as "about
+                # to start" forever, for work nobody accepted.
+                with open(os.path.join(self.dir, f"{name}.json")) as fh:
+                    rec = json.load(fh)
+                self.assertEqual(rec["state"], "killed")
+                self.assertIn("could not be written", rec["reason"])
+                self.assertEqual(self.world.spawned, [])
+
+    def test_an_unreachable_proxy_is_the_same_error(self):
+        # Refusal and unreachability are the same thing to the caller — no job —
+        # and the difference belongs in the reason, not in the outcome.
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"HARNESS_EGRESS_PROXY": "http://127.0.0.1:1", "HARNESS_EGRESS_TOKEN": "t"},
+        ), self.assertRaises(J.JobError):
+            self.store.submit("echo hi", name="scout", via_broker=True)
+        with open(os.path.join(self.dir, "scout.json")) as fh:
+            self.assertEqual(json.load(fh)["state"], "killed")
+
+    def test_without_the_proxy_the_request_is_still_a_file(self):
+        # The local transport is the default and must not have moved: benchmarks
+        # and the eval run the broker against a shared directory.
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HARNESS_EGRESS_PROXY", None)
+            job = self.store.submit("echo hi", name="scout", via_broker=True)
+        self.assertEqual(job.state, "requested")
+        self.assertEqual(self.received, [])
+        path = os.path.join(self.requests_dir(), "scout.json")
+        self.assertTrue(os.path.exists(path), "no request file for the broker to claim")
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["name"], "scout")
