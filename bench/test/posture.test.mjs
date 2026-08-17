@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { KERNEL_ENV_ALLOW, srtSettings } from "../../runtime/posture.mjs";
+import { KERNEL_ENV_ALLOW, defaultEgressListen, egressSocketPath, srtSettings } from "../../runtime/posture.mjs";
 import { renderClient } from "../generate.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -109,6 +109,63 @@ describe("srt settings deny the region that holds the credentials", () => {
 		// The kernel reaches the egress proxy over loopback (macOS) rather than
 		// through this list. An entry here would be a second route out.
 		assert.deepEqual(s.network.allowedDomains, []);
+	});
+});
+
+describe("the proxy's address form follows the platform's sandbox", () => {
+	// The Linux half of §7.2, as an executed check. bwrap gives the sandbox its own
+	// network namespace, so a TCP default there is a boundary with no working door —
+	// and the failure looks like "the agent never called spawn", not like an error.
+	it("linux defaults to the unix socket, macOS keeps the proven TCP loopback", () => {
+		const real = process.platform;
+		try {
+			for (const [platform, want] of [["linux", "unix"], ["darwin", "tcp"], ["win32", "tcp"]]) {
+				Object.defineProperty(process, "platform", { value: platform, configurable: true });
+				assert.equal(defaultEgressListen(), want, `${platform} should listen ${want}`);
+			}
+		} finally {
+			Object.defineProperty(process, "platform", { value: real, configurable: true });
+		}
+	});
+
+	it("the socket-path ceiling is the same number in the proxy and in the harness", () => {
+		// Two copies of a kernel constant, in two languages. Disagreement is a run
+		// that dies at bind() with "invalid argument" — the proxy refusing a path
+		// this module handed it.
+		const go = /unixPathMax = (\d+)/.exec(read("proxy/egress/main.go"));
+		const js = /UNIX_PATH_MAX = (\d+)/.exec(read("runtime/posture.mjs"));
+		assert.ok(go && js, "one of the two ceilings is no longer a named constant");
+		assert.equal(js[1], go[1]);
+	});
+
+	it("a socket path too long for the run directory falls back inside the ceiling", () => {
+		const ceiling = Number(/UNIX_PATH_MAX = (\d+)/.exec(read("runtime/posture.mjs"))[1]);
+		assert.equal(egressSocketPath("/run/x"), "/run/x/egress.sock");
+		const deep = `/run/${"nested-run-directory/".repeat(8)}`;
+		const fallback = egressSocketPath(deep, "s");
+		assert.ok(fallback.length < ceiling, `fallback ${fallback} is ${fallback.length} bytes`);
+		assert.notEqual(fallback, join(deep, "egress.sock"));
+	});
+
+	it("the MCP runners ask for TCP and refuse Linux, where their clients cannot reach it", () => {
+		// The MCP route is used by clients that speak HTTP over TCP only. Taking the
+		// platform default there would give a Linux run a socket its arms cannot dial
+		// — a posture whose single route out is dead, which reads as an ungrounded
+		// agent rather than as a broken boundary.
+		for (const file of ["bench/run-task.mjs", "bench/appworld/run-task.mjs"]) {
+			const src = read(file);
+			assert.match(src, /listen: "tcp"/, `${file} does not pin the MCP transport`);
+			assert.match(src, /process\.platform === "linux"/, `${file} does not refuse the Linux case`);
+			assert.match(src, /unix socket \(docs\/CLOUD-HARNESS-DESIGN\.md §7\.2\)/, `${file}'s refusal cites no reason`);
+		}
+	});
+
+	it("a unix-only proxy is told to open no port", () => {
+		// --listen has a real default, so the socket case has to say "none" out loud;
+		// forgetting it would leave a TCP listener open on the platform where TCP is
+		// exactly what does not work. (The rule itself is pinned in Go —
+		// TestSocketOnlyRunOpensNoPort.)
+		assert.match(read("runtime/posture.mjs"), /"--listen", listen === "unix" \? "none" : "127\.0\.0\.1:0"/);
 	});
 });
 

@@ -31,6 +31,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -121,16 +122,20 @@ export function pythonPrefixes(python) {
  * hosted. There srt sandboxes through bubblewrap, which puts the process in its
  * own network namespace with only its own loopback — measured inside a container,
  * a POST to the proxy on 127.0.0.1 gets no connection at all while the proxy sits
- * there provably up and its audit log stays empty. The route that does work is to
- * treat the proxy as a DOMAIN: alias it in /etc/hosts and name it in
- * `allowedDomains`, so srt's own parent-namespace proxy carries the hop (verified:
- * spawn 201 with the run's token, 401 with a wrong one, api.anthropic.com still
- * refused). A unix-socket listener would be cleaner and main.go does not have one
- * yet — it binds TCP only.
+ * there provably up and its audit log stays empty.
  *
- * So this function's network block is correct for the macOS host runners and is
- * NOT a portable expression of the posture. Anything running the kernel on Linux
- * needs the domain-alias form.
+ * The Linux form is therefore a UNIX SOCKET, which `allowAllUnixSockets` below
+ * already permits: a socket is a path, and the sandbox shares the filesystem even
+ * when it does not share the network namespace. `startEgress({ listen: "unix" })`
+ * is the default there, and the proxy's address travels as `unix:<path>` (verified
+ * inside a container: spawn 201 with the run's token, 401 with a wrong one, TCP
+ * loopback still dead, api.anthropic.com still refused). The older
+ * domain-alias form — alias the proxy in /etc/hosts, name it in `allowedDomains`
+ * — also works and is the fallback; it costs a domain entry, which is a second
+ * route out of the sandbox.
+ *
+ * So this block is portable, and the transport is what changes per platform: the
+ * network section stays closed either way.
  */
 export function srtSettings({ runDir, home, readable, writable = [] }) {
 	return {
@@ -181,8 +186,62 @@ export function buildEgressBinary({ out = join(ROOT, ".run/bin/egress") } = {}) 
 }
 
 /**
+ * Which door this platform's sandbox can actually reach.
+ *
+ * macOS: TCP loopback, which works because `allowLocalBinding` is forced true by
+ * ipykernel's ZMQ (see srtSettings) and is what every number in docs/ was measured
+ * over.
+ *
+ * Linux: the unix socket, and nothing else. bwrap gives the sandbox its own
+ * network namespace, so the harness's 127.0.0.1 is not the sandbox's — measured
+ * with the proxy provably up: no connection at all, empty audit log. The other
+ * working form (alias the proxy in /etc/hosts, name it in `allowedDomains`) needs
+ * a domain entry, and a domain entry is a second route out.
+ *
+ * A default per platform rather than a flag callers must remember, because the
+ * point of this module is that every runner shares ONE boundary — a boundary that
+ * depends on each caller getting a flag right is several boundaries.
+ */
+export const defaultEgressListen = () => (process.platform === "linux" ? "unix" : "tcp");
+
+/**
+ * sockaddr_un.sun_path: 104 bytes on macOS, 108 on Linux, so 104 is the portable
+ * ceiling. Kept in step with proxy/egress/main.go's own constant by
+ * bench/test/posture.test.mjs — a path this module hands out and the proxy then
+ * refuses is a run that dies at bind with "invalid argument".
+ */
+const UNIX_PATH_MAX = 104;
+
+/**
+ * Where the run's socket lives: in the run directory, unless that is too long.
+ *
+ * Run directories are named after task, variant and run id and nest several levels
+ * deep, so the ceiling is reachable in ordinary use rather than only in a
+ * pathological case. The fallback is a short name under TMPDIR — which the sandbox
+ * can also reach, since srtSettings already allows /tmp and TMPDIR for ipykernel's
+ * connection file — at the cost of not sitting with the run's other artefacts.
+ */
+export function egressSocketPath(runDir, session = "run") {
+	const inRun = join(runDir, "egress.sock");
+	if (inRun.length < UNIX_PATH_MAX) return inRun;
+	const short = join(tmpdir(), `egr-${session}-${process.pid}.sock`);
+	if (short.length >= UNIX_PATH_MAX) {
+		throw new Error(
+			`no socket path fits the ${UNIX_PATH_MAX}-byte ceiling (tried ${inRun} and ${short}); ` +
+				"use a shorter run directory or TMPDIR",
+		);
+	}
+	return short;
+}
+
+/**
  * Start a per-run egress proxy and hand back the two variables the sandbox
  * needs to use it.
+ *
+ * `listen` is "tcp" (a port), "unix" (a socket) or "both", defaulting per platform
+ * — see defaultEgressListen. "both" exists because the two doors share one handler
+ * and one token, so a caller with a TCP client (an MCP SDK) and a sandboxed client
+ * (the kernel) can serve each without two proxies.
  *
  * Port 0, not a fixed one: benchmark tasks run pooled, and a fixed port makes
  * concurrent runs fight over a boundary — the loser either fails to bind or,
@@ -197,7 +256,18 @@ export function buildEgressBinary({ out = join(ROOT, ".run/bin/egress") } = {}) 
  * `routes` is passed through to the config verbatim. Empty is legitimate and
  * common: the eval tasks want spawn and nothing else.
  */
-export function startEgress({ runDir, spawnDir, routes = [], session = "run", env = process.env, waitMs = 15000 }) {
+export function startEgress({
+	runDir,
+	spawnDir,
+	routes = [],
+	session = "run",
+	env = process.env,
+	waitMs = 15000,
+	listen = defaultEgressListen(),
+}) {
+	if (!["tcp", "unix", "both"].includes(listen)) {
+		throw new Error(`startEgress: listen must be tcp|unix|both, got ${JSON.stringify(listen)}`);
+	}
 	const bin = buildEgressBinary();
 	const configPath = join(runDir, "egress-config.json");
 	const tokensPath = join(runDir, "egress-tokens.txt");
@@ -215,6 +285,8 @@ export function startEgress({ runDir, spawnDir, routes = [], session = "run", en
 	// before this line existed.
 	rmSync(addrPath, { force: true });
 
+	const socketPath = listen === "tcp" ? "" : egressSocketPath(runDir, session);
+
 	const minted = spawnSync(bin, ["--mint", session], { encoding: "utf8" });
 	if (minted.status !== 0) throw new Error(`egress --mint failed: ${minted.stderr ?? ""}`);
 	const token = minted.stdout.trim().split(/\s+/)[1];
@@ -224,10 +296,16 @@ export function startEgress({ runDir, spawnDir, routes = [], session = "run", en
 	writeFileSync(tokensPath, `${session} ${token}\n`, { mode: 0o600 });
 
 	const logFile = createWriteStream(logPath);
+	// "none" rather than omitting --listen: the flag's default is a real port, so
+	// leaving it out would open TCP on a run that asked for the socket only.
 	const proc = spawn(
 		bin,
-		["--listen", "127.0.0.1:0", "--addr-file", addrPath, "--config", configPath,
-			"--tokens", tokensPath, "--audit", auditPath],
+		[
+			"--listen", listen === "unix" ? "none" : "127.0.0.1:0",
+			...(socketPath ? ["--listen-unix", socketPath] : []),
+			"--addr-file", addrPath, "--config", configPath,
+			"--tokens", tokensPath, "--audit", auditPath,
+		],
 		{ cwd: runDir, env, stdio: ["ignore", "pipe", "pipe"] },
 	);
 	proc.stdout.pipe(logFile);
@@ -239,6 +317,12 @@ export function startEgress({ runDir, spawnDir, routes = [], session = "run", en
 		stopped = true;
 		process.off("exit", stop);
 		if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+		// SIGKILL is deliberate (a proxy that ignores SIGTERM must still die) and it
+		// means the socket file is never unlinked by the proxy itself. The next run in
+		// this directory recovers from that — listenUnixSocket asks the socket before
+		// removing it — but leaving debris behind would make every re-run's log carry
+		// a stale-socket line for a condition we created.
+		if (socketPath) rmSync(socketPath, { force: true });
 	};
 	// A proxy left running holds a port and a spawn directory belonging to a run
 	// that is over. This harness has been burned by orphans before, so reap it on
@@ -267,7 +351,19 @@ export function startEgress({ runDir, spawnDir, routes = [], session = "run", en
 		throw new Error(`egress proxy did not announce an address within ${waitMs}ms`);
 	}
 
-	return { url: `http://${addr}`, token, auditPath, configPath, logPath, stop, pid: proc.pid };
+	// `url` is the address a SANDBOXED client should use, which is why the socket
+	// wins whenever there is one: with both doors open, handing the kernel the TCP
+	// address would hand it the door that does not work on Linux, and it would fail
+	// as silence — a spawn that never happened. `httpUrl` stays available for clients
+	// that can only speak TCP (an MCP SDK pointed at {proxy}/r/<route>).
+	const httpUrl = addr.startsWith("unix:") ? null : `http://${addr}`;
+	const unixUrl = socketPath ? `unix:${socketPath}` : null;
+	return {
+		url: unixUrl ?? httpUrl,
+		...(httpUrl ? { httpUrl } : {}),
+		...(unixUrl ? { unixUrl, socketPath } : {}),
+		token, auditPath, configPath, logPath, stop, pid: proc.pid,
+	};
 }
 
 /**

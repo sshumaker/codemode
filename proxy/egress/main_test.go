@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -17,8 +18,8 @@ const (
 	goodTok = "egr-deadbeef"
 )
 
-// buildServer wires the same constructors main() uses, against a fake upstream.
-func buildServer(t *testing.T, upstreamURL, spawnDir string) *httptest.Server {
+// buildHandler wires the same constructors main() uses, against a fake upstream.
+func buildHandler(t *testing.T, upstreamURL, spawnDir string) http.Handler {
 	t.Helper()
 	t.Setenv("TEST_ROUTE_CRED", realKey)
 	rc := routeConfig{Name: "svc", Upstream: upstreamURL, CredHeader: "x-api-key", CredEnv: "TEST_ROUTE_CRED"}
@@ -28,7 +29,47 @@ func buildServer(t *testing.T, upstreamURL, spawnDir string) *httptest.Server {
 		t.Fatal(err)
 	}
 	sess := &sessions{byTok: map[string]string{goodTok: "task-42"}, spends: map[string]int64{}}
-	return httptest.NewServer(newHandler(sess, aud, map[string]*route{"svc": rt}, spawnDir))
+	return newHandler(sess, aud, map[string]*route{"svc": rt}, spawnDir)
+}
+
+func buildServer(t *testing.T, upstreamURL, spawnDir string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(buildHandler(t, upstreamURL, spawnDir))
+}
+
+// tempSocket returns a short-enough socket path. Deliberately not t.TempDir():
+// on macOS that is /var/folders/<2>/<26>/T/<TestName>/001, which for a test name
+// of any length blows past the 104-byte sun_path ceiling — the exact trap
+// listenUnixSocket reports on, and one a test must not walk into by accident.
+func tempSocket(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "egr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "e.sock")
+}
+
+// unixClient dials one socket for every request, whatever the URL's host says.
+// This is the client shape a sandboxed caller needs (runtime/jobs.py does the
+// same thing with http.client), so the tests exercise the real access pattern.
+func unixClient(path string) *http.Client {
+	return &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", path)
+		},
+	}}
+}
+
+// serve runs the handler on already-bound listeners for the length of the test.
+func serve(t *testing.T, h http.Handler, lns []net.Listener) {
+	t.Helper()
+	srv := &http.Server{Handler: h}
+	for _, ln := range lns {
+		go func(ln net.Listener) { srv.Serve(ln) }(ln)
+	}
+	t.Cleanup(func() { srv.Close() })
 }
 
 func TestRouteSwapAndStrip(t *testing.T) {
@@ -252,16 +293,255 @@ func TestSpawnOnlyWithZeroRoutes(t *testing.T) {
 	}
 }
 
+// The whole boundary over a unix socket, not merely "the socket answers".
+//
+// This is the form Linux forces (bwrap gives the sandbox its own network
+// namespace, so the harness's loopback is unreachable — docs §7.2), so the
+// properties that make the TCP door a boundary have to hold on this one too:
+// auth before anything, the route's credential swapped in, spawn writing its
+// request file. A socket that accepted everything would look identical from
+// outside.
+func TestUnixSocketServesTheWholeBoundary(t *testing.T) {
+	var gotKey, gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey, gotPath = r.Header.Get("x-api-key"), r.URL.Path
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	sock, spawnDir := tempSocket(t), t.TempDir()
+	lns, err := openListeners("", sock, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve(t, buildHandler(t, upstream.URL, spawnDir), lns)
+	cli := unixClient(sock)
+
+	post := func(path, token, body string) (int, string) {
+		req, _ := http.NewRequest("POST", "http://egress"+path, strings.NewReader(body))
+		if token != "" {
+			req.Header.Set(egressTokenHeader, token)
+		}
+		resp, err := cli.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s over the socket: %v", path, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+
+	if status, body := post("/r/svc/v1/messages", goodTok, `{}`); status != 200 || body != `{"ok":true}` {
+		t.Fatalf("route over the socket: %d %q", status, body)
+	}
+	if gotPath != "/v1/messages" || gotKey != realKey {
+		t.Fatalf("upstream saw path=%q key=%q; the route did not swap the credential", gotPath, gotKey)
+	}
+	if status, _ := post("/control/spawn", goodTok, `{"name":"child","body":{"cmd":"echo hi"}}`); status != http.StatusCreated {
+		t.Fatalf("spawn over the socket: %d, want 201", status)
+	}
+	if _, err := os.Stat(filepath.Join(spawnDir, "child.json")); err != nil {
+		t.Fatalf("spawn over the socket wrote no request file: %v", err)
+	}
+	// The socket is not an authenticated channel by virtue of being a socket.
+	for _, tok := range []string{"", "egr-wrong", realKey} {
+		if status, _ := post("/control/spawn", tok, `{"name":"sneak","body":{"cmd":"x"}}`); status != http.StatusUnauthorized {
+			t.Fatalf("token %q over the socket: %d, want 401", tok, status)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(spawnDir, "sneak.json")); err == nil {
+		t.Fatal("an unauthenticated POST over the socket wrote a request file")
+	}
+	if status, _ := post("/r/nope/x", goodTok, ""); status != http.StatusNotFound {
+		t.Fatalf("unknown route over the socket: %d, want 404", status)
+	}
+
+	// Only this uid may connect where the kernel enforces socket modes.
+	st, err := os.Stat(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("socket mode is %o, want 600", perm)
+	}
+}
+
+// SIGKILL is how the harness reaps a per-run proxy, and a killed process never
+// unlinks its socket. So the NORMAL state of a reused run directory is a socket
+// file with nothing behind it, and a proxy that refused to bind there would fail
+// every second run — while one that removed it unconditionally would evict a live
+// neighbour.
+func TestStaleSocketIsRecoveredButLiveOneIsNot(t *testing.T) {
+	sock := tempSocket(t)
+
+	// Debris in both shapes: a leftover socket whose process is gone, and (some
+	// crash paths) an ordinary file at the path.
+	dead, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead.(*net.UnixListener).SetUnlinkOnClose(false)
+	dead.Close() // socket file survives, nothing accepts on it
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("test setup left no stale socket: %v", err)
+	}
+
+	live, err := listenUnixSocket(sock)
+	if err != nil {
+		t.Fatalf("bind over a stale socket failed: %v", err)
+	}
+	// And now that something IS listening, a second bind must refuse rather than
+	// unlink a working proxy out from under its run.
+	serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), []net.Listener{live})
+	if _, err := listenUnixSocket(sock); err == nil {
+		t.Fatal("bound over a LIVE socket; a running proxy would have been evicted")
+	} else if !strings.Contains(err.Error(), "already listening") {
+		t.Fatalf("refusal does not name the cause: %v", err)
+	}
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("the refused bind removed the live socket anyway: %v", err)
+	}
+}
+
+func TestUnixPathTooLongIsNamed(t *testing.T) {
+	long := filepath.Join(os.TempDir(), strings.Repeat("x", unixPathMax), "e.sock")
+	_, err := listenUnixSocket(long)
+	if err == nil {
+		t.Fatal("a path past the sun_path ceiling was accepted")
+	}
+	// bind() says "invalid argument", which sends the reader looking at the wrong
+	// thing. The error has to say it is the length.
+	if !strings.Contains(err.Error(), "caps a socket path") {
+		t.Fatalf("error does not explain the ceiling: %v", err)
+	}
+}
+
+// Both doors at once, one boundary behind them. The macOS host runners keep TCP
+// (proven, and the MCP clients speak it), Linux needs the socket; a run that
+// serves both must not have two different sets of rules.
+func TestBothListenersServeTheSameHandler(t *testing.T) {
+	sock, spawnDir := tempSocket(t), t.TempDir()
+	dir := t.TempDir()
+	addrFile := filepath.Join(dir, "addr")
+	lns, err := openListeners("127.0.0.1:0", sock, addrFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lns) != 2 {
+		t.Fatalf("openListeners returned %d listeners, want 2", len(lns))
+	}
+	serve(t, buildHandler(t, "http://127.0.0.1:1", spawnDir), lns)
+
+	tcpAddr := lns[0].Addr().String()
+	// The announced address is the TCP one when TCP is served: that is the form
+	// every existing client already reads.
+	raw, err := os.ReadFile(addrFile)
+	if err != nil || string(raw) != tcpAddr {
+		t.Fatalf("addr file says %q, want the TCP address %q (%v)", raw, tcpAddr, err)
+	}
+
+	clients := map[string]*http.Client{"tcp": http.DefaultClient, "unix": unixClient(sock)}
+	base := map[string]string{"tcp": "http://" + tcpAddr, "unix": "http://egress"}
+	for door, cli := range clients {
+		spawn := func(name, token string) int {
+			body := `{"name":"` + name + `","body":{"cmd":"echo hi"}}`
+			req, _ := http.NewRequest("POST", base[door]+"/control/spawn", strings.NewReader(body))
+			req.Header.Set(egressTokenHeader, token)
+			resp, err := cli.Do(req)
+			if err != nil {
+				t.Fatalf("%s door: %v", door, err)
+			}
+			resp.Body.Close()
+			return resp.StatusCode
+		}
+		if got := spawn("via-"+door, goodTok); got != http.StatusCreated {
+			t.Fatalf("%s door: spawn got %d, want 201", door, got)
+		}
+		if got := spawn("sneak-"+door, "egr-wrong"); got != http.StatusUnauthorized {
+			t.Fatalf("%s door: wrong token got %d, want 401", door, got)
+		}
+		if _, err := os.Stat(filepath.Join(spawnDir, "via-"+door+".json")); err != nil {
+			t.Fatalf("%s door: no request file: %v", door, err)
+		}
+	}
+}
+
+// Unix-only, and the client has to be told so: `unix:<path>` rather than a
+// host:port a client would try to dial as TCP and fail on with no idea why.
+func TestAddrFileAnnouncesTheUnixForm(t *testing.T) {
+	sock := tempSocket(t)
+	dir := t.TempDir()
+	addrFile := filepath.Join(dir, "addr")
+	lns, err := openListeners("", sock, addrFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll(lns)
+
+	raw, err := os.ReadFile(addrFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "unix:"+sock {
+		t.Fatalf("addr file says %q, want %q", raw, "unix:"+sock)
+	}
+	// And the announced path is the one that answers.
+	conn, err := net.Dial("unix", strings.TrimPrefix(string(raw), "unix:"))
+	if err != nil {
+		t.Fatalf("nothing listening at the announced socket: %v", err)
+	}
+	conn.Close()
+
+	// Closing unlinks: a run that ends tidily leaves no debris for the next one.
+	closeAll(lns)
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Fatalf("socket file survived Close: %v", err)
+	}
+}
+
+// A socket-only run must not also open a TCP port. On Linux that port is the door
+// that provably does not work, so opening it is a listener nobody asked for and
+// nobody can use — and it would happen silently, since --listen has a default.
+func TestSocketOnlyRunOpensNoPort(t *testing.T) {
+	const dflt = "127.0.0.1:8091"
+	for _, c := range []struct {
+		name        string
+		listenFlag  string
+		listenAsked bool
+		unixPath    string
+		want        string
+	}{
+		{"socket only", dflt, false, "/tmp/e.sock", ""},
+		{"both, TCP asked for explicitly", "127.0.0.1:0", true, "/tmp/e.sock", "127.0.0.1:0"},
+		{"TCP only, the long-standing default", dflt, false, "", dflt},
+		{"none, and nothing else", "none", true, "", ""},
+	} {
+		if got := resolveTCPAddr(c.listenFlag, c.listenAsked, c.unixPath); got != c.want {
+			t.Fatalf("%s: TCP address %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestNoListenerAtAllIsRefused(t *testing.T) {
+	// `--listen none` with no socket is a proxy nothing can reach, which would come
+	// up, log happily and serve no one — the same failure shape as the empty
+	// config the constructor already refuses.
+	if _, err := openListeners("", "", ""); err == nil {
+		t.Fatal("openListeners accepted zero listeners")
+	}
+}
+
 // The parent needs the port before it can put it in the kernel's environment,
 // and a per-run proxy binds port 0 to avoid colliding with a concurrent run.
 func TestListenAndAnnounceWritesResolvedPort(t *testing.T) {
 	dir := t.TempDir()
 	addrFile := filepath.Join(dir, "addr")
-	ln, err := listenAndAnnounce("127.0.0.1:0", addrFile)
+	lns, err := openListeners("127.0.0.1:0", "", addrFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer closeAll(lns)
+	ln := lns[0]
 
 	raw, err := os.ReadFile(addrFile)
 	if err != nil {

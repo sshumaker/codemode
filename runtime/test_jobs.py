@@ -1026,10 +1026,16 @@ class TestBrokerRequestOverEgress(Base):
                 pass
 
         self.status = 201
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server, self.proxy = self.start_server(Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.proxy = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def start_server(self, handler):
+        """The transport under test. Overridden by the unix-socket subclass."""
+        import http.server
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
 
     def tearDown(self):
         self.server.shutdown()
@@ -1119,3 +1125,70 @@ class TestBrokerRequestOverEgress(Base):
         self.assertTrue(os.path.exists(path), "no request file for the broker to claim")
         with open(path) as fh:
             self.assertEqual(json.load(fh)["name"], "scout")
+
+
+# ---------------------------------------------------------------------------------
+# the same request, over a unix socket
+# ---------------------------------------------------------------------------------
+
+class TestBrokerRequestOverUnixEgress(TestBrokerRequestOverEgress):
+    """
+    Every assertion above, re-run against a socket instead of a port.
+
+    Not a smoke test of "the socket answers": this is the transport Linux forces,
+    because bwrap gives the sandbox its own network namespace and the harness's
+    127.0.0.1 is not the sandbox's (docs/CLOUD-HARNESS-DESIGN.md §7.2). If the
+    socket path only carried the happy case, a run on Linux would be a run whose
+    refusal handling, token header and retry semantics were never tested — and
+    those are precisely the paths that fail silently, by leaving a job in
+    `requested` for work nobody accepted.
+
+    Inheriting the tests rather than restating them is deliberate: the two
+    transports cannot drift into different behaviour without this class going red.
+    """
+
+    def start_server(self, handler):
+        import http.server
+        import socket
+        import socketserver
+        import tempfile
+
+        class UnixHTTPServer(http.server.HTTPServer):
+            address_family = socket.AF_UNIX
+
+            def server_bind(self):
+                # HTTPServer's own server_bind reads server_address as (host, port)
+                # to build server_name; with AF_UNIX the address is a path string
+                # and it would slice two characters out of it.
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = "localhost", 0
+
+        # A short directory on purpose: sun_path caps at 104 bytes on macOS, and the
+        # default per-test temp directory name is long enough to matter.
+        self.sock_dir = tempfile.mkdtemp(prefix="egr")
+        self.addCleanup(shutil.rmtree, self.sock_dir, True)
+        path = os.path.join(self.sock_dir, "e.sock")
+        return UnixHTTPServer(path, handler), f"unix:{path}"
+
+    def test_the_address_forms_agree_about_the_path(self):
+        # `unix:/p/e.sock` and `unix:///p/e.sock` are both written by hand in
+        # configs and both mean the same socket.
+        path = J._egress_socket_path(self.proxy)
+        self.assertTrue(J._is_unix_egress(self.proxy))
+        self.assertEqual(J._egress_socket_path(f"unix://{path}"), path)
+        self.assertEqual(J._egress_socket_path(f"unix:{path}"), path)
+        self.assertFalse(J._is_unix_egress("http://127.0.0.1:8091"))
+
+    def test_a_missing_socket_is_unreachable_not_a_crash(self):
+        # The stale-socket case from the client's side: the file may be gone (or may
+        # never have existed) and that has to arrive as the same no-job outcome an
+        # unreachable port produces, naming the path so it is diagnosable.
+        gone = os.path.join(self.sock_dir, "not-here.sock")
+        with unittest.mock.patch.dict(
+            os.environ, {"HARNESS_EGRESS_PROXY": f"unix:{gone}", "HARNESS_EGRESS_TOKEN": "t"}
+        ), self.assertRaises(J.JobError):
+            self.store.submit("echo hi", name="orphan", via_broker=True)
+        with open(os.path.join(self.dir, "orphan.json")) as fh:
+            rec = json.load(fh)
+        self.assertEqual(rec["state"], "killed")
+        self.assertIn("could not be written", rec["reason"])

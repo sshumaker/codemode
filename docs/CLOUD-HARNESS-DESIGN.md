@@ -273,15 +273,73 @@ srt.**
 **This does not hold on Linux.** srt sandboxes through bubblewrap, which gives
 the process its own network namespace, so `127.0.0.1` is not the host's
 loopback. Measured inside a container with the proxy provably up: no connection
-at all, and an empty audit log. Anything hosted needs one of
+at all, and an empty audit log.
 
-- the **domain-alias** form — alias the proxy in `/etc/hosts`, name it in
-  `allowedDomains`, and srt's own parent-namespace proxy carries the hop
-  (verified end to end: 201 with the run's token, 401 with a wrong one,
-  `api.anthropic.com` still refused), or
-- a **unix-socket listener** on the proxy, which would be cleaner and which
-  `main.go` does not have yet — it binds TCP only. `allowAllUnixSockets` is
-  already true.
+**The Linux form is a unix socket** (built 2026-08-17). A socket is a path, and
+the sandbox shares the filesystem even where it does not share the network
+namespace; `allowAllUnixSockets` was already true, so nothing about the posture
+had to be loosened to allow it. The proxy takes `--listen-unix <path>` alongside
+or instead of `--listen`, one handler behind both listeners, and the address
+travels to the sandbox in the form a client needs it:
+
+```
+HARNESS_EGRESS_PROXY = unix:/path/to/egress.sock     # Linux, the default there
+HARNESS_EGRESS_PROXY = http://127.0.0.1:<port>       # macOS, the default there
+```
+
+`runtime/posture.mjs` picks per platform (`defaultEgressListen`), because a
+boundary that depends on each caller remembering a flag is several boundaries.
+`runtime/jobs.py` speaks both — `http.client` over an `AF_UNIX` socket, stdlib
+only, since the kernel's environment is not a place to acquire a dependency.
+
+Measured in a Linux container, from inside a real srt/bwrap sandbox
+(`scripts/egress-unix-linux-proof.sh`, which is the re-runnable transcript):
+
+| from inside the sandbox | result |
+|---|---|
+| socket + the run's token | **201**, and the request file appears harness-side |
+| socket + a wrong token | **401** |
+| socket + no token | **401** |
+| the proxy's own TCP loopback | **unreachable** (`ECONNREFUSED`, the netns) |
+| `api.anthropic.com` | **refused** (403 at srt's own tunnel) |
+
+The control matters as much as the probes: the *same* TCP port answers 201 from
+an unsandboxed process in that container, so the sandbox's failure is
+attributable to the namespace rather than to a dead proxy — the shape of mistake
+this project has already made once. The rig needs `--cap-add=SYS_ADMIN` with
+seccomp/apparmor/systempaths unconfined for bwrap to unshare inside Docker; that
+is acceptable for a throwaway verification container and **not** a posture to
+ship (§7.3).
+
+Two details that are load-bearing rather than incidental:
+
+- **A stale socket file is the normal case, not an exotic one.** The harness
+  reaps a per-run proxy with SIGKILL, which never runs the unlink, so the next
+  run in a reused directory always finds debris. Bind asks the socket first: one
+  that accepts a connection is a live proxy and the bind refuses; one that
+  refuses is debris and is removed. Both directions are tested, because
+  unconditional removal would evict a neighbour's running proxy.
+- **`sun_path` caps at 104 bytes** (macOS; 108 on Linux). Run directories are
+  named after task, variant and run id, so this is reachable in ordinary use —
+  `egressSocketPath` falls back to a short name under `TMPDIR`, and the proxy
+  reports the ceiling by name rather than letting `bind()` say "invalid
+  argument".
+
+**What the socket does not carry yet: MCP.** `/control/spawn` is reached over it
+by `jobs.py`, but the `mcp` route is used by the generated python client and the
+vanilla extension, and both speak HTTP over TCP. So `--posture` on the two MCP
+runners (`bench/run-task.mjs`, `bench/appworld/run-task.mjs`) pins `listen:
+"tcp"` and **refuses outright on Linux** rather than running under a boundary
+whose only route out is unreachable — a condition that would surface as an
+ungrounded agent, not as an error. Closing that gap means an MCP client with a
+unix-socket transport on both arms.
+
+The older **domain-alias** form — alias the proxy in `/etc/hosts`, name it in
+`allowedDomains`, and srt's own parent-namespace proxy carries the hop (verified
+end to end: 201 with the run's token, 401 with a wrong one, `api.anthropic.com`
+still refused) — still works and remains the fallback. It costs a domain entry,
+which is a second route out of the sandbox; the socket costs nothing that was
+not already permitted.
 
 ### 7.3 In a container the posture means less, and says so
 
@@ -353,8 +411,9 @@ exactly create/exec/fs; posture is their network-policy config). The pattern
 that makes any backend identical: a small self-contained payload runs inside
 the sandbox (kernel + jobs.py + prelude — dependency-free Python), and the
 harness talks to it over one channel. A provider only has to answer "can you
-run a process and expose a socket." On Linux that channel must respect §7.2
-(bwrap netns: unix socket or domain-alias, never bare loopback).
+run a process and expose a socket." On Linux that channel is the unix socket of
+§7.2 — never bare loopback, which bwrap's netns makes unreachable, and the
+domain-alias only as a fallback.
 
 The certification suite already exists: `sandbox-check` plus the
 keyleak/eviction/subagent live tasks run *from inside* and report what the

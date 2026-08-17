@@ -476,6 +476,88 @@ def timeout_message(seconds: float, command: str = "") -> str:
 
 
 # --------------------------------------------------------------------------------
+# the egress proxy, as a client
+# --------------------------------------------------------------------------------
+
+# HARNESS_EGRESS_PROXY is either an http URL or `unix:<socket-path>`.
+#
+# The socket form is not a stylistic alternative: on Linux it is the only address a
+# sandboxed process can reach. srt sandboxes through bubblewrap, which gives the
+# process its own network namespace, so the harness's 127.0.0.1 is not the
+# sandbox's — measured with the proxy provably up, a loopback POST gets no
+# connection at all and the audit log stays empty (docs/CLOUD-HARNESS-DESIGN.md
+# §7.2). A socket is a path in a filesystem both sides already share.
+#
+# stdlib only, deliberately: this module is injected into the agent's kernel, whose
+# environment is built from an allow-list and is not a place to acquire a
+# dependency. `http.client` is the layer below urllib and takes its own connection,
+# which is all a unix socket needs.
+_UNIX_PREFIX = "unix:"
+
+
+def _is_unix_egress(proxy: str) -> bool:
+    return proxy.startswith(_UNIX_PREFIX)
+
+
+def _egress_socket_path(proxy: str) -> str:
+    """`unix:/run/x/egress.sock` and `unix:///run/x/egress.sock` both mean the path."""
+    return "/" + proxy[len(_UNIX_PREFIX):].lstrip("/")
+
+
+def _egress_post(proxy: str, path: str, body: bytes, headers: dict, timeout: float = 15) -> Tuple[int, str]:
+    """
+    POST to the proxy over whichever transport its address names.
+
+    Returns (status, reason) for any HTTP answer including a refusal — the caller
+    decides what a status means. Raises OSError only when there was no answer at
+    all, so "the proxy said no" and "the proxy is not there" stay distinguishable
+    at the call site rather than collapsing into one exception type.
+    """
+    if _is_unix_egress(proxy):
+        import http.client
+        import socket
+
+        sock = _egress_socket_path(proxy)
+        # http.client leaves exactly one thing open: where the connection comes
+        # from. Assigning .sock means .connect() is never called, so no subclass and
+        # no third-party transport is needed — the Host header is cosmetic here.
+        conn = http.client.HTTPConnection("localhost", timeout=timeout)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(sock)
+        except OSError as exc:
+            s.close()
+            raise OSError(f"egress proxy unreachable at {sock}: {exc}") from exc
+        conn.sock = s
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status, resp.reason
+        except OSError as exc:
+            raise OSError(f"egress proxy unreachable at {sock}: {exc}") from exc
+        finally:
+            conn.close()
+
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(proxy.rstrip("/") + path, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.reason
+    except urllib.error.HTTPError as exc:
+        # HTTPError IS the response; closing it keeps a refused request from
+        # leaving a dangling socket (and a ResourceWarning) behind.
+        code, reason = exc.code, exc.reason
+        exc.close()
+        return code, reason
+    except urllib.error.URLError as exc:
+        raise OSError(f"egress proxy unreachable: {exc.reason}") from exc
+
+
+# --------------------------------------------------------------------------------
 # handles
 # --------------------------------------------------------------------------------
 
@@ -864,30 +946,14 @@ class JobStore:
         Anything else is refusal or breakage, and a spawn that was refused must
         be an error now, not a job that silently never starts.
         """
-        import urllib.error
-        import urllib.request
-
         body = json.dumps({"name": payload["name"], "body": payload}).encode()
-        req = urllib.request.Request(
-            proxy.rstrip("/") + "/control/spawn",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "x-egress-token": os.environ.get("HARNESS_EGRESS_TOKEN", ""),
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status not in (200, 201):
-                    raise OSError(f"egress proxy answered {resp.status}")
-        except urllib.error.HTTPError as exc:
-            # HTTPError IS the response; closing it keeps a refused spawn from
-            # leaving a dangling socket (and a ResourceWarning) behind.
-            exc.close()
-            raise OSError(f"egress proxy refused the spawn: {exc.code} {exc.reason}") from exc
-        except urllib.error.URLError as exc:
-            raise OSError(f"egress proxy unreachable: {exc.reason}") from exc
+        headers = {
+            "Content-Type": "application/json",
+            "x-egress-token": os.environ.get("HARNESS_EGRESS_TOKEN", ""),
+        }
+        status, reason = _egress_post(proxy, "/control/spawn", body, headers)
+        if status not in (200, 201):
+            raise OSError(f"egress proxy refused the spawn: {status} {reason}")
 
     def _cancel_request(self, rec: dict) -> bool:
         """

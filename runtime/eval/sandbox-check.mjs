@@ -18,9 +18,14 @@
 // was reported as blocked — a test failing for its own reasons is worse than none.
 import { spawnSync } from "node:child_process";
 import { writeFileSync, mkdtempSync, mkdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { startEgress } from "../posture.mjs";
+
+// The runtime directory this file lives under; the unix-socket probe imports
+// jobs.py from it rather than reimplementing the client.
+const RUNTIME = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const [settings, runDir, envFile, proxyArg, tokenArg] = process.argv.slice(2);
 
 // `auto` starts a proxy for the length of the check. Without it the egress
@@ -35,8 +40,11 @@ if (proxyArg === "auto") {
 }
 const proxyUrl = egress ? egress.url : proxyArg;
 const proxyToken = egress ? egress.token : tokenArg;
-const SRT = `${process.cwd()}/node_modules/.bin/srt`;
-const PY = `${process.env.HOME}/.prime/agent/kernel-venv/bin/python`;
+const SRT = process.env.HARNESS_SRT_BIN ?? `${process.cwd()}/node_modules/.bin/srt`;
+// The kernel's own interpreter, since that is the process whose boundary is under
+// test. Overridable by the same variable the harness uses to point a container's
+// kernel at its venv, so the check can run where the kernel runs.
+const PY = process.env.PRIME_AGENT_KERNEL_PYTHON ?? `${process.env.HOME}/.prime/agent/kernel-venv/bin/python`;
 const dir = mkdtempSync(join(tmpdir(), "sbxprobe-"));
 // A read probe must fail on CONTENT, not on absence: open() of a path that is
 // merely missing raises the same way a denied one does, and would pass this
@@ -92,8 +100,27 @@ const probes = [
     : []),
 ];
 
-/** POST /control/spawn and insist on an exact status; anything else exits non-zero. */
+/**
+ * POST /control/spawn and insist on an exact status; anything else exits non-zero.
+ *
+ * Two transports, because the proxy has two doors and which one a sandbox can use
+ * is a property of the platform, not of the check (posture.mjs
+ * defaultEgressListen). The unix form goes through jobs.py's own client rather
+ * than a second implementation of it: the thing being certified is the client the
+ * kernel actually uses, and a probe that spoke the socket differently could pass
+ * while `spawn()` failed.
+ */
 function spawnProbe(url, token, wantStatus) {
+  if (url.startsWith("unix:")) {
+    return [
+      `import sys`,
+      `sys.path.insert(0, ${JSON.stringify(RUNTIME)})`,
+      `import jobs`,
+      `got, reason = jobs._egress_post(${JSON.stringify(url)}, "/control/spawn", b"not-a-spawn-request",`,
+      `    {"content-type": "application/json", "x-egress-token": ${JSON.stringify(token)}}, timeout=8)`,
+      `assert got == ${wantStatus}, f"proxy answered {got} {reason}, want ${wantStatus}"`,
+    ].join("\n");
+  }
   return [
     `import json,urllib.request,urllib.error`,
     `req = urllib.request.Request(${JSON.stringify(url.replace(/\/$/, "") + "/control/spawn")},`,

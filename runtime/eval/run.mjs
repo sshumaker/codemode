@@ -35,7 +35,13 @@ import { fileURLToPath } from "node:url";
 import { TASKS } from "./tasks.mjs";
 import { pollShape } from "./poll-shape.mjs";
 import { seedPrimeSettings } from "../../bench/prime-settings.mjs";
-import { KERNEL_ENV_ALLOW, pythonPrefixes, srtSettings as buildSrtSettings, startEgress } from "../posture.mjs";
+import {
+	KERNEL_ENV_ALLOW,
+	defaultEgressListen,
+	pythonPrefixes,
+	srtSettings as buildSrtSettings,
+	startEgress,
+} from "../posture.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUNTIME = join(ROOT, "runtime");
@@ -253,13 +259,23 @@ const envInherit = argv.includes("--env-inherit");
  * come up. --no-egress falls back to the request FILE (jobs.py writes it
  * directly when HARNESS_EGRESS_PROXY is unset), which is how the two transports
  * stay comparable.
+ *
+ * The proxy's ADDRESS defaults per platform (posture.mjs defaultEgressListen: TCP
+ * loopback on macOS, a unix socket on Linux, where bwrap's network namespace makes
+ * loopback unreachable). `--egress-unix` / `--egress-both` force the form, which is
+ * how the socket path gets exercised on the machine this is developed on rather
+ * than only where it is mandatory.
  */
 const egressOn = !argv.includes("--no-egress");
+const egressListen = argv.includes("--egress-unix") ? "unix" : argv.includes("--egress-both") ? "both" : undefined;
 const requestsDir = join(jobDir, "requests");
 let egress;
 if (egressOn) {
 	mkdirSync(requestsDir, { recursive: true });
-	egress = startEgress({ runDir, spawnDir: requestsDir, routes: [], session: runId });
+	egress = startEgress({
+		runDir, spawnDir: requestsDir, routes: [], session: runId,
+		...(egressListen ? { listen: egressListen } : {}),
+	});
 	console.log(`[egress] ${egress.url} (pid ${egress.pid}) -> ${egress.auditPath}`);
 }
 
@@ -581,7 +597,11 @@ child.on("close", (code) => {
 	// brokered chain looks identical from the job records whether the request
 	// arrived over HTTP or as a file, so the distinction has to be recorded here
 	// or it is unrecoverable once the run directory is all that is left.
-	summary.egress = egress ? { url: egress.url, audit: egress.auditPath } : null;
+	// `listen` as well as the url: with both doors open the url is the TCP one, so
+	// the url alone would not say whether the socket was there to be used.
+	summary.egress = egress
+		? { url: egress.url, listen: egressListen ?? defaultEgressListen(), audit: egress.auditPath }
+		: null;
 	egress?.stop();
 	summary.exitCode = code;
 	summary.wallMs = Date.now() - started;

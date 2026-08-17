@@ -5,7 +5,7 @@
 // and injects that upstream's credentials at the boundary, so no credential of
 // any kind exists sandbox-side. Sandbox processes get two env vars:
 //
-//	HARNESS_EGRESS_PROXY  = http://<host>:<port>
+//	HARNESS_EGRESS_PROXY  = http://<host>:<port>  or  unix:<socket-path>
 //	HARNESS_EGRESS_TOKEN  = <opaque per-session token minted host-side>
 //
 // and the sandbox's network config (srt) denies everything except this address.
@@ -13,6 +13,13 @@
 // Requests look like: POST {proxy}/r/<route>/<upstream-path>, token in
 // x-egress-token (or x-api-key / Authorization, so unmodified SDKs pointed at
 // {proxy}/r/<route> work as-is).
+//
+// Either address form, or both at once (--listen, --listen-unix). On Linux the
+// unix socket is the only form a sandboxed client can use at all: srt sandboxes
+// through bubblewrap, which puts the process in its own network namespace, so the
+// harness's 127.0.0.1 is not the sandbox's and a loopback connect gets nowhere.
+// A socket is a path, and the sandbox already shares the filesystem — see
+// docs/CLOUD-HARNESS-DESIGN.md §7.2.
 //
 // The control surface is part of the same boundary: POST /control/spawn turns
 // "start a subagent" into an API call like everything else. The proxy runs
@@ -43,10 +50,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -381,34 +390,144 @@ func newHandler(sess *sessions, aud *auditor, routes map[string]*route, spawnDir
 	})
 }
 
-// ---- main -------------------------------------------------------------------
+// ---- listeners ---------------------------------------------------------------
 
-// listenAndAnnounce binds, then publishes the address it actually got.
+// sockaddr_un.sun_path is 104 bytes on macOS and 108 on Linux; the smaller one is
+// the portable ceiling. Worth its own check because bind() reports the failure as
+// "invalid argument", which reads like a bad path rather than a long one.
+const unixPathMax = 104
+
+// listenUnixSocket binds a unix socket, recovering from a dead proxy's leftovers.
 //
-// A per-run proxy asks for port 0: a fixed port collides the moment two runs
-// overlap, and this harness pools benchmark tasks. But the kernel needs the
-// resolved port in its environment before it boots, so the port has to travel
-// back to the parent — hence a file, written temp-then-rename so a parent
-// polling for it can never read half an address and dial a truncated port.
-func listenAndAnnounce(addr, addrFile string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
+// A socket file outlives the process that created it whenever that process does
+// not get to run its unlink — and SIGKILL is exactly how this harness reaps a
+// per-run proxy (runtime/posture.mjs), so a stale file in a reused run directory
+// is the ordinary case, not an exotic one. Removing it blindly would evict a LIVE
+// neighbour, though, so the socket is asked first: something that accepts a
+// connection is a running proxy and this bind must fail; something that refuses
+// is debris and gets removed.
+func listenUnixSocket(path string) (net.Listener, error) {
+	if len(path) >= unixPathMax {
+		return nil, fmt.Errorf(
+			"--listen-unix %s: the path is %d bytes and the kernel caps a socket path at %d; "+
+				"put the socket somewhere shorter (e.g. under TMPDIR) rather than deep in a run directory",
+			path, len(path), unixPathMax)
+	}
+	// 0700 applies only if this call creates the directory; an existing run
+	// directory keeps its own mode.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("--listen-unix: %w", err)
+	}
+	if _, err := os.Lstat(path); err == nil {
+		if c, derr := net.DialTimeout("unix", path, 250*time.Millisecond); derr == nil {
+			c.Close()
+			return nil, fmt.Errorf("--listen-unix %s: something is already listening there", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("--listen-unix: removing the stale socket: %w", err)
+		}
+	}
+	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
 	}
-	if addrFile == "" {
-		return ln, nil
-	}
-	tmp := addrFile + ".writing"
-	if err := os.WriteFile(tmp, []byte(ln.Addr().String()), 0o600); err != nil {
+	// The token is the authority (same as the TCP form), but a socket is also a
+	// filesystem object, so narrow it to this uid: one check that does not depend
+	// on a secret. BSD kernels have historically ignored the mode on connect;
+	// Linux enforces it, and Linux is the case that needs a unix socket at all.
+	if err := os.Chmod(path, 0o600); err != nil {
 		ln.Close()
-		return nil, fmt.Errorf("write --addr-file: %w", err)
-	}
-	if err := os.Rename(tmp, addrFile); err != nil {
-		ln.Close()
-		return nil, fmt.Errorf("rename --addr-file: %w", err)
+		return nil, fmt.Errorf("--listen-unix: chmod: %w", err)
 	}
 	return ln, nil
 }
+
+// announce publishes the address clients should use, temp-then-rename so a parent
+// polling for the file can never read half an address and dial a truncated port.
+func announce(addrFile, addr string) error {
+	if addrFile == "" {
+		return nil
+	}
+	tmp := addrFile + ".writing"
+	if err := os.WriteFile(tmp, []byte(addr), 0o600); err != nil {
+		return fmt.Errorf("write --addr-file: %w", err)
+	}
+	if err := os.Rename(tmp, addrFile); err != nil {
+		return fmt.Errorf("rename --addr-file: %w", err)
+	}
+	return nil
+}
+
+// openListeners binds everything the flags asked for and announces one address.
+//
+// A per-run proxy asks for TCP port 0: a fixed port collides the moment two runs
+// overlap, and this harness pools benchmark tasks. But the kernel needs the
+// resolved address in its environment before it boots, so the address has to
+// travel back to the parent — hence --addr-file.
+//
+// One line, because the client needs one address: `host:port` when TCP is served
+// (the long-standing form, and the compatible answer when both are), and
+// `unix:<path>` when the socket is the only door. Whoever asked for both already
+// knows the socket path — they passed it.
+func openListeners(tcpAddr, unixPath, addrFile string) ([]net.Listener, error) {
+	if tcpAddr == "" && unixPath == "" {
+		return nil, fmt.Errorf("nothing to listen on: pass --listen and/or --listen-unix")
+	}
+	var lns []net.Listener
+	announced := ""
+	if tcpAddr != "" {
+		ln, err := net.Listen("tcp", tcpAddr)
+		if err != nil {
+			return nil, err
+		}
+		lns = append(lns, ln)
+		announced = ln.Addr().String()
+	}
+	if unixPath != "" {
+		ln, err := listenUnixSocket(unixPath)
+		if err != nil {
+			closeAll(lns)
+			return nil, err
+		}
+		lns = append(lns, ln)
+		if announced == "" {
+			announced = "unix:" + unixPath
+		}
+	}
+	if err := announce(addrFile, announced); err != nil {
+		closeAll(lns)
+		return nil, err
+	}
+	return lns, nil
+}
+
+// resolveTCPAddr decides whether TCP is served at all.
+//
+// --listen has a real default, so asking for a socket and getting the port too
+// would be the silent case: on Linux the port is the door that DOES NOT WORK
+// (bwrap netns), and opening it anyway means a listening socket nobody uses and
+// nobody asked for. So --listen-unix alone means unix only, an explicit --listen
+// alongside it means both, and "none" turns TCP off without a socket for the case
+// where that is what someone wants to say.
+func resolveTCPAddr(listenFlag string, listenAsked bool, unixPath string) string {
+	if listenFlag == "none" {
+		return ""
+	}
+	if unixPath != "" && !listenAsked {
+		return ""
+	}
+	return listenFlag
+}
+
+// closeAll closes every listener; for a unix socket that is also what unlinks the
+// socket file (net.Listen sets unlink-on-close).
+func closeAll(lns []net.Listener) {
+	for _, ln := range lns {
+		ln.Close()
+	}
+}
+
+// ---- main -------------------------------------------------------------------
 
 func newToken() string {
 	b := make([]byte, 16)
@@ -419,8 +538,9 @@ func newToken() string {
 }
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8091", "address to listen on (port 0 picks a free one)")
-	addrFile := flag.String("addr-file", "", "write the bound address here once listening")
+	listen := flag.String("listen", "127.0.0.1:8091", `TCP address to listen on (port 0 picks a free one; "none" serves no TCP)`)
+	listenUnix := flag.String("listen-unix", "", "unix socket to listen on (the only form a bwrap-sandboxed client can reach; may be combined with --listen)")
+	addrFile := flag.String("addr-file", "", "write the address clients should use here once listening")
 	configPath := flag.String("config", "", "route table JSON (required)")
 	auditPath := flag.String("audit", "", "JSONL audit file (default: stderr)")
 	tokensPath := flag.String("tokens", "", "file of '<name> <token>' lines minted with --mint")
@@ -489,11 +609,49 @@ func main() {
 		log.Fatal("no session tokens loaded; mint with --mint and pass --tokens")
 	}
 
-	ln, err := listenAndAnnounce(*listen, *addrFile)
+	tcpAsked := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "listen" {
+			tcpAsked = true
+		}
+	})
+	lns, err := openListeners(resolveTCPAddr(*listen, tcpAsked, *listenUnix), *listenUnix, *addrFile)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
+	where := make([]string, 0, len(lns))
+	for _, ln := range lns {
+		where = append(where, fmt.Sprintf("%s://%s", ln.Addr().Network(), ln.Addr()))
+	}
 	log.Printf("egress listening on %s: %d route(s), spawn=%v, %d session(s)",
-		ln.Addr(), len(routes), cfg.SpawnDir != "", len(sess.byTok))
-	log.Fatal(http.Serve(ln, newHandler(sess, aud, routes, cfg.SpawnDir)))
+		strings.Join(where, " + "), len(routes), cfg.SpawnDir != "", len(sess.byTok))
+
+	// A socket file left behind is the next run's stale-socket problem, so take
+	// the signals that let us unlink it. SIGKILL cannot be caught — which is how
+	// the harness reaps this process — so listenUnixSocket still has to recover
+	// from debris; this is the tidy path, not the guarantee.
+	stopping := make(chan struct{})
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		close(stopping)
+		closeAll(lns)
+	}()
+
+	h := newHandler(sess, aud, routes, cfg.SpawnDir)
+	// One handler, every listener: the boundary is the same boundary whichever
+	// door a request came through, including its auth and its audit.
+	serveErr := make(chan error, len(lns))
+	for _, ln := range lns {
+		go func(ln net.Listener) { serveErr <- http.Serve(ln, h) }(ln)
+	}
+	err = <-serveErr
+	select {
+	case <-stopping:
+		closeAll(lns)
+		return
+	default:
+		log.Fatal(err)
+	}
 }

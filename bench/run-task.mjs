@@ -262,11 +262,25 @@ if (posture) {
 	//
 	// No spawn_dir: MCP-Bench has no jobs runtime, so /control/spawn stays off
 	// rather than being enabled decoratively.
+	//
+	// `listen: "tcp"` explicitly rather than the platform default: the MCP route is
+	// used by the generated python client and by the vanilla extension, and both
+	// speak HTTP over TCP — neither has a unix-socket transport. On Linux that door
+	// is unreachable from inside a bwrap sandbox (docs §7.2), so the posture there
+	// would be a boundary whose one route out is dead: a run that looks confined and
+	// grounds nothing. Refuse rather than measure that.
+	if (process.platform === "linux") {
+		throw new Error(
+			"--posture on Linux needs an MCP client that can speak a unix socket (docs/CLOUD-HARNESS-DESIGN.md §7.2): " +
+				"the TCP route both arms use cannot be reached from a bwrap sandbox",
+		);
+	}
 	egress = startEgress({
 		runDir,
 		spawnDir: "",
 		routes: [{ name: "mcp", upstream: PROXY }],
 		session: runId,
+		listen: "tcp",
 	});
 
 	const kernelPython = process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");

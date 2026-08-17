@@ -795,7 +795,19 @@ async function main() {
 	let egress;
 	let srtSettingsPath;
 	if (posture) {
-		egress = startEgress({ runDir, spawnDir: "", routes: [{ name: "mcp", upstream: proxy }], session: runId });
+		// TCP explicitly, and a refusal on Linux — same reason as bench/run-task.mjs:
+		// the MCP clients on both arms speak HTTP over TCP, and a bwrap sandbox cannot
+		// reach loopback (docs §7.2), so the posture there would be a boundary with a
+		// dead route rather than a boundary.
+		if (process.platform === "linux") {
+			throw new Error(
+				"--posture on Linux needs an MCP client that can speak a unix socket (docs/CLOUD-HARNESS-DESIGN.md §7.2): " +
+					"the TCP route both arms use cannot be reached from a bwrap sandbox",
+			);
+		}
+		egress = startEgress({
+			runDir, spawnDir: "", routes: [{ name: "mcp", upstream: proxy }], session: runId, listen: "tcp",
+		});
 		const kernelPython =
 			process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
 		srtSettingsPath = join(runDir, "srt-settings.json");
