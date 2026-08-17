@@ -227,3 +227,82 @@ the provider.
   is fixed as part of PR-3 rather than by adopting prime's rlm-runtime.
 - The review's PR-3 (hosting correctness) gets its spec: implement the
   SIGKILL-replay invariant, then the point fixes fall out of it.
+
+## 7. The boundary posture as built (2026-08-16)
+
+Three things, and they only mean anything together. One module,
+`runtime/posture.mjs`, so the eval loop and the benchmark runners can say they
+ran the *same* boundary rather than three convergent clones.
+
+| piece | what it does | where it is real |
+|---|---|---|
+| srt sandbox | what the kernel may read, write, reach | host runners (macOS) |
+| kernel env allow-list | the kernel env is BUILT, not scrubbed | everywhere, incl. containers |
+| egress proxy | the one route out + `/control/spawn` | host runners; runs fine in containers, but see §7.2 |
+
+The eval loop runs all three on every run. `spawn()` from a cell is now an HTTP
+POST to the proxy, which writes the request file the broker already services —
+same durability log, different transport. Proven by the `subagent` task, which
+greps the run's own audit for the spawn verdict: the job records look identical
+whichever door the request came through, so without that assertion a run with
+the proxy up and silently unused passes every other check.
+
+### 7.1 The benchmark runners get it behind a flag, default OFF
+
+`--posture` / `HARNESS_POSTURE=boundary`, recorded in each runner's provenance.
+Off by default deliberately: every number in `docs/` was measured without it,
+and the posture changes things the benchmarks are sensitive to — what the kernel
+can read, whether a cell can reach the network, one extra hop per MCP call.
+Flipping the default would move measured conditions under a label saying nothing
+moved, which is the failure the fairness tests exist to catch.
+`bench/test/posture.test.mjs` pins the default and the provenance.
+
+Under the posture, MCP traffic for BOTH arms goes to `{egress}/r/mcp` with the
+session token — one door, whichever representation is under test. Measured on
+the 6-task quick set: 6/6 completed, all 50 MCP calls in the audit on the `mcp`
+route with status 200, cost and turns inside the ~27% noise band against off.
+
+### 7.2 macOS and Linux disagree about loopback, and it is load-bearing
+
+On macOS the kernel reaches the proxy at `127.0.0.1:<port>`, and it works
+*because* `allowLocalBinding: true` — which ipykernel's ZMQ already requires.
+With it false the connect fails "Operation not permitted". So on macOS all of
+loopback is open, not just our port: **the proxy's authority is its token, not
+srt.**
+
+**This does not hold on Linux.** srt sandboxes through bubblewrap, which gives
+the process its own network namespace, so `127.0.0.1` is not the host's
+loopback. Measured inside a container with the proxy provably up: no connection
+at all, and an empty audit log. Anything hosted needs one of
+
+- the **domain-alias** form — alias the proxy in `/etc/hosts`, name it in
+  `allowedDomains`, and srt's own parent-namespace proxy carries the hop
+  (verified end to end: 201 with the run's token, 401 with a wrong one,
+  `api.anthropic.com` still refused), or
+- a **unix-socket listener** on the proxy, which would be cleaner and which
+  `main.go` does not have yet — it binds TCP only. `allowAllUnixSockets` is
+  already true.
+
+### 7.3 In a container the posture means less, and says so
+
+The brain lives inside the task container for terminal-bench and TAC, so the
+host-side halves do not apply. What remains real is the env allow-list — worth
+having, since TAC leaks its env-LLM key into the container by design.
+
+srt is deliberately **not** wired in there. Measured inside both task images it
+needs bubblewrap, socat and ripgrep (none present), srt 0.0.71 (the `tac-agent`
+volume carries 0.0.55, which fails), and a container launched with
+`--cap-add=SYS_ADMIN` plus seccomp, apparmor and systempaths all unconfined.
+That buys an inner boundary by materially weakening the outer one, and it is a
+decision to take deliberately rather than a flag's side effect. Note also that
+the seccomp half is unavailable in a container regardless
+(`allowAllUnixSockets: false` cannot apply).
+
+**Both agent volumes currently lack the env allow-list patch**, so setting the
+variable in-container is a silent no-op today. `tb-agent` is the sharper trap: it
+*does* honour `HARNESS_KERNEL_SANDBOX_*`, so the sandbox half can be switched on
+and seen to work while the kernel still inherits `ANTHROPIC_API_KEY` — a run
+labelled confined, demonstrably sandboxed, and leaking the key throughout. Both
+container runners therefore check the volume's build for the marker and **fail
+preflight** rather than run under a boundary they do not have. Re-provision
+(`bench/*/provision-agent-volume.sh`) before using `posture=boundary` there.

@@ -49,7 +49,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { KERNEL_ENV_ALLOW, pythonPrefixes, srtSettings, startEgress } from "../../runtime/posture.mjs";
 import { apiLayout, docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
 import { loadRequiredDefaults } from "../required-defaults.mjs";
 import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
@@ -225,6 +227,17 @@ const bashTool = argv.includes("--bash");
  * what gets rendered, and lands in the runId either way.
  */
 const validateArgs = argv.includes("--validate-args") || process.env.HARNESS_VALIDATE_ARGS === "1";
+/**
+ * --posture / HARNESS_POSTURE=boundary — the srt sandbox, the allow-list kernel
+ * environment, and one egress route out.
+ *
+ * OFF by default because it is a measured condition, not a bug fix: it changes
+ * what the kernel can read, whether a cell can reach the network at all, and
+ * adds a hop to every world call. Every AppWorld number in docs/ was taken
+ * without it, so turning it on by default would move the conditions under a
+ * label saying nothing moved. Recorded in both provenance files below.
+ */
+const posture = argv.includes("--posture") || process.env.HARNESS_POSTURE === "boundary";
 /**
  * --required-defaults — render the classifier's listed parameters with no default.
  *
@@ -666,7 +679,7 @@ writeFileSync(
 			runId,
 			arm,
 			residency,
-			variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, bash: bashTool, apiLayout: layout, basePromptVersion, navToolBinaries },
+			variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, bash: bashTool, apiLayout: layout, basePromptVersion, navToolBinaries, posture: posture ? "boundary" : "off" },
 			// The two halves, separately, so "was the base identical?" is a diff and
 			// not an argument.
 			basePrompt,
@@ -711,7 +724,7 @@ const meta = {
 	promptVariant: arm === "codemode" ? promptName : arm === "vanilla" ? vanillaPromptName : undefined,
 	// Which opt-in codemode variants were on. A run compared against another must
 	// be able to say which condition it was in without re-reading the api/ tree.
-	variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, bash: bashTool, apiLayout: layout, basePromptVersion, navToolBinaries },
+	variants: { docsGate, navTools, validateArgs, readGate, requiredDefaults: requiredDefaultsOn, bash: bashTool, apiLayout: layout, basePromptVersion, navToolBinaries, posture: posture ? "boundary" : "off" },
 	basePromptDigest: digest(basePrompt),
 	preambleChars: preamble.length,
 	toolCount: toolList.length,
@@ -769,6 +782,42 @@ async function main() {
 	cliArgs.push(facts.instruction);
 
 	const proxy = `http://127.0.0.1:${port}`;
+
+	/**
+	 * The boundary posture, off by default — see bench/run-task.mjs for why it is
+	 * a measured condition rather than a default.
+	 *
+	 * The one structural difference from MCP-Bench: the upstream is this run's own
+	 * env-server on an ephemeral port, so the route can only be built here, after
+	 * startEnvServer has resolved. That is also why the route table is written
+	 * per run rather than shared — there is no fixed address to point at.
+	 */
+	let egress;
+	let srtSettingsPath;
+	if (posture) {
+		egress = startEgress({ runDir, spawnDir: "", routes: [{ name: "mcp", upstream: proxy }], session: runId });
+		const kernelPython =
+			process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
+		srtSettingsPath = join(runDir, "srt-settings.json");
+		writeFileSync(
+			srtSettingsPath,
+			`${JSON.stringify(
+				srtSettings({
+					runDir,
+					home: homedir(),
+					// runDir holds the generated api/ tree and both ledgers; runtime/ is
+					// needed only when the bash tool is on, because its guard imports
+					// jobs.py from inside the kernel.
+					readable: [runDir, join(ROOT, "runtime"), dirname(CLI), ...pythonPrefixes(kernelPython), "/tmp", tmpdir()],
+					writable: ["/tmp", tmpdir()],
+				}),
+				null,
+				2,
+			)}\n`,
+		);
+		console.log(`[posture] sandbox + env allow-list + egress ${egress.url} -> ${egress.auditPath}`);
+	}
+
 	const child = spawn("bash", ["-c", `set -a; . "$1"; set +a; shift; exec node "$@"`, "_", envFile, ...cliArgs], {
 		cwd: runDir,
 		env: {
@@ -777,9 +826,19 @@ async function main() {
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_TELEMETRY: "0",
 			PRIME_AGENT_CODING_AGENT_DIR: seedPrimeSettings(join(runDir, "agent-home")),
+			...(posture
+				? {
+						HARNESS_EGRESS_PROXY: egress.url,
+						HARNESS_EGRESS_TOKEN: egress.token,
+						HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettingsPath,
+						HARNESS_KERNEL_SANDBOX_BIN: join(ROOT, "node_modules/.bin/srt"),
+						HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW,
+					}
+				: {}),
 			// Both arms' transports read these. The env-server speaks the MCP proxy's
 			// protocol precisely so nothing here needs an AppWorld-specific branch.
-			HARNESS_MCP_PROXY: proxy,
+			// Under the posture they read the egress route instead — one door.
+			HARNESS_MCP_PROXY: posture ? `${egress.url}/r/mcp` : proxy,
 			HARNESS_MCP_CATALOGUE: CATALOGUE,
 			HARNESS_MCP_SERVERS: catalogue.map((s) => s.server).join(","),
 			HARNESS_RUN_ID: runId,
@@ -896,6 +955,9 @@ async function main() {
 	clearTimeout(killTimer);
 	streamFile.end();
 	trajectoryFile.end();
+	// Before the world is torn down, and unconditionally: the proxy holds a port,
+	// and a sweep that leaks one per task exhausts them long before the tasks.
+	egress?.stop();
 	mark("agentEnd");
 
 	summary.exitCode = exitCode;

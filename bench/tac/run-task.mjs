@@ -28,6 +28,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { KERNEL_ENV_ALLOW } from "../../runtime/posture.mjs";
 import { buildTacPreamble } from "./prompts.mjs";
 import { makeArgv } from "../argv.mjs";
 import { createStreamCollector, newSummary } from "../stream-collector.mjs";
@@ -65,6 +66,25 @@ const timeoutSec = Number(flag("timeout", 2400));
  * starts truncating trajectories.
  */
 const maxCost = Number(flag("max-cost", 0));
+/**
+ * --posture / HARNESS_POSTURE=boundary — and in a container it means only the
+ * kernel env allow-list.
+ *
+ * The brain lives inside the task container here, so the host-side halves do not
+ * apply: there is no loop environment out here to keep a credential out of, and
+ * the container is already the sandbox. srt is deliberately not wired in —
+ * measured inside these images it needs bubblewrap, socat and ripgrep (none
+ * present), srt 0.0.71 (the volume has 0.0.55), and a container run with
+ * --cap-add=SYS_ADMIN plus seccomp, apparmor and systempaths unconfined. Buying
+ * an inner boundary by that much weakening of the outer one is a decision to
+ * take deliberately, not a side effect of a flag.
+ *
+ * What remains is worth having: TAC leaks its env-LLM key into the container by
+ * design (run_multi_npc.py puts it on a command line), so keeping the KERNEL's
+ * environment built-from-a-list rather than inherited is real. The build-marker
+ * check below refuses the run if the volume cannot honour it.
+ */
+const posture = flag("posture", "off") === "boundary" || process.env.HARNESS_POSTURE === "boundary";
 const image = flag("image", `ghcr.io/theagentcompany/${taskName}-image:${VERSION}`);
 const runId = flag("run-id", `tac__${taskName}__${arm}__${promptVariant}__${model.replace(/\//g, "-")}`);
 const runDir = join(ROOT, ".run/tac", runId);
@@ -182,7 +202,7 @@ async function main() {
 	const phases = {};
 	const mark = (name) => { phases[name] = new Date().toISOString(); };
 	mark("start");
-	const meta = { runId, arm, model, promptVariant, task: taskName, image, container, startedAt: new Date().toISOString(), phases };
+	const meta = { runId, arm, model, promptVariant, task: taskName, image, container, posture: posture ? "boundary" : "off", startedAt: new Date().toISOString(), phases };
 	writeFileSync(join(runDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
 
 	// Exactly what produced this number: image digest, harness versions, the
@@ -245,10 +265,18 @@ async function main() {
 		const expect = [
 			["HARNESS_CELL_TIMEOUT_MS", "per-cell timeout"],
 			...(process.env.HARNESS_JOBS_RUNTIME === "1" ? [["__HARNESS_WAIT_SECONDS__", "host-side jobs.wait"]] : []),
+			...(posture ? [["HARNESS_KERNEL_ENV_ALLOW", "kernel env allow-list"]] : []),
 		];
+		// Two files, because the markers live in two of them: the cell timeout is
+		// in the ipython tool, the env allow-list is in the kernel module. Checking
+		// only the first would pass a volume that cannot honour the posture at all
+		// — measured: the tac-agent volume has 0 matches for the allow-list
+		// anywhere under dist/, so setting the variable today is a silent no-op and
+		// the run must fail here rather than wear a boundary it does not have.
 		const { stdout } = await docker([
 			"exec", container, "bash", "-c",
-			"cat /agent/prime-mono/packages/coding-agent/dist/core/tools/ipython.js 2>/dev/null | head -c 400000",
+			"cat /agent/prime-mono/packages/coding-agent/dist/core/tools/ipython.js " +
+				"/agent/prime-mono/packages/coding-agent/dist/core/kernel/index.js 2>/dev/null | head -c 800000",
 		]);
 		const missing = expect.filter(([marker]) => !stdout.includes(marker)).map(([, name]) => name);
 		if (missing.length > 0) {
@@ -921,6 +949,11 @@ function runAgent() {
 			 // Vanilla waits between tool calls and pays nothing for it.
 			 `-e HARNESS_CELL_TIMEOUT_MS=${process.env.HARNESS_CELL_TIMEOUT_MS ?? 600000} ` +
 			 `-e HARNESS_SHOW_NAMESPACE=${process.env.HARNESS_SHOW_NAMESPACE ?? "1"} ` +
+			 // The kernel's environment is BUILT from this list rather than
+			 // inheriting the container's, which here is the one that holds TAC's
+			 // leaked env-LLM key. Guarded by the build-marker check above, so a
+			 // volume that cannot honour it fails the run instead of ignoring it.
+			 (posture ? `-e HARNESS_KERNEL_ENV_ALLOW=${KERNEL_ENV_ALLOW} ` : "") +
 			 // Point IPython at a directory we control instead of relying on ~/.ipython.
 			 //
 			 // The prelude was staged into /root/.ipython/profile_default/startup and

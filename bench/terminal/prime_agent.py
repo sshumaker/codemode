@@ -132,6 +132,21 @@ ARM_TOOLS = {
 # would be the hand-rolled-kernel mistake again.
 BASH_EXTENSION = "bench/arms/bash-tool-extension.ts"
 
+# The kernel environment allow-list, under posture=boundary.
+#
+# Duplicated from runtime/posture.mjs because this runner is Python and that one
+# is the source of truth for every other runner; the two are pinned equal by
+# bench/test/posture.test.mjs, so a name added on one side and not the other
+# fails a test rather than quietly giving the container kernel a different
+# boundary than the host kernels get.
+KERNEL_ENV_ALLOW = ",".join([
+    "PATH", "HOME", "TMPDIR", "TMP", "TEMP",
+    "USER", "LOGNAME", "SHELL", "TERM", "TZ",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    "IPYTHONDIR",
+    "HARNESS_*",
+])
+
 
 class PrimeAgent(BaseAgent):
     def __init__(
@@ -140,12 +155,38 @@ class PrimeAgent(BaseAgent):
         arm: str = "codemode",
         jobs: str = "off",
         wait_mode: str = "sleep",
+        posture: str = "off",
         max_cost: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         if arm not in ARM_TOOLS:
             raise ValueError(f"arm must be one of {sorted(ARM_TOOLS)}, got {arm!r}")
+        # posture=boundary — and here it means LESS than it does on the host
+        # runners, which is why the name is validated and recorded rather than
+        # quietly reused.
+        #
+        # The brain lives inside the task container, so the host-side pieces do
+        # not apply: there is no loop environment out here to keep a credential
+        # out of, and the container IS the sandbox. What remains that is real is
+        # the kernel env allow-list — the key reaches the container because the
+        # agent needs it, so keeping it out of the KERNEL is still worth doing.
+        #
+        # srt is deliberately NOT wired in here. Measured inside these images it
+        # needs bubblewrap, socat and ripgrep (absent from both), srt 0.0.71 (the
+        # tac-agent volume carries 0.0.55, which fails), and a container launched
+        # with --cap-add=SYS_ADMIN plus seccomp, apparmor and systempaths all
+        # unconfined. That trade buys an inner boundary by materially weakening
+        # the outer one, and it is a decision to take deliberately, not a flag's
+        # side effect. The egress proxy cross-compiles and runs fine in these
+        # images (verified: 201/401 on the control surface), but the kernel
+        # cannot reach it through srt on Linux anyway — bwrap gives the sandbox
+        # its own network namespace, so 127.0.0.1 is not the host's loopback.
+        if str(posture) not in ("off", "boundary"):
+            raise ValueError(f"posture must be off|boundary, got {posture!r}")
+        self._posture = str(posture)
+        if self._posture == "boundary" and arm != "codemode":
+            raise ValueError("posture=boundary requires arm=codemode (it confines the kernel)")
         # sleep: the host-side in-process wait (the measured default).
         # exit:  scheduler mode — the harness process EXITS at a wait and
         #        runtime/scheduler.py re-invokes `prime -c` when the wake is due.
@@ -229,6 +270,13 @@ class PrimeAgent(BaseAgent):
             # being left to believe it finished.
             "HARNESS_CELL_TIMEOUT_MS": os.environ.get(
                 "HARNESS_CELL_TIMEOUT_MS", "600000"),
+            # The one half of the posture that is real in a container. The kernel
+            # is BUILT from these names rather than having the key removed from
+            # it, so a credential nobody has thought of yet is absent too. Only
+            # under posture=boundary, and _preflight refuses the run unless the
+            # volume's bundle actually honours the variable — see the note there.
+            **({"HARNESS_KERNEL_ENV_ALLOW": KERNEL_ENV_ALLOW}
+               if self._posture == "boundary" else {}),
         }
         if self._jobs == "on":
             # IPYTHONDIR explicitly, not ~/.ipython. Staging the prelude into
@@ -519,6 +567,17 @@ file you have already looked at.\
         # exists for — the run must fail preflight, not lie in its label.
         if self._wait_mode == "exit":
             want.append("HARNESS_WAIT_MODE")
+        # The sharpest instance of this whole class of trap. The tb-agent volume
+        # HONOURS HARNESS_KERNEL_SANDBOX_* while carrying no env allow-list at
+        # all (measured: 0 matches for HARNESS_KERNEL_ENV_ALLOW anywhere under
+        # /agent/prime, against 1 in the host bundle), so the sandbox half can be
+        # switched on and seen to work while the kernel still inherits
+        # ANTHROPIC_API_KEY — a run that is labelled confined, demonstrably
+        # sandboxed, and leaking the key the whole time. Setting the variable
+        # without this check is a silent no-op, so the run must fail preflight
+        # until the volume is re-provisioned from a current build.
+        if self._posture == "boundary":
+            want.append("HARNESS_KERNEL_ENV_ALLOW")
         r = self._exec(session, ["sh", "-c",
                                  f"cat {AGENT_ROOT}/prime/dist/bundle/*.js"])
         blob = r.output
@@ -710,6 +769,7 @@ file you have already looked at.\
             "instruction": instruction,
             "jobs_runtime": self._jobs,
             "wait_mode": self._wait_mode,
+            "posture": self._posture,
             "jobs_staging": jobs_status,
             "jobs_preamble_chars": len(preamble),
             "preflight": checks,

@@ -182,7 +182,16 @@ describe("direct network egress is blocked", () => {
 describe("both arms reach the world through one transport", () => {
 	it("the runner points both arms' transports at the env-server", () => {
 		// _client.py (codemode) and mcp-tools-extension.ts (vanilla) both read this.
-		assert.match(RUNNER, /HARNESS_MCP_PROXY: proxy/);
+		// ONE assignment, so the two arms cannot be pointed at different worlds —
+		// that is the invariant, not the particular spelling of the value.
+		const assignments = RUNNER.match(/HARNESS_MCP_PROXY: [^,\n]+/g) ?? [];
+		assert.equal(assignments.length, 1, `HARNESS_MCP_PROXY assigned ${assignments.length} times`);
+		// Off-posture it is the env-server verbatim; under the posture it is that
+		// same env-server reached through the run's egress route (the route's
+		// upstream IS `proxy` — see the startEgress call above it), so both arms
+		// still traverse exactly one transport to exactly one world.
+		assert.match(assignments[0], /posture \? `\$\{egress\.url\}\/r\/mcp` : proxy$/);
+		assert.match(RUNNER, /routes: \[\{ name: "mcp", upstream: proxy \}\]/);
 	});
 
 	it("the env-server dispatches through world.execute, not world.requester", () => {

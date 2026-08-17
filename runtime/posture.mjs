@@ -109,13 +109,28 @@ export function pythonPrefixes(python) {
  * readable because python's interpreter and dyld need them and no credential of
  * ours is there.
  *
- * `allowLocalBinding` is doing more work than its name suggests. ipykernel
- * speaks ZMQ over loopback, so it cannot be false — and measured under srt on
- * macOS, it is also what permits an outbound connect to 127.0.0.1, which is how
- * the kernel reaches the egress proxy. With it false, that connect fails
+ * `allowLocalBinding` is doing more work than its name suggests, ON MACOS.
+ * ipykernel speaks ZMQ over loopback so it cannot be false, and measured under
+ * seatbelt it is also what permits an outbound connect to 127.0.0.1 — which is
+ * how the kernel reaches the egress proxy. With it false that connect fails
  * "Operation not permitted"; external egress stays blocked either way (403 at
- * srt's own proxy). So loopback is open as a whole, not just to our port: the
- * egress proxy's authority rests on its token, not on srt.
+ * srt's own proxy). So on macOS loopback is open as a whole, not just to our
+ * port: the proxy's authority rests on its token, not on srt.
+ *
+ * THIS DOES NOT HOLD ON LINUX, and the difference is load-bearing for anything
+ * hosted. There srt sandboxes through bubblewrap, which puts the process in its
+ * own network namespace with only its own loopback — measured inside a container,
+ * a POST to the proxy on 127.0.0.1 gets no connection at all while the proxy sits
+ * there provably up and its audit log stays empty. The route that does work is to
+ * treat the proxy as a DOMAIN: alias it in /etc/hosts and name it in
+ * `allowedDomains`, so srt's own parent-namespace proxy carries the hop (verified:
+ * spawn 201 with the run's token, 401 with a wrong one, api.anthropic.com still
+ * refused). A unix-socket listener would be cleaner and main.go does not have one
+ * yet — it binds TCP only.
+ *
+ * So this function's network block is correct for the macOS host runners and is
+ * NOT a portable expression of the posture. Anything running the kernel on Linux
+ * needs the domain-alias form.
  */
 export function srtSettings({ runDir, home, readable, writable = [] }) {
 	return {
