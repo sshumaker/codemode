@@ -398,6 +398,48 @@ describe("pyType: schema information must survive into the signature", () => {
 		assert.equal(by.ids, "list[int]");
 	});
 
+	it("additionalProperties makes a typed map, not a bare dict", () => {
+		// Measured on the product port: `complete_job.final_outputs` carries
+		// `additionalProperties: {type: array, items: {type: string}}` and rendered
+		// `dict`, whereupon four consecutive real jobs passed a bare list and had to
+		// read the wrapper's source to recover. The docstring stated the shape the
+		// whole time — the agent writes from the SIGNATURE.
+		const t = normalizeTool({
+			name: "complete_job",
+			description: "Mark done.",
+			input_schema: {
+				type: "object",
+				properties: {
+					final_outputs: {
+						type: "object",
+						additionalProperties: { type: "array", items: { type: "string" } },
+					},
+				},
+			},
+		});
+		assert.equal(t.params.find((p) => p.name === "final_outputs").type, "dict[str, list[str]]");
+	});
+
+	it("an unconstrained object stays a bare dict", () => {
+		// `additionalProperties: true` (and absent) genuinely say "anything goes",
+		// which `dict` already expresses — inventing a value type there would claim
+		// more than the schema does.
+		const t = normalizeTool({
+			name: "w",
+			description: "d",
+			input_schema: {
+				type: "object",
+				properties: {
+					loose: { type: "object", additionalProperties: true },
+					bare: { type: "object" },
+				},
+			},
+		});
+		const by = Object.fromEntries(t.params.map((p) => [p.name, p.type]));
+		assert.equal(by.loose, "dict");
+		assert.equal(by.bare, "dict");
+	});
+
 	it("a non-string enum keeps its JSON values, not their reprs", () => {
 		// `Literal[1, 2]` and `Literal[True]` are what Python wants; a naive
 		// stringify would emit `Literal["1"]` and silently change the type.

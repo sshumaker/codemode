@@ -123,6 +123,21 @@ function pyType(schema) {
 	if (schema.type === "array") {
 		return `list[${pyType(schema.items)}]`;
 	}
+	// The map case, and the same information loss as the two branches above and
+	// below: `{"type": "object", "additionalProperties": {...}}` is a homogeneous
+	// dict, and rendering it bare `dict` says nothing about what goes in it. JSON
+	// object keys are always strings, so the key type is exact rather than a guess.
+	// Measured on the product port: `complete_job.final_outputs` is
+	// `additionalProperties: {type: array, items: {type: string}}` — i.e.
+	// `dict[str, list[str]]` — and rendered `dict`, whereupon four consecutive real
+	// jobs called it with a bare list and had to `cat` the wrapper to recover. The
+	// docstring carried the shape the whole time; the signature is what the agent
+	// writes from, so the signature is where the shape has to be.
+	// `additionalProperties: true`/`false`/absent stays `dict`: those say the
+	// values are unconstrained, which bare `dict` already expresses.
+	if (schema.type === "object" && schema.additionalProperties && typeof schema.additionalProperties === "object") {
+		return `dict[str, ${pyType(schema.additionalProperties)}]`;
+	}
 	// anyOf / oneOf. Without this the union collapses to `Any` and the signature
 	// stops carrying what the schema knows -- measured on AppWorld's
 	// `supervisor.complete_task`, whose `answer` is anyOf[number,integer,string]
@@ -594,6 +609,19 @@ def _check(value: object, schema: dict, path: str) -> str | None:
         for key in schema.get("required", []):
             if key not in value:
                 return f"{path} is missing the required key {key!r}"
+        # The map case: additionalProperties, as a schema, constrains every value
+        # not covered by properties. Without this a homogeneous dict was checked
+        # only for being a dict, so {"image": "id"} passed here and failed at the
+        # server — one round trip later, and for a graded run, one error row in the
+        # trace the graders read.
+        extra = schema.get("additionalProperties")
+        if isinstance(extra, dict):
+            for key, item in value.items():
+                if key in properties:
+                    continue
+                problem = _check(item, extra, f"{path}[{key!r}]")
+                if problem:
+                    return problem
     return None
 
 

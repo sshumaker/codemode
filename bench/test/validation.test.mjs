@@ -283,6 +283,42 @@ describe("the generated tree, executed against a stub proxy", () => {
 		assert.match(probe("on"), /^OK$/m);
 	});
 
+	it("on: a typed map's VALUES are checked, not just its dict-ness", () => {
+		// `additionalProperties` as a schema constrains every value. Without it a
+		// homogeneous dict was checked only for being a dict, so the wrong value type
+		// passed here and failed at the server — one round trip later, and for a
+		// graded run one `state=error` row in the trace the graders read. Measured on
+		// the product port's `complete_job.final_outputs` (dict[str, list[str]]).
+		const dir = mkdtempSync(join(tmpdir(), "harness-validate-map-"));
+		dirs.push(dir);
+		for (const [rel, content] of Object.entries(generate(CATALOGUE, { validateArgs: true }).files)) {
+			const path = join(dir, "api", rel);
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, content);
+		}
+		const schema = { type: "object", additionalProperties: { type: "array", items: { type: "string" } } };
+		const script = [
+			"import json,sys",
+			`sys.path.insert(0, ${JSON.stringify(dir)})`,
+			"import api._client as c",
+			`schema = json.loads(${JSON.stringify(JSON.stringify(schema))})`,
+			"out = {",
+			"  'good': c._check({'image': ['a', 'b']}, schema, 'final_outputs'),",
+			"  'value_not_list': c._check({'image': 'a'}, schema, 'final_outputs'),",
+			"  'item_not_str': c._check({'image': [1]}, schema, 'final_outputs'),",
+			"  'not_a_dict': c._check(['a'], schema, 'final_outputs'),",
+			"}",
+			"print(json.dumps(out))",
+		].join("\n");
+		const out = JSON.parse(execFileSync("python3", ["-c", script], { encoding: "utf8", stdio: "pipe" }).trim().split("\n").at(-1));
+		assert.equal(out.good, null, "a correctly shaped map was rejected");
+		// Each rejection has to NAME the offending key, or the correction is a riddle.
+		assert.match(out.value_not_list, /final_outputs\['image'\] must be array/);
+		assert.match(out.item_not_str, /final_outputs\['image'\]\[0\] must be string/);
+		// The list-for-dict mistake all four measured jobs actually made.
+		assert.match(out.not_a_dict, /final_outputs must be object, got list/);
+	});
+
 	it("every generated module still compiles with validation on", () => {
 		const dir = mkdtempSync(join(tmpdir(), "harness-validate-ast-"));
 		dirs.push(dir);
