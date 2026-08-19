@@ -1,0 +1,13 @@
+2026-08-19T03:29:40Z watchdog armed for task=compile-compcert (kill on FIRST scheduler sighting)
+2026-08-19T03:29:55Z container=compile-compcert-1-of-1-sched-kill9-1
+2026-08-19T03:31:06Z SIGHTED scheduler pid=3815
+2026-08-19T03:31:06Z   ps:  3815 0 python3 -u /tmp/harness/scheduler.py /tmp/harness/sessions --drain --interval 5 --deadline 2272
+  tree:      48      34      71 /usr/bin/python3 /usr/bin/asciinema rec --stdin /logs/agent.cast
+  tree:      49      48      70 /usr/bin/python3 /usr/bin/asciinema rec --stdin /logs/agent.cast
+  tree:      50      48      70 /usr/bin/python3 /usr/bin/asciinema rec --stdin /logs/agent.cast
+  tree:    3815       0       0 python3 -u /tmp/harness/scheduler.py /tmp/harness/sessions --drain --interval 5 --deadline 2272
+2026-08-19T03:31:06Z KILLED -9 pid=3815
+2026-08-19T03:31:07Z confirmed: pid=3815 is gone
+2026-08-19T03:31:07Z survivors (orphaned children of the dead scheduler):
+     3846       0       1 python3 -u /tmp/harness/scheduler.py /tmp/harness/sessions --drain --interval 5 --deadline 2271
+2026-08-19T03:31:07Z watchdog done — one kill delivered, not re-arming

@@ -751,3 +751,17 @@ measured nothing as wired: `prime_agent._stage_jobs` copies `jobs.py`,
 would have looked like "the agent chose not to delegate". Confirmed in every
 `prelude-status.txt` this campaign produced: `SUBAGENTS off`. **That staging must
 be added and A0'd before any subagent number is believed.**
+
+## #59: live kill -9 of the scheduler mid-build (2026-08-19)
+
+Run sched-kill9-1, compile-compcert, codemode, wait_mode=exit. The watchdog
+SIGKILLed the drain scheduler (pid 3815) at 03:31:06Z on first sighting; the
+self-healing relaunch had a replacement (pid 3846) up ONE SECOND later with the
+deadline correctly decremented (2272 -> 2271, _drain_wakes' own arithmetic).
+The agent's opam job survived independently, post-kill wakes fired (wakes=3),
+and the build resolved: PASS, 17 turns, drainRelaunches=1, $0.289.
+Evidence: docs/evidence/sched-kill9-watchdog.log + .run/terminal-bench/sched-kill9-1/.
+
+Caveat (deliberate): the kill landed before the scheduler had spawned a harness
+child, so this proves the clean case. The orphaned-lease case (kill while a
+cli.js child is alive) remains unexercised; needs a child-sensitive trigger.
