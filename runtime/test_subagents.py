@@ -275,6 +275,7 @@ class TestChildEnvironment(Base):
                      HARNESS_KERNEL_ENV_SCRUB="ANTHROPIC_API_KEY",
                      HARNESS_KERNEL_SANDBOX_SETTINGS="/run/srt.json",
                      HARNESS_KERNEL_SANDBOX_BIN="/run/srt",
+                     HARNESS_KERNEL_SANDBOX="off",
                      ANTHROPIC_API_KEY="present-here"),
             node="node", python="python3",
         )
@@ -286,6 +287,9 @@ class TestChildEnvironment(Base):
         self.assertEqual(env["HARNESS_KERNEL_ENV_SCRUB"], "ANTHROPIC_API_KEY")
         self.assertEqual(env["HARNESS_KERNEL_SANDBOX_SETTINGS"], "/run/srt.json")
         self.assertEqual(env["HARNESS_KERNEL_SANDBOX_BIN"], "/run/srt")
+        # The explicit bare-marker travels too: the kernel fails closed, so a
+        # parent that said "off" must say it for its children or they refuse.
+        self.assertEqual(env["HARNESS_KERNEL_SANDBOX"], "off")
         # And nothing secret rides along: the spec is a file in the job directory,
         # which is inside the sandbox.
         self.assertNotIn("ANTHROPIC_API_KEY", env)

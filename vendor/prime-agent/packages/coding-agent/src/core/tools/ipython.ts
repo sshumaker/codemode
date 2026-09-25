@@ -22,6 +22,503 @@ import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { parseIpythonBashCell } from "./ipython-cell-code.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
+/**
+ * Trim an IPython traceback to the exception and the lines that raised it.
+ *
+ * Measured on a real bridge error (the fixture in bench/test/fixtures/, captured
+ * from the same IPython the kernel runs): **2,961 characters across 8 frames, with
+ * the message last.** The bulk is not asyncio plumbing. IPython prints source
+ * CONTEXT around each frame's failing line, and in the compiled API bridge the
+ * lines above `return await _call(...)` are the function's entire docstring — so a
+ * two-call chain re-printed two docstrings the model had already been given, then
+ * `_client.py`'s docstring, then the payload literal, and only then said what was
+ * wrong. On the product port GLM 5.2 hit this 12 times in 83 cells.
+ *
+ * ipykernel sends one array element per frame, so the trim is structural rather
+ * than a regex over the whole blob:
+ *
+ *   - interpreter plumbing (asyncio, nest_asyncio, ipykernel, IPython) is dropped;
+ *     the mistake is never there,
+ *   - a frame that is only a call INTO the generated bridge is dropped. Detected
+ *     from the marked line, not from a path: `await _call(...)`, `_validate(...)`
+ *     and the bridge's own `raise` are the three, and the exception message names
+ *     the API, the argument and the constraint already,
+ *   - in every surviving frame the lines BEFORE the `--->` marker go and the
+ *     marker line and everything after it stay. That keeps the location line, the
+ *     offending line and the continuation lines carrying the arguments the model
+ *     passed, and drops the echoed docstring,
+ *   - the leading separator, the `ExcType Traceback (most recent call last)`
+ *     header and the final `ExcType: message` are kept verbatim.
+ *
+ * On the fixture: 2,961 -> 931 characters, and what remains is the header, the
+ * model's own two frames, and the message. Nothing that names code the model
+ * wrote is dropped, so an ordinary Python bug in a cell is still diagnosable —
+ * a plain `KeyError` matches none of these rules and only loses the source lines
+ * above the one that raised.
+ *
+ * OFF unless HARNESS_TRACEBACK_TRIM=1, and off is byte-faithful to upstream — an
+ * unflagged build renders exactly what every pre-trim run saw.
+ *
+ * The default is not timidity about the trim; it is about how a condition gets
+ * selected. Before this gate the trim was chosen by REBUILDING dist, and a
+ * rebuild in a checkout that a live eval was reading put the trim into two jobs
+ * that had not asked for it (one kept — no error cells, so the trim could not
+ * have mattered — one excluded). An env var lets ONE dist serve both arms of an
+ * A/B, makes the condition explicit in the run recipe rather than implicit in a
+ * build timestamp, and cannot leak into a run that did not name it.
+ * See scripts/neutralize-prime.mjs.
+ */
+const TRACEBACK_PLUMBING =
+	/(?:^|[/\\])(?:nest_asyncio\d*\.py|asyncio[/\\][^/\\]+\.py|ipykernel(?:_launcher)?[/\\]|IPython[/\\]core[/\\])/;
+
+/** The marked line of a frame that is only a hop through the generated bridge. */
+const BRIDGE_HOP = /^\s*-+>\s*\d*\s*(?:return )?(?:await _call\(|_validate\(server, tool|raise (?:ArgumentError|McpError|DocsFirst|ReadFirst)\()/;
+
+export function trimCellTraceback(traceback: readonly string[]): string {
+	const frames = traceback ?? [];
+	// Read per call, not captured at module load: the kernel and the agent share a
+	// process, and a value frozen at import would make the flag depend on when the
+	// module was first required rather than on the run's own environment.
+	if (process.env.HARNESS_TRACEBACK_TRIM !== "1" || frames.length < 3) return frames.join("\n");
+
+	const kept: string[] = [];
+	frames.forEach((frame, index) => {
+		// The first two elements are the separator and the `ExcType Traceback ...`
+		// header; the last is the message. All three are what the trim is FOR.
+		if (index < 2 || index === frames.length - 1) {
+			kept.push(frame);
+			return;
+		}
+		if (TRACEBACK_PLUMBING.test(frame)) return;
+		const lines = frame.split("\n");
+		const marker = lines.findIndex((line) => /^\s*-+>\s/.test(line));
+		if (marker < 0) {
+			kept.push(frame);
+			return;
+		}
+		if (BRIDGE_HOP.test(lines[marker])) return;
+		// Line 0 is `File <path>:<n>, in <fn>(...)` or `Cell In[n], line n` — the
+		// only context that says WHERE. Everything between it and the marker is
+		// source the model either wrote itself one cell ago or cannot edit.
+		kept.push(marker === 0 ? frame : [lines[0], ...lines.slice(marker)].join("\n"));
+	});
+	// A traceback trimmed to nothing but its own punctuation is worse than a long
+	// one: if EVERY middle frame matched, the raise happened somewhere this
+	// function does not model, so show what the kernel actually sent.
+	return kept.length >= 4 ? kept.join("\n") : frames.join("\n");
+}
+
+/**
+ * Refuse a cell that reaches outside the job's own working directory.
+ *
+ * Measured provenance (H1 probe, job `6p8nIAVw`): **62 of 75 cells hunted the
+ * harness itself** for a tool named in the job brief — `grep -r start_media_job`
+ * over `~/src/harness`, reading daemon sockets and session state, and recovering
+ * its own system prompt out of a daemon state JSON — while the complete tool index
+ * AND an explicit "do not search the filesystem" rule sat in its system prompt the
+ * entire run. In-context guidance has hit its ceiling on this failure mode.
+ *
+ * So the correction moves to the channel this project has repeatedly measured to
+ * work: the ERROR of the cell that made the mistake. Runs that hit a guard adopted
+ * the primitive on the very next cell, where the same sentence in a prompt did not
+ * (CLAUDE.md, "put the correction in the error, not in the prompt").
+ *
+ * OFF unless HARNESS_FS_GUARD=1, and off is byte-faithful — an unflagged build
+ * executes exactly the cells it always did. Same contract as
+ * HARNESS_TRACEBACK_TRIM, and for the same reason: a condition selected by
+ * REBUILDING dist leaked the trim into two eval jobs that had not asked for it, so
+ * conditions live in the run's environment where the recipe can record them.
+ *
+ * Deliberately blunt. This is an experiment arm: a false positive costs one
+ * redirected cell (and the redirect is the intervention), while a false negative
+ * is just the behaviour we already have. What it therefore does NOT do is parse
+ * Python or shell — it scans the cell's source text for absolute paths, `~`, and
+ * `$HOME`, and for a whole-machine search with no path at all (`find / -name …`).
+ *
+ * What is allowed, i.e. what the job legitimately touches:
+ *   - anything at or under the cell's cwd (the round directory), which is where
+ *     `api/` lives — so `open('api/INDEX.md')` and every relative path pass,
+ *   - TMPDIR and /tmp, for scratch files,
+ *   - anything that is not a filesystem path: URLs, division, regexes, and bare
+ *     strings that merely start with a slash are left alone by construction,
+ *     because a candidate must look like a rooted path AND fall outside the roots.
+ *
+ * The parent of cwd is NOT allowed, on purpose: the session directory one level up
+ * holds `system-prompt.txt` and the live `stream.jsonl`, and reading its own
+ * transcript back into context is P7 in the failure ledger.
+ */
+
+/**
+ * Absolute-path-shaped tokens: `/x`, `~/x`, `~user/x`, `$HOME/x`.
+ *
+ * The home-relative alternatives are DELIMITED (`~` must be followed by `/`, by a
+ * username, or by nothing) because tilde expansion bypasses the SYSTEM_ROOTS
+ * bound below by construction: `~<anything>` resolves under `$HOME`, whose first
+ * segment is always `Users`/`home`, so a bare `~[A-Za-z0-9...]*` can never be
+ * dismissed as "probably a URL or a regex" the way a `/`-rooted token can.
+ *
+ * Measured cost of not delimiting it: a creative prompt containing the markdown
+ * cell `| Product Staging | Athletic-build subjects, arms bent ~45° for outerwear |`
+ * was read as the path `~45`, expanded to `/Users/<me>45`, and the WHOLE CELL was
+ * refused with "outside this job's working directory" — a refusal that looks like
+ * the agent overstepped and is actually the guard misreading prose. `~3`, `~1.5`,
+ * `~50`, `~60` and `~9` all appeared the same way in one 40-round arm. A tilde is
+ * only ever a path when it is `~` alone, `~/…`, or `~username…`; a `~` followed by
+ * a digit or a dot is an approximation sign, which is how models write prose.
+ */
+const ROOTED_PATH = /(?:^|[\s'"`(=:,\[{|&;])((?:\$HOME(?=[\/\s'"`,;)\]}|]|$)|~(?=[\/\s'"`,;)\]}|]|$)|~[A-Za-z_][A-Za-z0-9_.-]*(?=[\/\s'"`,;)\]}|]|$)|\/)[A-Za-z0-9_.\-/~$]*)/g;
+
+/** A whole-machine search that names no path: `find / -name x`, `grep -r x ~`. */
+const BARE_ROOT_SEARCH = /\b(?:find|grep|rg|fd|ls|cat|du|tree)\b[^\n]*?\s(\/|~)(?:\s|$)/m;
+
+/** First path segments that mean "the machine", not "this job". */
+const SYSTEM_ROOTS = new Set([
+	"Users",
+	"home",
+	"root",
+	"etc",
+	"usr",
+	"opt",
+	"var",
+	"private",
+	"proc",
+	"sys",
+	"dev",
+	"Library",
+	"Applications",
+	"System",
+	"Volumes",
+	"srv",
+	"mnt",
+	"media",
+	"snap",
+	"bin",
+	"sbin",
+	"lib",
+	"lib64",
+	"boot",
+]);
+
+function fsGuardRoots(cwd: string): string[] {
+	// TMPDIR itself, not its parent. An earlier version allowed all of
+	// `/var/folders` — macOS's TMPDIR lives there — and that swallowed the SESSION
+	// directory whenever the round directory sat under a temp root, i.e. the guard
+	// silently permitted the one read (its own system prompt) it most needs to
+	// refuse. The allowance is now exactly the temp roots and nothing above them.
+	const roots = [cwd, process.env.TMPDIR ?? "", "/tmp", "/private/tmp", "/var/tmp"];
+	return roots.filter(Boolean).map((root) => (root.endsWith("/") ? root.slice(0, -1) : root));
+}
+
+/** True when `path` is at or under one of the allowed roots. */
+function fsGuardAllows(path: string, roots: readonly string[]): boolean {
+	return roots.some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+/**
+ * The first out-of-bounds path a cell names, or null.
+ *
+ * Exported for the tests, which drive it directly rather than booting a kernel:
+ * the refusal text IS the intervention, so it is pinned verbatim.
+ */
+export function fsGuardOffence(code: string, cwd: string): string | null {
+	// A guard that throws turns one refusable cell into a dead tool call. Found by
+	// driving the compiled tool directly with a malformed argument, which is a
+	// thing no unit test of this function would have produced: never trust the
+	// caller's shape in the one code path that runs before everything else.
+	if (typeof code !== "string" || !code) return null;
+	const roots = fsGuardRoots(typeof cwd === "string" ? cwd : "");
+	const home = process.env.HOME ?? "";
+	for (const match of code.matchAll(ROOTED_PATH)) {
+		const raw = match[1];
+		if (!raw || raw === "/" || raw === "~") continue;
+		// `~` and `$HOME` are the spelling the measured failure actually used
+		// (`grep -r … ~/src/harness`), so they are resolved rather than skipped.
+		const path = raw.startsWith("~") ? home + raw.slice(1) : raw.startsWith("$HOME") ? home + raw.slice(5) : raw;
+		if (!path.startsWith("/")) continue;
+		if (fsGuardAllows(path, roots)) continue;
+		// A rooted token whose first segment is not a real system root is far more
+		// likely to be a URL path, a regex, or an MCP route than a file — this is
+		// where the bluntness is bounded rather than in the caller.
+		const first = path.split("/")[1] ?? "";
+		if (!SYSTEM_ROOTS.has(first)) continue;
+		return raw;
+	}
+	const bare = BARE_ROOT_SEARCH.exec(code);
+	return bare ? bare[1] : null;
+}
+
+/**
+ * The refusal, as the cell's own error result — three lines, no traceback.
+ *
+ * Short on purpose. The failing run had the whole tool index in context and still
+ * hunted; a long explanation is more of the thing that did not work. Line one is
+ * the fact (this path, refused), lines two and three are where to go instead.
+ */
+export function fsGuardRefusal(path: string): string {
+	// The refusal is the one channel the model reliably learns from (measured:
+	// next-cell adoption, every time), so it must name the WHOLE local surface.
+	// The previous text named only api/ — and a live H20 trace (n7Lw6uhp cell 3→4)
+	// showed a job absorb that as "skills/ is not part of the job" and walk past
+	// the playbooks directory it had just listed.
+	const skillsLine = process.env.HARNESS_SKILLS_ROOT ? " Playbooks are files under ./skills." : "";
+	return (
+		`Refused: ${path} is outside this job's working directory, and nothing was executed.\n` +
+		`This machine is not part of the job. Your tools are Python packages under ./api — the index is in your system prompt.${skillsLine}\n` +
+		"A tool named in the brief that is not under api/ belongs to a different agent; deliver the outcome with the tools you have."
+	);
+}
+
+/**
+ * H55: the one-time read-batching gate.
+ *
+ * Measured, on the 40-round control arm, from the per-message `usage` records:
+ * cost is 66.6% cacheRead and `observed cacheRead / (n_messages x ctx_final / 2)`
+ * = 1.09, i.e. essentially exactly QUADRATIC in message count -- a prefix is
+ * re-read once per message. So a removed message is worth more than a removed
+ * token, and the biggest removable block is sequential reading: 29% of cells are
+ * read-only (median 10 of 33), in 66 runs of two or more consecutive read-only
+ * cells, the longest 15 long. Collapsing each run to one cell removes 232 of 1242
+ * cells, median 33 messages -> 24, which is a 0.63x cost multiplier: 37% cheaper.
+ * That is an upper bound on perfect batching, and it is still the largest single
+ * lever found for the 2.62x gap.
+ *
+ * The prompt already says it, twice -- "read the skills and query the tool schemas
+ * you need once, up front and in parallel" and "a cell is a program, not a single
+ * call: independent steps belong in ONE cell". Both were in context for every one
+ * of those 66 streaks, which is L2 at its ceiling for the third time, so the
+ * correction goes in the error channel where it has been adopted on the very next
+ * cell every time it has fired.
+ *
+ * WHY THE THIRD CELL AND NOT THE SECOND. Two reads in a row are frequently
+ * DEPENDENT and correct: the agent cannot know the path in `skills/<name>/SKILL.md`
+ * until it has read the index that names it, and refusing that would be refusing
+ * the only order the job permits. A third consecutive read-only cell is where the
+ * pattern stops being "follow the reference I just learned" and starts being "one
+ * file per turn". 46 of the 66 streaks reach three, so firing here still catches
+ * most of them.
+ *
+ * The refusal names the plain-Python way to do it and invents no API, because a
+ * bespoke accessor appears in zero pretraining tokens and the filesystem is
+ * already the interface. Bounded like its siblings: fires ONCE, then disarms for
+ * the session, so the worst case is one spent cell and the best case is six.
+ * OFF unless HARNESS_READ_BATCH_GUARD=1; off is byte-faithful.
+ */
+const READ_ONLY_CELL =
+	/open\s*\(|\.read\s*\(\s*\)|__doc__|\bhelp\s*\(|os\.listdir|glob\.glob|read_text\s*\(/;
+/** Anything that acts. A cell that reads AND acts is never a pure read. */
+const CELL_ACTS = /\bawait\s|\bapi\.\w+\.\w+\s*\(/;
+let readBatchGateFired = false;
+let consecutiveReadOnly = 0;
+
+/** Exported for the tests, which drive the streak directly rather than a kernel. */
+export function readBatchGateReset(): void {
+	readBatchGateFired = false;
+	consecutiveReadOnly = 0;
+}
+
+export function readBatchGateCheck(code: string): string | null {
+	if (process.env.HARNESS_READ_BATCH_GUARD !== "1") return null;
+	// The streak is tracked even after the gate has fired: cheap, and it keeps the
+	// counter honest if a later change wants to fire more than once.
+	if (READ_ONLY_CELL.test(code) && !CELL_ACTS.test(code)) consecutiveReadOnly += 1;
+	else {
+		consecutiveReadOnly = 0;
+		return null;
+	}
+	if (readBatchGateFired || consecutiveReadOnly < 3) return null;
+	readBatchGateFired = true;
+	return (
+		"Refused, this once only, and nothing was executed: this is the third cell in a row that only reads.\n" +
+		"A cell costs a full turn and a turn re-reads every turn above it, so N reads in N cells cost about N^2. " +
+		"Independent reads belong in ONE cell — e.g. `for p in [a, b, c]: print(p, open(p).read())` — " +
+		"and a docstring is cheaper than a whole module: `print(api.<module>.<tool>.__doc__)`.\n" +
+		"Re-run this cell with the other reads you already know you need folded into it. " +
+		"This gate will not fire again this session."
+	);
+}
+
+/** The guard's verdict for one cell, or null when it is off or the cell is fine. */
+export function fsGuardCheck(code: string, cwd: string): string | null {
+	// Read per call, not captured at module load: one dist has to serve both arms
+	// of an A/B, and a value frozen at import would make the condition depend on
+	// when this module was first required rather than on the run's environment.
+	if (process.env.HARNESS_FS_GUARD !== "1") return null;
+	const offence = fsGuardOffence(code, cwd);
+	return offence === null ? null : fsGuardRefusal(offence);
+}
+
+/**
+ * Refuse a cell that runs a command this environment does not have.
+ *
+ * The hole the filesystem guard leaves, found in a live trace (job `dl3D-iS5`):
+ * that guard blocks ROOTED paths, so `grep -r x /Users/…` is refused while
+ * `which opsctl` walks straight past it. A bare name on PATH reaches the
+ * whole host — `pip`, `env`, `ps`, `curl`, and the operator's own binaries — and
+ * the job hunted exactly there once the paths stopped working.
+ *
+ * Same contract as the other gates: OFF unless HARNESS_EXEC_GUARD=1, byte-faithful
+ * when unset, read per call, the literal "1" only. Separate flag from
+ * HARNESS_FS_GUARD on purpose — two interventions that fire on the same cells are
+ * two conditions, and an A/B that cannot separate them measures neither.
+ *
+ * Blunt by construction, like the FS guard: the first word of each pipeline
+ * segment, plus the first argument of a `subprocess`/`os.system` call. It does not
+ * parse shell grammar, and a false positive costs one redirected cell.
+ *
+ * The allowlist is measured — the commands legitimate cells across all traces
+ * actually used — not imagined. Everything else is refused BY NAME, which is the
+ * whole point: the model learns the environment is closed, rather than learning
+ * that one more binary was missing.
+ *
+ * Interim, and worth saying so: the real fix is a containerized kernel with only
+ * the job directory mounted, which subsumes both guards. This is what can be
+ * bought this window.
+ */
+
+/** Commands legitimate cells actually ran, across every trace read so far. */
+const EXEC_ALLOWED = new Set([
+	"cat",
+	"ls",
+	"head",
+	"tail",
+	"wc",
+	"grep",
+	"sed",
+	"awk",
+	"echo",
+	"mkdir",
+	"cp",
+	"mv",
+	"rm",
+	"python3",
+	"ffmpeg",
+	"ffprobe",
+]);
+
+/**
+ * Shell syntax that is not a binary on PATH, and therefore not what this guard is
+ * about.
+ *
+ * NOT in the ordered allowlist, and added deliberately: `cd out && cat x` is one
+ * legitimate cell, and refusing it on `cd` would teach that the shell itself is
+ * unavailable — a false positive with no security value, since none of these
+ * reaches the host beyond what the words after them already do. They are checked
+ * for keyword-hood, not permitted as commands: whatever follows `&&` is still
+ * judged on its own.
+ */
+const SHELL_SYNTAX = new Set([
+	"cd",
+	"export",
+	"set",
+	"unset",
+	"local",
+	"source",
+	".",
+	":",
+	"true",
+	"false",
+	"test",
+	"[",
+	"[[",
+	"printf",
+	"read",
+	"exit",
+	"return",
+	"shift",
+	"break",
+	"continue",
+	"if",
+	"then",
+	"else",
+	"elif",
+	"fi",
+	"for",
+	"while",
+	"until",
+	"do",
+	"done",
+	"case",
+	"esac",
+	"in",
+	"function",
+	"time",
+	"exec",
+	"eval",
+	"wait",
+]);
+
+/** `FOO=1 BAR=2 cmd` — environment assignments precede the command. */
+const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** A `subprocess.*` / `os.system` / `os.popen` call's first string argument. */
+const PYTHON_EXEC = /(?:subprocess\.(?:run|call|check_call|check_output|Popen)|os\.(?:system|popen|execvp?))\s*\(\s*(?:\[\s*)?(['"])([^'"]+)\1/g;
+
+/** The command word of a shell fragment, or null when there is nothing to judge. */
+function execCommandOf(fragment: string): string | null {
+	for (const raw of fragment.trim().split(/\s+/)) {
+		const word = raw.replace(/^[('"`]+/, "");
+		if (!word || ENV_ASSIGNMENT.test(word)) continue; // FOO=1 cmd
+		if (word.startsWith("-") || word.startsWith("<") || word.startsWith(">")) continue;
+		// A rooted path is the filesystem guard's business, not this one — and
+		// judging it here would refuse `/usr/bin/env` twice with two messages.
+		if (word.startsWith("/") || word.startsWith("~") || word.startsWith(".")) return null;
+		const command = word.split("/")[0];
+		return SHELL_SYNTAX.has(command) ? null : command;
+	}
+	return null;
+}
+
+/** The first command a cell runs that this environment does not have, or null. */
+export function execGuardOffence(code: string): string | null {
+	if (typeof code !== "string" || !code) return null;
+	const lines = code.split("\n");
+	const isBash = /^\s*%%bash\b/.test(lines[0] ?? "");
+	if (isBash) {
+		for (const line of lines.slice(1)) {
+			const stripped = line.replace(/#.*$/, "");
+			// Pipelines and lists: every segment runs a command of its own, so each is
+			// judged. `cat x | pip install -` is not made safe by starting with `cat`.
+			for (const segment of stripped.split(/\||&&|\|\||;|\n/)) {
+				const command = execCommandOf(segment);
+				if (command && !EXEC_ALLOWED.has(command)) return command;
+			}
+		}
+	}
+	// `!cmd` line magic, and Python-side execution, in any cell.
+	for (const line of lines) {
+		const bang = /^\s*!(\S+)/.exec(line);
+		if (bang && !EXEC_ALLOWED.has(bang[1]) && !SHELL_SYNTAX.has(bang[1])) return bang[1];
+	}
+	for (const match of code.matchAll(PYTHON_EXEC)) {
+		const command = execCommandOf(match[2]);
+		if (command && !EXEC_ALLOWED.has(command)) return command;
+	}
+	return null;
+}
+
+/**
+ * The refusal — three lines, and the third is the FS guard's verbatim.
+ *
+ * Sharing that line is deliberate: a model that has seen it once should recognise
+ * the same boundary being drawn, rather than reading two unrelated complaints.
+ */
+export function execGuardRefusal(command: string): string {
+	return (
+		`Refused: ${command} is not available here, and nothing was executed.\n` +
+		"This environment is minimal and fully known: Python stdlib, preinstalled packages, and ./api — there are no other commands or services.\n" +
+		"A tool named in the brief that is not under api/ belongs to a different agent; deliver the outcome with the tools you have."
+	);
+}
+
+/** The guard's verdict for one cell, or null when it is off or the cell is fine. */
+export function execGuardCheck(code: string): string | null {
+	// Read per call, for the reason the other gates are: one dist serves both arms
+	// of an A/B, and the condition belongs in the run's environment.
+	if (process.env.HARNESS_EXEC_GUARD !== "1") return null;
+	const offence = execGuardOffence(code);
+	return offence === null ? null : execGuardRefusal(offence);
+}
+
 const RLM_BOOTSTRAP_BASE_CODE = `
 import asyncio
 import os as _prime_agent_os
@@ -804,6 +1301,17 @@ export function createIpythonToolDefinition(
 					: undefined;
 			try {
 				const code = applyShellSettingsToBashMagicCell(params.code, options);
+				// Before the kernel sees it: the refusal has to arrive as this cell's own
+				// error, since that is the channel the correction is delivered on.
+				const fsRefusal = fsGuardCheck(code, cwd) ?? execGuardCheck(code) ?? readBatchGateCheck(code);
+				if (fsRefusal) {
+					clearTimeout(cellTimer);
+					return {
+						content: [{ type: "text", text: fsRefusal }],
+						details: { durationMs: 0, status: "error", errorEname: "FilesystemGuard", stdout: "", stderr: fsRefusal },
+						isError: true,
+					};
+				}
 				const { result: r, kernelRestarted, kernelDied } = await executeWithBusyKernelChoice(
 					provisioner,
 					reportStartupProgress,
@@ -900,7 +1408,7 @@ export function createIpythonToolDefinition(
 				if (r.stderr) text += (text ? "\n" : "") + r.stderr;
 				if (r.result) text += (text ? "\n" : "") + r.result;
 				if (r.status === "error" && r.error) {
-					text += (text ? "\n" : "") + r.error.traceback.join("\n");
+					text += (text ? "\n" : "") + trimCellTraceback(r.error.traceback);
 				}
 				if (kernelRestarted) {
 					const notice = kernelDied ? KERNEL_DEATH_NOTICE : KERNEL_RESTART_NOTICE;

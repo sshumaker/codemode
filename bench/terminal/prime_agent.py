@@ -277,6 +277,12 @@ class PrimeAgent(BaseAgent):
             # volume's bundle actually honours the variable — see the note there.
             **({"HARNESS_KERNEL_ENV_ALLOW": KERNEL_ENV_ALLOW}
                if self._posture == "boundary" else {}),
+            # The kernel fails closed (vendor kernel/index.ts): without srt
+            # settings it refuses to start unless told bare was chosen. In a
+            # task container srt is not provisioned in either posture -- the
+            # container itself is the OS boundary, and under posture=boundary
+            # the env allow-list above is the half that is real here. Say so.
+            "HARNESS_KERNEL_SANDBOX": "off",
         }
         if self._jobs == "on":
             # IPYTHONDIR explicitly, not ~/.ipython. Staging the prelude into

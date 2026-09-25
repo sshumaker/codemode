@@ -14,9 +14,12 @@
  * the benchmark runners must be able to say they ran the SAME boundary, which
  * is only true if there is one implementation of it.
  *
- * What this module does not do is decide whether the posture is on. That is the
- * caller's, because for the benchmark runners it is a measured condition and
- * must be explicit in the run's provenance.
+ * Whether the posture is on is no longer any caller's SILENT choice: the kernel
+ * fails closed (vendor kernel/index.ts, via scripts/neutralize-prime.mjs) and
+ * refuses to start without srt settings unless HARNESS_KERNEL_SANDBOX=off says
+ * bare was chosen on purpose. What stays with the caller is which explicit
+ * condition to run -- for the benchmark runners it is measured, so it must be
+ * named in the run's provenance either way.
  */
 import { spawn, spawnSync } from "node:child_process";
 import {

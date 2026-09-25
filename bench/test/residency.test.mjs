@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { generate, renderFullDocs } from "../generate.mjs";
 import { buildVanillaPreamble, VANILLA_VARIANT_NAMES } from "../prompts.mjs";
-import { loadTasks } from "../tasks.mjs";
+import { loadTasks, requireTaskSet } from "../tasks.mjs";
 
 const CATALOGUE = JSON.parse(readFileSync(new URL("../data/mcp-schemas.json", import.meta.url), "utf8")).catalogue;
 const TASKS = loadTasks();
@@ -48,7 +48,15 @@ test("w1 remains unguided — the negative control is not silently upgraded", ()
 });
 
 test("codemode L4 renders real documentation for every runnable task", () => {
-	assert.ok(TASKS.length > 0, "no runnable tasks — the rest of this file proves nothing");
+	// Names the missing dataset instead of reporting "no runnable tasks", which
+	// reads as a bug in the code under test: `vendor/mcp-bench` is gitignored, so
+	// this file was silently vacuous in every worktree, and the one assertion that
+	// did fire was diagnosed as a compiler regression.
+	requireTaskSet();
+	// A floor, not `> 0`: the dataset is pinned at 50 runnable grounded tasks, so a
+	// count far below that is a truncated or half-installed checkout rather than a
+	// property of the code, and it must not read as one.
+	assert.ok(TASKS.length >= 40, `expected ~50 runnable tasks, got ${TASKS.length} — is the task set complete?`);
 	for (const t of TASKS) {
 		const { normalized, tocLines } = generate(forTask(t));
 		const docs = normalized.map(({ server, tools }) => renderFullDocs(tools, { server })).join("\n");
@@ -65,7 +73,12 @@ test("the docs-in preamble is an order of magnitude larger than docs-out", () =>
 	// The dial has to actually move. Measured on collected AppWorld runs the levels
 	// were 4.6k / 9k / 68k with no overlap; this asserts the same separation here,
 	// where the catalogue is per-task and smaller.
-	for (const t of TASKS.slice(0, 10)) {
+	// Not `.slice(0, 10)` over a possibly-empty list: this loop passed vacuously in
+	// every worktree run, where the dial it exists to prove was never measured.
+	requireTaskSet();
+	const sample = TASKS.slice(0, 10);
+	assert.equal(sample.length, 10, `expected 10 tasks to sample, got ${sample.length}`);
+	for (const t of sample) {
 		const { normalized, names } = generate(forTask(t));
 		const docs = normalized.map(({ server, tools }) => renderFullDocs(tools, { server })).join("\n");
 		const namesOnly = names.join("\n");

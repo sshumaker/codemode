@@ -99,6 +99,31 @@ Pipeline per run: container → `init.sh` (seeds services) → arm → upstream
 
 ## 3. Bugs found (all fixed; each produced a plausible number, not an error)
 
+> **Provisioning note (2026-08-29): the stub `package.json`, and why TAC escaped it.**
+> Prime derives its env-var prefix at startup from `piConfig.name` in the nearest
+> `package.json` above `dist/`. Given a stub manifest, `envPrefix` falls back to
+> `pi`, so prime reads `PI_CODING_AGENT_DIR` and **silently ignores
+> `PRIME_AGENT_CODING_AGENT_DIR`** — `settings.json` and `models.json` then come
+> from `~/.prime/agent` rather than the provisioned volume. Nothing errors. The
+> only tell is `cli.js --version` printing **`0.0.0`** instead of `0.7.1`, so that
+> line is worth reading in any provisioning log you are date-checking.
+>
+> **TAC's provisioner never had this bug**: `bench/tac/provision-agent-volume.sh`
+> copies the real `packages/` tree, so the real manifest travels with it, and it
+> builds the externals in an isolated `/tmp/ext` instead of writing a manifest
+> next to `dist/`. `bench/terminal/provision-agent-volume.sh` did have it (it
+> copies `dist/` alone and wrote `{"name":"prime-externals"}`) and is fixed as of
+> this commit, with a hard failure if the version line ever reads `0.0.0` again.
+>
+> **Recorded results stand.** Provisioning was identical across the arms in every
+> campaign that used the tb-agent volume, so a misdirected agent dir was symmetric
+> and comparative results are unaffected; model selection in those runners came
+> through explicit flags and env rather than `models.json`, and
+> `PRIME_AGENT_KERNEL_PYTHON` is hardcoded rather than prefix-derived, so the
+> kernel was never involved. Full mechanism in
+> `docs/CONTAINER-RUNTIME-DESIGN.md`.
+
+
 1. **Reimplemented harness.** First version hand-rolled the ipython kernel over
    `docker exec` and the vanilla tools. Measured the clone, not the harness, and
    silently dropped image attachments — a multimodal model went blind on ~35% of

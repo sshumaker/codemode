@@ -37,6 +37,21 @@ cost are cheap proxies worth watching, but a variant can be cheaper simply
 because it gave up sooner. **Rank by `score`/`fulfil`; use cost as a tiebreak.**
 Several hours went into optimizing cost before this was checked.
 
+## A rate is not an answer
+
+Never report `k/n` without the roster of the `n-k` failures: the item, what
+happened instead, and the cell where it happened. If the roster is not derivable,
+say so — that is a finding about the instrument, not a reason to omit it.
+
+This exists because of a measured exchange. A summary reported "Skill Pick 8/10"
+with a mechanism claim attached; asked "where did we fail on skill pick?", the
+very next turn opened with "the grader recorded per-item verdicts". The data was
+on disk and known to be on disk, and the aggregate still felt finished.
+
+Corollary, learned the same week: **an aggregate can move against the thing you
+are optimising.** H21 raised Skill Pick 8/10 -> 9/10 and its Overall *fell*,
+because two other criteria each lost one item. Decompose before concluding.
+
 ## Sample size: ~27% run-to-run noise
 
 The same prompt on the same task, run twice, differed by 29% in turns and 26% in
@@ -45,6 +60,19 @@ comparison ranked v3 *worse* when 24 cells later showed it significantly better.
 
 Prefer `--repeat 4` over more tasks. Always run the paired t-test, never eyeball
 the means.
+
+**This rule governs ranking, not looking.** n=1 forbids you from calling an arm
+weaker. It does not forbid reading the next trace — it obligates it. Traces are
+free and already on disk; only confirming *runs* cost money. Measured: across two
+driver sessions on a 1004-run corpus, "n=1" appears 108 times and "noise" 135,
+nearly always as the last words before the session stopped. The rule had become
+the exit ramp, because it said what could not be concluded and never said what to
+do instead.
+
+So: never report a candidate weakness with fewer than 5 traces read at the same
+decision point. If you have one, go read four more before writing anything down.
+When the runs genuinely are not there, close it `inconclusive` with its reason —
+that verdict is always available. You may stop; you may not stop silently.
 
 ## Before trusting any result
 

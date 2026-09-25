@@ -989,6 +989,25 @@ which is the axis under study.
 > and it is now **partly reproduced on MCP-Bench, with the residency claim refined**
 > rather than confirmed (§10.4a, limitation 1).
 
+> **Provenance of the trees these numbers came from.** Every cost figure in §10
+> was measured on `api/` trees generated at `725e693` or earlier — i.e. before the
+> pythonic-argument adapters. `scott/bridge-adapters` (T1 `23db15a`, T2 `fcda594`)
+> widens **23 of AppWorld's 1,544 parameter signatures**: each gains `| str` or
+> `| float` on an array-of-scalars type, a one-line docstring note, and a coercion
+> line in its module. Measured on the L4 docs-resident render: **1,453 added
+> characters against 210,043, i.e. 0.69%** (~360 tokens of a ~52k-token cell) —
+> about 40x smaller than the ~27% run-to-run noise floor (§10.7), not invisible.
+> The schemas themselves are untouched, so vanilla's `toolDefs` are byte-identical,
+> and no example literals reach any AppWorld container, since nothing in that
+> catalogue is a nested shape.
+>
+> Consequence, stated so nobody has to rediscover it: a re-run on the current tree
+> is **not byte-comparable** to these numbers, and should be compared as ratios
+> rather than as absolute cents. For a byte-exact reproduction, generate from
+> `725e693`. The adapted-parameter count is pinned as a literal in
+> `bench/test/pythonic-args.test.mjs`, so a future rule change that widens 200
+> parameters instead of 23 fails a test rather than quietly moving the baseline.
+
 Every measurement this project has taken confounds two factors — and so does
 upstream's. AppWorld's function-calling agent narrows 469 APIs to ≤20 with an LLM
 pre-pass because the schemas do not fit (`function_calling_agent.py:117`), and

@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
+import { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";
 import path from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
@@ -217,13 +218,14 @@ export function createGrepToolDefinition(
 							return lines;
 						};
 
-						const args: string[] = ["--json", "--line-number", "--color=never", "--hidden"];
+						const args: string[] = ["--json", "--line-number", "--color=never", "--hidden", "--follow"];
 						if (ignoreCase) args.push("--ignore-case");
 						if (literal) args.push("--fixed-strings");
 						if (glob) args.push("--glob", glob);
 						args.push("--", pattern, searchPath);
 
-						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const sbRg = toolSandboxWrap(rgPath, args);
+						const child = spawn(sbRg.bin, sbRg.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						let matchCount = 0;

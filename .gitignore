@@ -3,7 +3,7 @@ dist/
 .env
 *.log
 .run/
-vendor/mcp-bench/
+vendor/mcp-bench
 vendor/TheAgentCompany/
 vendor/appworld/
 
@@ -13,3 +13,9 @@ __pycache__/
 *.pyc
 vendor/tau-bench/
 vendor/terminal-bench/
+
+# Harness artifacts: content-identified builds (scripts/build-harness-artifact.sh).
+# The ID and provenance are what matter; the bytes are reproducible from the SHA.
+.harness/
+# Written by scripts/build-harness-artifact.sh; it names a machine-local path.
+harness.lock.json

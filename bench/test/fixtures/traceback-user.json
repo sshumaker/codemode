@@ -1,0 +1,10 @@
+{
+ "note": "Captured verbatim from IPython 9.16.1 + nest_asyncio (the kernel venv prime uses) via a monkeypatched InteractiveShell._showtraceback \u2014 the exact hook ipykernel overrides to send the error message. The only edit is the run directory prefix, rewritten to /run.",
+ "frames": [
+  "---------------------------------------------------------------------------",
+  "KeyError                                  Traceback (most recent call last)",
+  "Cell In[1], line 15\n     12         n += counts[row]\n     13     return n\n---> 15 total([\"image\", \"video\"])\n",
+  "Cell In[1], line 12, in total(rows)\n     10 n = 0\n     11 for row in rows:\n---> 12     n += counts[row]\n     13 return n\n",
+  "KeyError: 'video'"
+ ]
+}

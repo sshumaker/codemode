@@ -270,7 +270,9 @@ describe("the transform is off by default and byte-identical when off", () => {
 
 	it("the untransformed signature still carries the default", () => {
 		const module = generate(FIXTURE, { apiLayout: "consolidated" }).files["mail.py"];
-		assert.match(module, /async def reply_to_message\(body: str, thread_id: int, recipients: list\[str\] \| None = None/);
+		// `list[str] | str` — the T2 adapter widens an array-of-scalars parameter. The
+		// claim here is the `= None` default, which the transform is what removes.
+		assert.match(module, /async def reply_to_message\(body: str, thread_id: int, recipients: list\[str\] \| str \| None = None/);
 		assert.equal(/Required here/.test(module), false);
 	});
 
@@ -295,7 +297,10 @@ describe("a promoted parameter renders as required, with the reason beside it", 
 	it("appears in the signature with no default, after the original required ones", () => {
 		assert.match(
 			files["mail.py"],
-			/async def reply_to_message\(body: str, thread_id: int, recipients: list\[str\], quiet: bool \| None = None\) -> Any:/,
+			// `| str` is the T2 adapter, not the transform. What this pins is that the
+			// promoted parameter has NO default and sits after the originally-required
+			// ones — a Python signature cannot order it otherwise.
+			/async def reply_to_message\(body: str, thread_id: int, recipients: list\[str\] \| str, quiet: bool \| None = None\) -> Any:/,
 		);
 	});
 

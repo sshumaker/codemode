@@ -359,7 +359,9 @@ const child = spawn(
 						HARNESS_KERNEL_SANDBOX_BIN: join(ROOT, "node_modules/.bin/srt"),
 						HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW,
 					}
-				: {}),
+				// The kernel fails closed; posture=off is a measured condition and
+				// must be SAID (and it already lands in meta.posture above).
+				: { HARNESS_KERNEL_SANDBOX: "off" }),
 			HARNESS_MCP_CATALOGUE: SCHEMAS,
 			HARNESS_MCP_SERVERS: task.exposedServers.join(","),
 			HARNESS_RUN_ID: runId,
