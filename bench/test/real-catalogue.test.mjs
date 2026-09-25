@@ -96,10 +96,11 @@ describe("real MCP-Bench catalogue", { skip: available ? false : "run bench/mcp-
 		assert.equal(toolDefs.length, total, "tool defs dropped a tool");
 		assert.equal(tocLines.length, total, "TOC dropped a tool");
 		assert.equal(names.length, total, "name list dropped a tool");
-		// Exclude the package scaffolding: per-server __init__.py and the shared
-		// root-level _client.py transport.
+		// Exclude the package scaffolding: per-server __init__.py, the shared
+		// root-level _client.py transport, and _types.py (the typed result surface,
+		// emitted only for a fully typed catalogue).
 		const modules = Object.keys(files).filter(
-			(p) => p.endsWith(".py") && !p.endsWith("__init__.py") && !p.endsWith("_client.py"),
+			(p) => p.endsWith(".py") && !p.endsWith("__init__.py") && !p.endsWith("_client.py") && !p.endsWith("_types.py"),
 		);
 		assert.equal(modules.length, total, "api/ tree dropped a tool");
 	});

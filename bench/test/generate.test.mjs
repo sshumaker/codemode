@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { countTokens } from "../arms.mjs";
-import { generate, normalizeTool, pyIdent, signature, wireName } from "../generate.mjs";
+import { constraintNote, generate, normalizeTool, pyIdent, renderFullDocs, signature, wireName } from "../generate.mjs";
 import { adversarial, realistic, synthetic } from "./fixtures/catalogue.mjs";
 
 const allTools = (catalogue) => catalogue.flatMap((s) => s.tools.map((t) => ({ server: s.server, ...t })));
@@ -264,5 +264,58 @@ describe("wire names satisfy provider constraints", () => {
 			assert.ok(def._mcp?.server, `${def.name} lost its server`);
 			assert.ok(def._mcp?.tool, `${def.name} lost its tool name`);
 		}
+	});
+});
+
+describe("schema bounds reach the docstring (W126)", () => {
+	// The validator enforced 136 constraints the docstrings never stated, so the
+	// agent's first in-range value was a guess: 1.57 ArgumentError turns per job,
+	// 20 of them `max_timeout` > 60. The docstring and `_schemas.json` are rendered
+	// from the same spec, so the sentence and the error can no longer disagree.
+	const tool = normalizeTool({
+		name: "bounded",
+		description: "Bounded.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				max_timeout: { type: "number", description: "Maximum seconds to wait", minimum: 1, maximum: 60 },
+				prompt: { type: "string", minLength: 1, maxLength: 7000 },
+				references: { type: "array", items: { type: "string" }, maxItems: 4 },
+				rate: { type: "number", exclusiveMinimum: 0 },
+				free: { type: "string", description: "No bounds" },
+			},
+			required: ["prompt"],
+		},
+	});
+	const byName = Object.fromEntries(tool.params.map((p) => [p.name, p]));
+
+	it("renders one sentence per bounded parameter, in the validator's terms", () => {
+		assert.equal(constraintNote(byName.max_timeout), "Range: 1 <= value <= 60.");
+		assert.equal(constraintNote(byName.prompt), "Length: 1 to 7000 characters.");
+		assert.equal(constraintNote(byName.references), "Items: at most 4.");
+		assert.equal(constraintNote(byName.rate), "Range: 0 < value.");
+		assert.equal(constraintNote(byName.free), null);
+	});
+
+	it("puts the sentence under the parameter in both layouts and in the resident docs", () => {
+		const cat = [{ server: "svc", tools: [{ name: "bounded", description: "Bounded.", inputSchema: tool.schema }] }];
+		for (const apiLayout of ["per-method", "consolidated"]) {
+			const { files } = generate(cat, { apiLayout, validateArgs: true, constraintNotes: true });
+			const text = Object.values(files).join("\n");
+			assert.match(text, /max_timeout: Maximum seconds to wait Optional\.\n\s+Range: 1 <= value <= 60\./, apiLayout);
+			assert.match(text, /prompt:\n\s+Length: 1 to 7000 characters\./, apiLayout);
+		}
+		assert.match(renderFullDocs(cat[0].tools.map(normalizeTool), { server: "svc", constraintNotes: true }), /Range: 1 <= value <= 60\./);
+	});
+
+	it("is opt-in: without constraintNotes no tree or resident doc changes", () => {
+		// The MCP-Bench and AppWorld numbers were measured on trees without these
+		// lines (AppWorld alone has 324 bounded parameters, ~10.7k chars of L4 text).
+		const cat = [{ server: "svc", tools: [{ name: "bounded", description: "Bounded.", inputSchema: tool.schema }] }];
+		for (const apiLayout of ["per-method", "consolidated"]) {
+			const text = Object.values(generate(cat, { apiLayout, validateArgs: true }).files).join("\n");
+			assert.doesNotMatch(text, /Range: |Length: |Items: /, apiLayout);
+		}
+		assert.doesNotMatch(renderFullDocs(cat[0].tools.map(normalizeTool), { server: "svc" }), /Range: /);
 	});
 });

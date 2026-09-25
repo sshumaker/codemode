@@ -161,3 +161,46 @@ describe("the root INDEX lists what can be imported", () => {
 		assert.match(index, /cat api\/<module>\.py/);
 	});
 });
+
+describe("the module index, opt-in (W129)", () => {
+	const index = consolidated(PRODUCT, { moduleIndex: true })["INDEX.md"];
+
+	it("the column is the KINDS of operation, derived from the tool names, never the bare category word", () => {
+		assert.match(index, /\| `api\.image` \| [^|]*\w[^|]* \| creative_actions \| 2 \|/);
+		assert.doesNotMatch(index, /\| `api\.image` \| image \|/);
+		assert.match(index, /\| `api\.video` \| [^|]+ \| creative_actions \| 2 \|/);
+		assert.match(index, /\| `api\.creative_actions` \| [^|]+ \| creative_actions \| 1 \|/);
+		assert.doesNotMatch(index, /everything else in this app/);
+		assert.match(index, /head -60 api\/<module>\.py/);
+	});
+
+	it("each module's header lists its tools, one line each, before the full contracts", () => {
+		const image = consolidated(PRODUCT, { moduleIndex: true })["image.py"];
+		const header = image.slice(0, image.indexOf('"""', 3));
+		assert.match(header, /Tools \(signature — what it does\):\n {2}api\.image\.create_image_nano_banana_pro\(prompt\) — create image nano banana pro\./);
+		assert.match(header, /api\.image\.blend_image\(prompt\)/);
+	});
+
+	it("is off by default: the tree is the one rendered before the option existed", () => {
+		const files = consolidated(PRODUCT);
+		assert.doesNotMatch(files["image.py"], /Tools \(signature/);
+		assert.doesNotMatch(files["INDEX.md"], /head -60/);
+		assert.deepEqual(consolidated(PRODUCT, { moduleIndex: false }), files);
+	});
+});
+
+describe("operationFamilies: kinds of operation, derived from names (W129)", async () => {
+	const { operationFamilies } = await import("../generate.mjs");
+	it("groups by the first two tokens, names the variants, and stands the rest alone", () => {
+		const out = operationFamilies([
+			"create_image_gpt_image_2", "create_image_nano_banana_pro", "create_image_seedream",
+			"modify_image_gpt_image_2", "modify_image_nano_banana_2",
+			"remove_background_sam3", "image_crop", "blend_image",
+		]);
+		assert.equal(out, "create_image ×3 (gpt, nano, seedream), modify_image ×2 (gpt, nano), blend_image, image_crop, remove_background_sam3");
+	});
+	it("caps the list and counts the remainder, so it stays a table of contents", () => {
+		const out = operationFamilies(["read", "write", "edit", "link", "judge_tool", "label_asset", "search_web", "todo_write", "complete_job", "wait_for_assets"], { max: 4 });
+		assert.match(out, /^complete_job, edit, judge_tool, label_asset, \+6 more$/);
+	});
+});
