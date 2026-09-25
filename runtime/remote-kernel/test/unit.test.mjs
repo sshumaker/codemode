@@ -199,6 +199,35 @@ describe("config", () => {
 	});
 });
 
+describe("daytona provider find", () => {
+	it("a bound sandbox is fetched by id, so a lagging label search can't hide a relabelled one", async () => {
+		const { DaytonaKernelProvider } = await import("../../daytona/provider.mjs");
+		const sandboxes = new Map([["sb-1", { id: "sb-1", state: "started", labels: { app: "assistant-workspace", conversation: "pool-x" } }]]);
+		let searchable = false;
+		const daytona = {
+			async *list({ labels }) {
+				for (const sb of sandboxes.values()) {
+					if (!searchable && labels.conversation === "conv-1") continue;
+					if (Object.entries(labels).every(([k, v]) => sb.labels[k] === v)) yield sb;
+				}
+			},
+			async get(id) {
+				const sb = sandboxes.get(id);
+				if (!sb) throw new Error("not found");
+				return sb;
+			},
+		};
+		const p = new DaytonaKernelProvider({ daytona });
+		sandboxes.get("sb-1").labels = { app: "assistant-workspace", conversation: "conv-1" };
+		assert.equal(await p.find("conv-1"), undefined, "the search lags the relabel");
+		p.bind("conv-1", "sb-1");
+		assert.equal((await p.find("conv-1"))?.id, "sb-1");
+		sandboxes.get("sb-1").labels = { app: "assistant-workspace", conversation: "someone-else" };
+		searchable = true;
+		assert.equal(await p.find("conv-1"), undefined, "a binding is dropped once the sandbox is no longer the conversation's");
+	});
+});
+
 describe("kernel-server bundle", () => {
 	it("concurrent builds into one dir share a single build, and every caller settles", async () => {
 		const { buildKernelServerBundle } = await import("../../daytona/bundle.mjs");

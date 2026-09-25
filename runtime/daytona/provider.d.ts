@@ -78,6 +78,8 @@ export declare class DaytonaKernelProvider {
 	/** Dispose the Daytona client; call on shutdown. */
 	close(): Promise<void>;
 	ensure(conversationId: string, opts?: { mounts?: Mount[] }): Promise<KernelConnectionInfo>;
+	/** Record that a sandbox was just relabelled to this conversation, so find() fetches it by id. */
+	bind(conversationId: string, sandboxId: string): void;
 	stop(conversationId: string): Promise<{ stopped: boolean; sandboxId?: string; state?: string }>;
 	destroy(conversationId: string): Promise<{ destroyed: boolean; sandboxId?: string }>;
 	touch(conversationId: string): Promise<void>;

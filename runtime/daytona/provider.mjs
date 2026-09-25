@@ -120,6 +120,7 @@ export class DaytonaKernelProvider {
 		this.resources = options.resources;
 		this.bundle = undefined;
 		this.locks = new Map();
+		this.bound = new Map();
 	}
 
 	/** Release the Daytona client (its event socket keeps a process alive otherwise). */
@@ -147,11 +148,34 @@ export class DaytonaKernelProvider {
 		return this.bundle;
 	}
 
+	/**
+	 * The conversation's sandbox. Once found (or bound), it is fetched by id: label
+	 * search is eventually consistent, and a sandbox relabelled to this conversation a
+	 * moment ago (a gateway's warm pool) can be missing from it, which made ensure()
+	 * create a second sandbox for the same conversation.
+	 */
 	async find(conversationId) {
-		for await (const sb of this.daytona.list({ labels: { ...this.labels, conversation: String(conversationId) } })) {
+		const id = String(conversationId);
+		const known = this.bound.get(id);
+		if (known) {
+			try {
+				const sb = await this.daytona.get(known);
+				if (sb?.labels?.conversation === id && sb.state !== "destroyed") return sb;
+			} catch {
+				// deleted or unreachable; fall back to the search
+			}
+			this.bound.delete(id);
+		}
+		for await (const sb of this.daytona.list({ labels: { ...this.labels, conversation: id } })) {
+			this.bound.set(id, sb.id);
 			return sb;
 		}
 		return undefined;
+	}
+
+	/** Record that `sandboxId` now belongs to `conversationId` (it was just relabelled to it). */
+	bind(conversationId, sandboxId) {
+		this.bound.set(String(conversationId), sandboxId);
 	}
 
 	/**
@@ -426,6 +450,7 @@ export class DaytonaKernelProvider {
 			const sb = await this.find(conversationId);
 			if (!sb) return { destroyed: false };
 			await retryConflict(() => sb.delete(120, true));
+			this.bound.delete(String(conversationId));
 			return { destroyed: true, sandboxId: sb.id };
 		});
 	}
