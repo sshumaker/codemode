@@ -81,6 +81,18 @@ async function retryTransient(fn, attempts = 4) {
 	}
 }
 
+/** 409 "state change in progress": another call is stopping/starting it; wait it out. */
+async function retryConflict(fn, attempts = 20) {
+	for (let i = 1; ; i++) {
+		try {
+			return await fn();
+		} catch (error) {
+			if (i >= attempts || error?.statusCode !== 409) throw error;
+			await new Promise((r) => setTimeout(r, 3000));
+		}
+	}
+}
+
 /** A remote path under the conversation's work dir; refuses anything that escapes it. */
 function underWork(workDir, rel) {
 	const p = posix.normalize(rel.startsWith("/") ? rel : posix.join(workDir, rel));
@@ -113,13 +125,15 @@ export class DaytonaKernelProvider {
 	/** Serialise lifecycle calls per conversation: two ensure()s must not race a create. */
 	withLock(conversationId, fn) {
 		const prev = this.locks.get(conversationId) ?? Promise.resolve();
-		const next = prev.catch(() => {}).then(fn);
-		this.locks.set(
-			conversationId,
-			next.finally(() => {
-				if (this.locks.get(conversationId) === next) this.locks.delete(conversationId);
-			}),
-		);
+		const next = prev.then(fn);
+		// The chain entry must never reject: the caller handles `next`, and an entry
+		// that rejected too would surface as an unhandled rejection of its own.
+		const settled = next
+			.catch(() => {})
+			.then(() => {
+				if (this.locks.get(conversationId) === settled) this.locks.delete(conversationId);
+			});
+		this.locks.set(conversationId, settled);
 		return next;
 	}
 
@@ -392,7 +406,7 @@ export class DaytonaKernelProvider {
 		return this.withLock(conversationId, async () => {
 			const sb = await this.find(conversationId);
 			if (!sb) return { destroyed: false };
-			await sb.delete(120, true);
+			await retryConflict(() => sb.delete(120, true));
 			return { destroyed: true, sandboxId: sb.id };
 		});
 	}
@@ -470,8 +484,10 @@ export class DaytonaKernelProvider {
 		const orphans = await this.listOrphans({ knownConversationIds });
 		for (const o of orphans) {
 			if (o.state === "destroying" || o.state === "destroyed") continue;
-			const sb = await this.daytona.get(o.sandboxId);
-			await sb.delete(120, true);
+			await retryConflict(async () => {
+				const sb = await this.daytona.get(o.sandboxId);
+				await sb.delete(120, true);
+			});
 		}
 		const ids = new Set(orphans.map((o) => o.sandboxId));
 		const deadline = Date.now() + waitMs;

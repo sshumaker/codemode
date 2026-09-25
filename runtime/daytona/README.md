@@ -33,7 +33,9 @@ const kernels = new DaytonaKernelProvider({
 | `ensure(conversationId, { mounts? })` | `KernelConnectionInfo` | Find the sandbox labelled `app=assistant-workspace, conversation=<id>`, or create it (name `aw-<id>-<hash>`); start it if stopped; install the runtime if the sandbox does not hold the current bundle version; lock egress (`networkBlockAll`); start or verify the kernel server; upload each mount once per content hash; return how to connect. Refuses (throws) unless the server's own probe says egress is blocked. Calls for one conversation are serialised. |
 | `stop(conversationId)` | `{stopped, sandboxId?}` | On idle. SIGTERMs the kernel server first so kernels flush their namespace snapshots, then stops the sandbox. Files, the venv and snapshots persist. |
 | `destroy(conversationId)` | `{destroyed, sandboxId?}` | On conversation delete. |
-| `touch(conversationId)` | — | `refreshActivity()`; call during long turns so auto-stop does not fire mid-turn. |
+| `touch(conversationId)` | — | one `refreshActivity()`. |
+| `keepAlive(conversationId, { intervalMs = 60000 })` | `release()` | `refreshActivity()` on an interval. **Hold it while prime is alive.** Traffic on the kernel's WebSocket does not count as Daytona activity: a sandbox with `autoStopInterval: 1` and a heartbeating kernel link was `stopping` at 60 s; the same sandbox under `keepAlive` stayed `started` for 180 s and stopped ~90 s after release. |
+| `listTree(conversationId, dir = "outputs")` | `{path, size, mtimeMs}[]` | every regular file under `dir`, recursively, in one sandbox call; `path` is relative to the work dir. |
 | `listOrphans({ knownConversationIds? })` | `Orphan[]` | Sandboxes with this provider's labels whose conversation is not in the set (all of them if no set). |
 | `reap({ knownConversationIds? })` | `Orphan[]` deleted | Delete every orphan. |
 | `uploadFile(conversationId, path, data)` | sandbox path | `path` relative to the work dir, e.g. `inputs/report.pdf`. Anything escaping the work dir is refused. |
@@ -127,6 +129,27 @@ work dir `~/work/{inputs,outputs}`.
 - **Fallback** (no snapshot): the stock image, root `~/.harness-runtime`; `ensure()`
   uploads the bundle, installs zeromq and uv, runs `--prebake`, then locks egress.
   With an older `harness-assistant-kernel-*` snapshot, only the bundle is replaced.
+
+## Measured (a Daytona account, us target, 1 vCPU / 1 GB default sandbox)
+
+| | |
+| --- | --- |
+| `ensure()`, new conversation, no snapshot (upload + venv build + lock) | 27–30 s (install 21–23 s) |
+| `ensure()`, sandbox stopped → started, server relaunched | 5.5 s |
+| `ensure()`, sandbox already running | ~1.5 s |
+| kernel `start()` (boot + bootstrap check) on a warm venv | 2.2–2.6 s; 1.25 s after a restart |
+| first cell after start (`1+1`) | 150–200 ms |
+| per-cell overhead, round trip through the Daytona proxy | ~85 ms (spike) |
+| reattach after a dropped socket, cell result intact | 0.74–1.4 s (local fake: ~0.1 s) |
+| `stop()` | 6.7 s |
+| real prime turn (Haiku 4.5, 2 tool calls incl. the tunnel) | 11–12 s, $0.011 |
+
+The prebuilt snapshot is not built: the API key in `the product's env file`
+("local") carries only `write:sandboxes` and `delete:sandboxes`, and
+`snapshot.create` answers 403. With a key that can write snapshots,
+`node runtime/daytona/snapshot.mjs` builds `harness-assistant-kernel-<version>` and
+`ensure()` uses it automatically; the new-conversation cost then drops to create +
+server launch (the install step disappears).
 
 ## Tests
 
