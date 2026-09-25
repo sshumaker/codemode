@@ -83,8 +83,9 @@ export declare class DaytonaKernelProvider {
 	keepAlive(conversationId: string, opts?: { intervalMs?: number }): () => void;
 	/** Every regular file under dir (default "outputs"), recursively: {path relative to the work dir, size, mtimeMs}. */
 	listTree(conversationId: string, dir?: string): Promise<{ path: string; size: number; mtimeMs: number }[]>;
-	listOrphans(opts?: { knownConversationIds?: Iterable<string> }): Promise<Orphan[]>;
-	reap(opts?: { knownConversationIds?: Iterable<string> }): Promise<Orphan[]>;
+	listOrphans(opts?: { knownConversationIds?: Iterable<string>; includeDestroyed?: boolean }): Promise<Orphan[]>;
+	/** Deletes every orphan and waits (up to waitMs, default 120 s) until Daytona stops listing them. */
+	reap(opts?: { knownConversationIds?: Iterable<string>; waitMs?: number }): Promise<Orphan[]>;
 	uploadFile(conversationId: string, path: string, data: Buffer | string): Promise<string>;
 	listFiles(conversationId: string, dir?: string): Promise<SandboxFile[]>;
 	readFile(conversationId: string, path: string): Promise<Buffer>;

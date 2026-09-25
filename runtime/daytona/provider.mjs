@@ -449,28 +449,38 @@ export class DaytonaKernelProvider {
 	 * those whose conversation is not in the set (the gateway deleted it, or crashed
 	 * before recording it); without, every labelled sandbox.
 	 */
-	async listOrphans({ knownConversationIds } = {}) {
+	async listOrphans({ knownConversationIds, includeDestroyed = false } = {}) {
 		const known = knownConversationIds ? new Set([...knownConversationIds].map(String)) : undefined;
 		const out = [];
 		for await (const sb of this.daytona.list({ labels: this.labels })) {
 			if (!Object.entries(this.labels).every(([k, v]) => sb.labels?.[k] === v)) continue;
 			const conversation = sb.labels?.conversation;
 			if (known && known.has(conversation)) continue;
+			if (!includeDestroyed && sb.state === "destroyed") continue;
 			out.push({ sandboxId: sb.id, conversationId: conversation, state: sb.state, lastActivityAt: sb.lastActivityAt });
 		}
 		return out;
 	}
 
-	/** Delete every orphan (see listOrphans). Returns what was deleted. */
-	async reap({ knownConversationIds } = {}) {
+	/**
+	 * Delete every orphan (see listOrphans), and wait until Daytona no longer lists
+	 * them: a sandbox reads "destroying" for a while after delete() returns.
+	 */
+	async reap({ knownConversationIds, waitMs = 120_000 } = {}) {
 		const orphans = await this.listOrphans({ knownConversationIds });
-		const deleted = [];
 		for (const o of orphans) {
+			if (o.state === "destroying" || o.state === "destroyed") continue;
 			const sb = await this.daytona.get(o.sandboxId);
 			await sb.delete(120, true);
-			deleted.push(o);
 		}
-		return deleted;
+		const ids = new Set(orphans.map((o) => o.sandboxId));
+		const deadline = Date.now() + waitMs;
+		while (Date.now() < deadline) {
+			const still = (await this.listOrphans()).filter((o) => ids.has(o.sandboxId) && o.state !== "destroyed");
+			if (still.length === 0) break;
+			await new Promise((r) => setTimeout(r, 2000));
+		}
+		return orphans;
 	}
 
 	async started(conversationId) {
