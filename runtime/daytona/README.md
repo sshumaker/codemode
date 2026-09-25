@@ -134,14 +134,14 @@ work dir `~/work/{inputs,outputs}`.
 
 | | |
 | --- | --- |
-| `ensure()`, new conversation, no snapshot (upload + venv build + lock) | 27–30 s (install 21–23 s) |
-| `ensure()`, sandbox stopped → started, server relaunched | 5.5 s |
+| `ensure()`, new conversation, no snapshot (upload + venv build + lock) | 27–35 s (install 21–28 s) |
+| `ensure()`, sandbox stopped → started, server relaunched | 5.5–8 s |
 | `ensure()`, sandbox already running | ~1.5 s |
 | kernel `start()` (boot + bootstrap check) on a warm venv | 2.2–2.6 s; 1.25 s after a restart |
 | first cell after start (`1+1`) | 150–200 ms |
 | per-cell overhead, round trip through the Daytona proxy | ~85 ms (spike) |
 | reattach after a dropped socket, cell result intact | 0.74–1.4 s (local fake: ~0.1 s) |
-| `stop()` | 6.7 s |
+| `stop()` | 5.3–6.7 s |
 | real prime turn (Haiku 4.5, 2 tool calls incl. the tunnel) | 11–12 s, $0.011 |
 
 The prebuilt snapshot is not built: the API key in `the product's env file`
@@ -150,6 +150,22 @@ The prebuilt snapshot is not built: the API key in `the product's env file`
 `node runtime/daytona/snapshot.mjs` builds `harness-assistant-kernel-<version>` and
 `ensure()` uses it automatically; the new-conversation cost then drops to create +
 server launch (the install step disappears).
+
+## The gateway backend
+
+`~/src/aw-daytona` (branch `daytona` of assistant-workspace) has
+`gateway/src/kernel/daytona.ts`, a `KernelBackend` over this provider, registered as
+`KERNEL_BACKEND=daytona`; its e2e suite passes with every kernel in Daytona
+(`E2E_KERNEL_BACKEND=daytona`, 9/9).
+
+## Known gaps
+
+- `HARNESS_FS_GUARD=1` (opt-in) judges a cell's paths against the loop's cwd, not the
+  sandbox's; leave it off with this backend.
+- The namespace-provenance feature writes `.cells/turn-N.py` on the loop's disk; a cell
+  that opens one of those in the sandbox will not find it.
+- A Python skill whose dependencies are *sibling* skill packages is uploaded alone, so
+  the sibling is not found; bundled skills are unaffected.
 
 ## Tests
 
