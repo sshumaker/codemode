@@ -75,6 +75,8 @@ export interface Orphan {
 
 export declare class DaytonaKernelProvider {
 	constructor(options?: DaytonaKernelProviderOptions);
+	/** Dispose the Daytona client; call on shutdown. */
+	close(): Promise<void>;
 	ensure(conversationId: string, opts?: { mounts?: Mount[] }): Promise<KernelConnectionInfo>;
 	stop(conversationId: string): Promise<{ stopped: boolean; sandboxId?: string; state?: string }>;
 	destroy(conversationId: string): Promise<{ destroyed: boolean; sandboxId?: string }>;

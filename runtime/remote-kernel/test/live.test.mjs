@@ -164,5 +164,6 @@ after(async () => {
 	const deleted = await provider.reap({ knownConversationIds: [] });
 	console.log(`reaped ${deleted.length} test sandboxes: ${deleted.map((d) => d.sandboxId).join(", ")}`);
 	const left = await provider.listOrphans();
+	await provider.close();
 	assert.equal(left.length, 0, `test sandboxes left behind: ${JSON.stringify(left)}`);
 });

@@ -45,9 +45,12 @@ export async function startFakeServer(opts = {}) {
 		...(opts.probeTargets ? { KERNEL_SERVER_PROBE_TARGETS: opts.probeTargets } : {}),
 		...opts.env,
 	};
+	// Its own process group, so kill9() takes the kernels down with it: a SIGKILLed
+	// server cannot dispose them, and they would outlive the test.
 	const child = spawn(process.execPath, [join(DIST, "core/kernel/remote/server-main.js")], {
 		env,
 		stdio: ["ignore", "pipe", "pipe"],
+		detached: true,
 	});
 	let log = "";
 	child.stdout.on("data", (d) => {
@@ -86,7 +89,11 @@ export async function startFakeServer(opts = {}) {
 			new Promise((resolve) => {
 				if (child.exitCode !== null) return resolve();
 				child.once("exit", () => resolve());
-				child.kill("SIGKILL");
+				try {
+					process.kill(-child.pid, "SIGKILL");
+				} catch {
+					child.kill("SIGKILL");
+				}
 			}),
 	};
 }

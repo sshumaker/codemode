@@ -122,6 +122,11 @@ export class DaytonaKernelProvider {
 		this.locks = new Map();
 	}
 
+	/** Release the Daytona client (its event socket keeps a process alive otherwise). */
+	async close() {
+		await this.daytona[Symbol.asyncDispose]?.();
+	}
+
 	/** Serialise lifecycle calls per conversation: two ensure()s must not race a create. */
 	withLock(conversationId, fn) {
 		const prev = this.locks.get(conversationId) ?? Promise.resolve();
@@ -173,10 +178,13 @@ export class DaytonaKernelProvider {
 			sb = await this.create(conversationId, version);
 			created = true;
 			mark("createMs", t);
-		} else if (sb.state !== "started") {
-			const t = Date.now();
-			await sb.start(120);
-			mark("startMs", t);
+		} else {
+			sb = await this.settled(sb);
+			if (sb.state !== "started") {
+				const t = Date.now();
+				await retryConflict(() => sb.start(120));
+				mark("startMs", t);
+			}
 		}
 		const home = (await sb.getUserHomeDir()) ?? "/home/daytona";
 		const layout = await this.layoutOf(sb, home);
@@ -209,6 +217,17 @@ export class DaytonaKernelProvider {
 			created,
 			timings,
 		};
+	}
+
+	/** Wait out a transition (someone else is stopping or starting it) before acting. */
+	async settled(sb, timeoutMs = 180_000) {
+		const moving = new Set(["stopping", "starting", "creating", "restoring", "pulling_snapshot", "building_snapshot"]);
+		const deadline = Date.now() + timeoutMs;
+		while (moving.has(sb.state) && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 1500));
+			await sb.refreshData();
+		}
+		return sb;
 	}
 
 	async create(conversationId, version) {
@@ -502,7 +521,8 @@ export class DaytonaKernelProvider {
 	async started(conversationId) {
 		const sb = await this.find(conversationId);
 		if (!sb) throw new Error(`no sandbox for conversation ${conversationId}`);
-		if (sb.state !== "started") await sb.start(120);
+		await this.settled(sb);
+		if (sb.state !== "started") await retryConflict(() => sb.start(120));
 		const home = (await sb.getUserHomeDir()) ?? "/home/daytona";
 		return { sb, workDir: `${home}/work` };
 	}

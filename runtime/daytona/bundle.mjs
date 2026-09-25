@@ -56,7 +56,7 @@ export async function buildKernelServerBundle(out = join(tmpdir(), `harness-kern
 	if (statSync(src).mtimeMs > statSync(join(DIST, "core/kernel/remote/server.js")).mtimeMs) {
 		throw new Error("dist is older than src/core/kernel/remote — rebuild before bundling");
 	}
-	const { build } = await import(join(ROOT, "vendor/prime-agent/node_modules/esbuild/lib/main.js"));
+	const { build, stop } = await import(join(ROOT, "vendor/prime-agent/node_modules/esbuild/lib/main.js"));
 	rmSync(out, { recursive: true, force: true });
 	mkdirSync(join(out, "dist"), { recursive: true });
 	await build({
@@ -71,6 +71,8 @@ export async function buildKernelServerBundle(out = join(tmpdir(), `harness-kern
 		define: { __PI_BUNDLED__: "true", __PI_BUILD_ID__: '"harness-kernel-server"' },
 		logLevel: "warning",
 	});
+	// esbuild's service child otherwise keeps the importing process (the gateway) alive.
+	stop();
 	const pkg = JSON.parse(readFileSync(join(CODING_AGENT, "package.json"), "utf8"));
 	writeFileSync(
 		join(out, "package.json"),
