@@ -79,20 +79,45 @@ echo "==> prime-agent (dist/bundle/cli.js — the published bin entry)"
 docker exec "$C" bash -c 'rm -rf /agent/prime && mkdir -p /agent/prime'
 docker cp "$PRIME/dist"    "$C:/agent/prime/dist"
 docker cp "$PRIME/skills"  "$C:/agent/prime/skills"
+
+# The manifest prime will read at runtime: its REAL name/version/type/piConfig,
+# with `dependencies` stripped.
+#
+# Both halves matter. Dependencies must go, because `npm i` reads whatever
+# manifest it finds and the real one lists workspace-internal @earendil-works/pi-*
+# packages that do not resolve from a public registry — copying it verbatim turns
+# a two-package install into a 404. But the rest must STAY, and a stub
+# `{"name":"prime-externals"}` (what this script used to write) silently breaks
+# prime's identity: it derives its env-var prefix from `piConfig.name`, so without
+# it `envPrefix` falls back to "pi", prime reads PI_CODING_AGENT_DIR, and
+# PRIME_AGENT_CODING_AGENT_DIR — which bench/terminal/run-task.mjs sets — is
+# ignored. settings.json and models.json then come from ~/.prime/agent instead of
+# the volume. Nothing errors; the only tell is the `prime` version line below
+# printing 0.0.0 instead of 0.7.1. See docs/CONTAINER-RUNTIME-DESIGN.md.
+python3 - "$PRIME/package.json" "$ROOT/.run/prime-manifest.json" <<'PYEOF'
+import json, os, sys
+real = json.load(open(sys.argv[1]))
+os.makedirs(os.path.dirname(sys.argv[2]), exist_ok=True)
+keep = {k: real[k] for k in ("name", "version", "type", "piConfig") if k in real}
+json.dump(keep, open(sys.argv[2], "w"), indent=2)
+PYEOF
+docker cp "$ROOT/.run/prime-manifest.json" "$C:/agent/prime/package.json"
+
 docker exec "$C" bash -c '
 set -e
 export PATH=/agent/node/bin:$PATH
 # The two externals the bundle does not inline. Built in the container so the
 # native zeromq binding matches this arch — the copied macOS tree would not.
-#
-# A *minimal* package.json, deliberately not the real one: `npm i` reads whatever
-# manifest it finds, and the real manifest lists workspace-internal packages
-# (@earendil-works/pi-*) that do not resolve from a public registry. Copying it
-# turns a two-package install into a 404.
-cd /agent/prime && printf "%s" "{\"name\":\"prime-externals\",\"private\":true}" > package.json
+cd /agent/prime
 npm i --no-package-lock --omit=dev zeromq undici 2>&1 | tail -3
 node -e "require(\"/agent/prime/node_modules/zeromq\"); console.log(\"    zeromq ok\")"
-echo "    prime $(node /agent/prime/dist/bundle/cli.js --version 2>&1 | tail -1)"'
+PRIME_VERSION=$(node /agent/prime/dist/bundle/cli.js --version 2>&1 | tail -1)
+echo "    prime $PRIME_VERSION"
+# 0.0.0 means the manifest above did not land and prime is reading
+# PI_CODING_AGENT_DIR. Fail here rather than in a run whose agent dir is silently
+# ~/.prime/agent.
+[ "$PRIME_VERSION" = "0.0.0" ] && { echo "    BROKEN: prime read a stub manifest (envPrefix fell back to pi)" >&2; exit 1; }
+true'
 
 echo "==> standalone python + kernel venv"
 docker exec "$C" bash -c '
