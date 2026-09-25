@@ -1,7 +1,7 @@
 {
   "name": "harness",
   "version": "1.0.0",
-  "description": "Code is all you need — agent harness experiment",
+  "description": "Code is all you need \u2014 agent harness experiment",
   "main": "index.js",
   "directories": {
     "doc": "docs"
@@ -13,13 +13,16 @@
     "validate": "node bench/validate.mjs",
     "test:js": "node --test \"bench/test/*.test.mjs\"",
     "test:runtime": "python3 -m unittest discover -s runtime -p 'test_*.py'",
-    "eval:jobs": "node runtime/eval/all.mjs"
+    "eval:jobs": "node runtime/eval/all.mjs",
+    "test:remote-kernel": "node --test --test-concurrency=1 --test-timeout=300000 runtime/remote-kernel/test/unit.test.mjs runtime/remote-kernel/test/link.test.mjs runtime/remote-kernel/test/fake.test.mjs",
+    "test:remote-kernel:live": "node --test --test-concurrency=1 --test-timeout=900000 runtime/remote-kernel/test/live.test.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@daytonaio/sdk": "^0.217.0",
     "js-tiktoken": "^1.0.21"
   },
   "private": true,

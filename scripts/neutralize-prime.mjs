@@ -25,7 +25,7 @@
  *
  * Idempotent: safe to re-run after bumping the vendored upstream.
  */
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -333,14 +333,14 @@ sub(
 sub(
 	"core/tools/index.ts",
 	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\tswitch (toolName) {",
-	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\toptions = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };\n\tswitch (toolName) {",
+	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\toptions = { ...options, ...(toolSandboxOptions(cwd, options as Record<string, unknown>) as Partial<ToolsOptions>) };\n\tswitch (toolName) {",
 	"createToolDefinition applies sandbox ops",
 );
 
 sub(
 	"core/tools/index.ts",
 	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\treturn {",
-	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\toptions = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };\n\treturn {",
+	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\toptions = { ...options, ...(toolSandboxOptions(cwd, options as Record<string, unknown>) as Partial<ToolsOptions>) };\n\treturn {",
 	"createAllToolDefinitions applies sandbox ops",
 );
 
@@ -350,28 +350,30 @@ sub(
 sub(
 	"core/tools/grep.ts",
 	'import { spawn } from "child_process";',
-	'import { spawn } from "child_process";\nimport { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";',
-	"grep.ts imports the sandbox wrap",
+	'import { toolSandboxSpawn } from "./path-utils.js";',
+	"grep.ts spawns through the sandbox chokepoint",
 );
 
+// mapOutput: rg prints absolute paths, which in the remote shape are the
+// sandbox's; the chokepoint rewrites them back so formatPath's relativising works.
 sub(
 	"core/tools/grep.ts",
 	'const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });',
-	'const sbRg = toolSandboxWrap(rgPath, args);\n\t\t\t\t\t\tconst child = spawn(sbRg.bin, sbRg.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });',
+	"const child = toolSandboxSpawn(rgPath, args, { mapOutput: true });",
 	"rg runs inside the sandbox",
 );
 
 sub(
 	"core/tools/find.ts",
 	'import { spawn } from "child_process";',
-	'import { spawn } from "child_process";\nimport { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";',
-	"find.ts imports the sandbox wrap",
+	'import { toolSandboxSpawn } from "./path-utils.js";',
+	"find.ts spawns through the sandbox chokepoint",
 );
 
 sub(
 	"core/tools/find.ts",
 	'const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });',
-	'const sbFd = toolSandboxWrap(fdPath, args);\n\t\t\t\t\t\tconst child = spawn(sbFd.bin, sbFd.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });',
+	"const child = toolSandboxSpawn(fdPath, args, { mapOutput: true });",
 	"fd runs inside the sandbox",
 );
 
@@ -870,6 +872,155 @@ sub(
 	'process.env.PRIME_AGENT_TRACES === "1"',
 );
 
+// --- remote kernel: the kernel in a sandbox on another machine ---------------
+//
+// Hands, not brain, taken one step further: the loop stays where the credentials
+// are, and the kernel (plus every file tool) runs inside a remote sandbox — a
+// Daytona sandbox, in the assistant — reached over one WebSocket. The modules are
+// whole files under scripts/patches/remote-kernel/, placed verbatim into
+// core/kernel/remote/; what follows are the three seams that choose them.
+//
+// The remote backend declares the sandbox as the boundary: the loop never starts a
+// local kernel, and the in-sandbox server refuses to start one while its own probe
+// can reach the internet (server.ts startKernel). See runtime/daytona/README.md.
+log("\nremote kernel:");
+
+const REMOTE_KERNEL_FILES = [
+	"protocol.ts",
+	"channel.ts",
+	"config.ts",
+	"pathmap.ts",
+	"skills.ts",
+	"link.ts",
+	"manager.ts",
+	"tools.ts",
+	"server.ts",
+	"server-main.ts",
+];
+
+/** Place a whole-file patch; the file under scripts/patches is the source of truth. */
+function place(relPath, patchPath, label) {
+	const path = join(PRIME, relPath);
+	const body = readFileSync(join(ROOT, "scripts/patches", patchPath), "utf8");
+	mkdirSync(dirname(path), { recursive: true });
+	if (existsSync(path) && readFileSync(path, "utf8") === body) return log(`  present ${relPath} :: ${label}`);
+	writeFileSync(path, body);
+	log(`  placed  ${relPath} :: ${label}`);
+}
+
+for (const name of REMOTE_KERNEL_FILES) {
+	place(`core/kernel/remote/${name}`, `remote-kernel/${name}`, "remote kernel module");
+}
+
+sub(
+	"core/tools/ipython.ts",
+	'import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";',
+	'import { isRemoteKernelEnabled } from "../kernel/remote/config.js";\n' +
+		'import { RemoteKernelManager } from "../kernel/remote/manager.js";\n' +
+		'import { createRemoteKernelManager } from "../kernel/remote/tools.js";\n' +
+		'import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";',
+	"ipython.ts imports the remote kernel",
+	"../kernel/remote/manager.js",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\tconst snapshotDir = this.options?.snapshotDir;\n\t\t\tconst m = new KernelManager({",
+	"\t\t\tconst snapshotDir = this.options?.snapshotDir;\n" +
+		"\t\t\t// HARNESS_REMOTE_KERNEL_URL: the kernel runs in a sandbox elsewhere, behind\n" +
+		"\t\t\t// the same KernelManager surface. Its snapshot lives on the sandbox's disk,\n" +
+		"\t\t\t// keyed by session id, so a restarted loop or sandbox revives the namespace.\n" +
+		"\t\t\tconst m = isRemoteKernelEnabled()\n" +
+		"\t\t\t\t? createRemoteKernelManager({\n" +
+		"\t\t\t\t\t\tlocalCwd: this.cwd,\n" +
+		"\t\t\t\t\t\tenv: this.options?.env,\n" +
+		"\t\t\t\t\t\tsessionId: this.options?.sessionId,\n" +
+		"\t\t\t\t\t\thostHandlers: this.options?.hostHandlers,\n" +
+		"\t\t\t\t\t\tpythonSkills: this.options?.pythonSkills,\n" +
+		"\t\t\t\t\t\tsnapshotKey: snapshotDir ? (this.options?.sessionId ?? snapshotDir) : undefined,\n" +
+		"\t\t\t\t\t})\n" +
+		"\t\t\t\t: new KernelManager({",
+	"remote kernel swaps in behind the provisioner",
+	"createRemoteKernelManager({",
+);
+
+// The snapshot is on the sandbox's disk; asking the loop's disk would always say no.
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\t\tconst snapshotExisted = existsSync(snapshotPathIn(snapshotDir));",
+	"\t\t\t\t\tconst snapshotExisted =\n" +
+		"\t\t\t\t\t\tm instanceof RemoteKernelManager ? await m.snapshotExists() : existsSync(snapshotPathIn(snapshotDir));",
+	"remote snapshot existence is asked of the sandbox",
+	"await m.snapshotExists()",
+);
+
+// ws is what both ends speak; it was only a transitive dependency before.
+subPackageJson(
+	'\t\t"uuid": "^14.0.0",\n',
+	'\t\t"uuid": "^14.0.0",\n\t\t"ws": "^8.21.0",\n',
+	"ws is a declared dependency",
+	'"ws": "^8.21.0"',
+);
+subPackageJson(
+	'\t\t"@types/proper-lockfile": "^4.1.4",\n',
+	'\t\t"@types/proper-lockfile": "^4.1.4",\n\t\t"@types/ws": "^8.18.1",\n',
+	"@types/ws for the remote kernel",
+	'"@types/ws"',
+);
+
+/** sub() for the coding-agent package.json, which sits beside src/. */
+function subPackageJson(find, replace, label, marker) {
+	const path = join(PRIME, "..", "package.json");
+	const src = readFileSync(path, "utf8");
+	if (src.includes(marker)) return log(`  present package.json :: ${label}`);
+	if (src.split(find).length - 1 !== 1) throw new Error(`package.json: expected 1 match for ${label}`);
+	writeFileSync(path, src.replace(find, () => replace));
+	log(`  patched package.json :: ${label}`);
+}
+
+log("\nkernel display images:");
+
+// A product host shows cells to a person, and a chart drawn with plt.show() is the
+// cell's point. See scripts/patches/display-images.ts; off unless HARNESS_DISPLAY_IMAGES=1.
+sub(
+	"core/kernel/index.ts",
+	"function parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undefined {",
+	`${patch("display-images.ts")}\n\nfunction parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undefined {`,
+	"plain image displays become attachments under HARNESS_DISPLAY_IMAGES=1",
+	"HARNESS_DISPLAY_IMAGE_MIMES",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\t\tconst attachment = parseAttachmentDisplay(c.data?.[ATTACHMENT_DISPLAY_MIME]);\n",
+	"\t\t\tconst attachment = parseAttachmentDisplay(c.data?.[ATTACHMENT_DISPLAY_MIME]) ?? harnessDisplayImage(c.data);\n",
+	"display handler consults the plain-image fallback",
+	"?? harnessDisplayImage(c.data)",
+);
+
+// --- thinking display: summarized holds thinking back until it ends -----------
+//
+// Anthropic's "summarized" display sends the thinking summary only once the
+// thinking block is over, so the first streamed byte of a turn that thinks lands
+// seconds after the model started (Sonnet 5, effort medium: 5.45 s vs 1.7 s
+// omitted). A caller that shows "thinking" rather than the thoughts opts into
+// "omitted" with HARNESS_THINKING_DISPLAY; unset keeps upstream's default.
+log("\nthinking display:");
+const AI_ANTHROPIC = "../../ai/src/providers/anthropic.ts";
+sub(
+	AI_ANTHROPIC,
+	'export type AnthropicThinkingDisplay = "summarized" | "omitted";',
+	`export type AnthropicThinkingDisplay = "summarized" | "omitted";\n\n${patch("thinking-display.ts")}`,
+	"HARNESS_THINKING_DISPLAY helper",
+	"function harnessThinkingDisplay",
+);
+sub(
+	AI_ANTHROPIC,
+	'const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? "summarized";',
+	'const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? harnessThinkingDisplay() ?? "summarized";',
+	"thinking display defaults to HARNESS_THINKING_DISPLAY",
+	"?? harnessThinkingDisplay() ??",
+);
+
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.
  *
@@ -919,7 +1070,8 @@ function assertPatchesInSync() {
 /** Every .ts under the vendored source tree. */
 function walkPrime() {
 	const out = [];
-	const stack = [join(PRIME)];
+	// The ai package too: the thinking-display patch lives in its anthropic provider.
+	const stack = [join(PRIME), join(PRIME, "../../ai/src")];
 	while (stack.length) {
 		for (const e of readdirSync(stack.pop(), { withFileTypes: true })) {
 			const full = join(e.parentPath ?? e.path, e.name);

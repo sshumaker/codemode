@@ -213,12 +213,14 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 	// has fails at `npm run build`, not here — but the replay must still own the
 	// edit, or the package.json change is a hand edit with no script behind it.
 	const PKG_JSON = "vendor/prime-agent/packages/coding-agent/package.json";
+	// The thinking-display patch lives in the ai package's Anthropic provider.
+	const AI_ANTHROPIC = "vendor/prime-agent/packages/ai/src/providers/anthropic.ts";
 
 	it("replaying the patch scripts on the base commit reproduces the vendored tree", () => {
 		const scratch = mkdtempSync(join(tmpdir(), "pristine-replay-"));
 		try {
 			mkdirSync(join(scratch, "vendor"), { recursive: true });
-			execSync(`git archive ${BASE} ${REL} ${PKG_JSON} | tar -x -C ${JSON.stringify(scratch)}`, {
+			execSync(`git archive ${BASE} ${REL} ${PKG_JSON} ${AI_ANTHROPIC} | tar -x -C ${JSON.stringify(scratch)}`, {
 				cwd: ROOT,
 				shell: "/bin/bash",
 				stdio: "pipe",
@@ -227,7 +229,7 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 			execSync(`node ${join(ROOT, "scripts/port-vanilla-tools.mjs")}`, { env, stdio: "pipe" });
 			execSync(`node ${join(ROOT, "scripts/neutralize-prime.mjs")}`, { env, stdio: "pipe" });
 			execSync(`node ${join(ROOT, "scripts/slim-prime.mjs")}`, { env, stdio: "pipe" });
-			for (const rel of [REL, PKG_JSON]) {
+			for (const rel of [REL, PKG_JSON, AI_ANTHROPIC]) {
 				try {
 					execSync(`diff -ru ${JSON.stringify(join(scratch, rel))} ${JSON.stringify(join(ROOT, rel))}`, {
 						stdio: "pipe",

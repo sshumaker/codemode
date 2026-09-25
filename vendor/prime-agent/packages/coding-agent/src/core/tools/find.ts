@@ -1,8 +1,7 @@
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
-import { spawn } from "child_process";
-import { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";
+import { toolSandboxSpawn } from "./path-utils.js";
 import path from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
@@ -267,8 +266,7 @@ export function createFindToolDefinition(
 						}
 						args.push("--", effectivePattern, searchPath);
 
-						const sbFd = toolSandboxWrap(fdPath, args);
-						const child = spawn(sbFd.bin, sbFd.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });
+						const child = toolSandboxSpawn(fdPath, args, { mapOutput: true });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						const lines: string[] = [];
