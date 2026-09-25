@@ -2154,7 +2154,12 @@ _RUN_ID = os.environ.get("HARNESS_RUN_ID", "")
 # /r/mcp route rather than straight at the MCP proxy. Empty otherwise, and the
 # request is then byte-identical to the pre-posture one.
 _EGRESS_TOKEN = os.environ.get("HARNESS_EGRESS_TOKEN", "")
-_TIMEOUT = 180
+# Seconds a call may take end to end. 180 unless the host says otherwise: a host that
+# holds calls open on a human (an approval prompt, a question) needs minutes.
+try:
+    _TIMEOUT = float(os.environ.get("HARNESS_MCP_TIMEOUT_S") or 180)
+except ValueError:
+    _TIMEOUT = 180
 
 
 class McpError(RuntimeError):

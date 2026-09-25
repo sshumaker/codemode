@@ -304,8 +304,9 @@ export class RemoteKernelLink {
 	private scheduleRetry(): void {
 		const delay = BACKOFF_MS[Math.min(this.attempt, BACKOFF_MS.length - 1)];
 		this.attempt++;
+		// Not unref'd: a request waiting on this reconnect must keep the process alive,
+		// or a print-mode loop with nothing else to do exits with the call unsettled.
 		this.retryTimer = setTimeout(() => this.connectOnce(), delay);
-		this.retryTimer.unref();
 	}
 
 	private onDropped(why: string): void {

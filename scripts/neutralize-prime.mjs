@@ -978,6 +978,25 @@ function subPackageJson(find, replace, label, marker) {
 	log(`  patched package.json :: ${label}`);
 }
 
+log("\nkernel display images:");
+
+// A product host shows cells to a person, and a chart drawn with plt.show() is the
+// cell's point. See scripts/patches/display-images.ts; off unless HARNESS_DISPLAY_IMAGES=1.
+sub(
+	"core/kernel/index.ts",
+	"function parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undefined {",
+	`${patch("display-images.ts")}\n\nfunction parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undefined {`,
+	"plain image displays become attachments under HARNESS_DISPLAY_IMAGES=1",
+	"HARNESS_DISPLAY_IMAGE_MIMES",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\t\tconst attachment = parseAttachmentDisplay(c.data?.[ATTACHMENT_DISPLAY_MIME]);\n",
+	"\t\t\tconst attachment = parseAttachmentDisplay(c.data?.[ATTACHMENT_DISPLAY_MIME]) ?? harnessDisplayImage(c.data);\n",
+	"display handler consults the plain-image fallback",
+	"?? harnessDisplayImage(c.data)",
+);
+
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.
  *
