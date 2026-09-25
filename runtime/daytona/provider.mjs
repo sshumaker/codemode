@@ -392,7 +392,7 @@ export class DaytonaKernelProvider {
 		return this.withLock(conversationId, async () => {
 			const sb = await this.find(conversationId);
 			if (!sb) return { destroyed: false };
-			await sb.delete(120);
+			await sb.delete(120, true);
 			return { destroyed: true, sandboxId: sb.id };
 		});
 	}
@@ -426,7 +426,7 @@ export class DaytonaKernelProvider {
 		const deleted = [];
 		for (const o of orphans) {
 			const sb = await this.daytona.get(o.sandboxId);
-			await sb.delete(120);
+			await sb.delete(120, true);
 			deleted.push(o);
 		}
 		return deleted;

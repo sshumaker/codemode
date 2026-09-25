@@ -40,16 +40,17 @@ attempt("tcp_8.8.8.8_53", lambda: socket.create_connection(("8.8.8.8", 53), time
 attempt("dns_github", lambda: socket.getaddrinfo("github.com", 443))
 import hashlib, re, stat
 import time
-needles = set(${JSON.stringify(needles)})
+needles = ${JSON.stringify(needles)}
 lengths = set(${JSON.stringify(lengths)})
 TOKEN = re.compile(rb"[A-Za-z0-9_\\-+]{16,}")
 def hits(data):
     # Only tokens as long as some secret can be one; hashing the rest is wasted work.
-    return any(len(t) in lengths and hashlib.sha256(t).hexdigest() in needles for t in TOKEN.findall(data))
+    found = {needles[h] for t in TOKEN.findall(data) if len(t) in lengths for h in [hashlib.sha256(t).hexdigest()] if h in needles}
+    return sorted(found)
 t_start = time.time()
 secretish = [k for k in os.environ if any(w in k.upper() for w in ("KEY", "SECRET", "PASSWORD", "CREDENTIAL")) or k.upper().endswith("TOKEN")]
 out["kernel_env_secretish_names"] = secretish
-out["kernel_env_needle_hits"] = [k for k, v in os.environ.items() if hits(v.encode())]
+out["kernel_env_needle_hits"] = {k: hits(v.encode()) for k, v in os.environ.items() if hits(v.encode())}
 proc_hits = []
 for pid in os.listdir("/proc"):
     if not pid.isdigit(): continue
@@ -58,8 +59,9 @@ for pid in os.listdir("/proc"):
             data = open(f"/proc/{pid}/{part}", "rb").read().replace(b"\\0", b" ")
         except Exception:
             continue
-        if hits(data): proc_hits.append(f"{pid}/{part}")
-out["proc_needle_hits"] = sorted(set(proc_hits))
+        found = hits(data)
+        if found: proc_hits.append({"at": f"{pid}/{part}", "secrets": found})
+out["proc_needle_hits"] = proc_hits
 # Everywhere this conversation could have written, or the loop could have put
 # something: home (the work dir, the runtime's state and bundle), temp dirs, /etc,
 # /root, and /opt/harness when the runtime came from the snapshot. Third-party trees
@@ -91,7 +93,8 @@ for root in roots:
             except Exception:
                 continue
             scanned += 1
-            if hits(data): fs_hits.append(path)
+            found = hits(data)
+            if found: fs_hits.append({"path": path, "secrets": found})
 out["fs_scanned_roots"] = roots
 out["fs_files_scanned"] = scanned
 out["fs_files_skipped_large"] = skipped_big
@@ -117,24 +120,37 @@ export async function certifySandbox({ km, secrets, toolDoorWorks }) {
 	const present = [...Object.entries(secrets), ["PLANTED_CONTROL", control]].filter(
 		([, v]) => typeof v === "string" && v.length >= 16,
 	);
-	const needles = present.map(([, v]) => digest(v));
+	const needles = Object.fromEntries(present.map(([k, v]) => [digest(v), k]));
 	const lengths = [...new Set(present.map(([, v]) => Buffer.byteLength(v)))];
 	const r = await km.execute(probeCode(needles, lengths));
 	const line = r.stdout.split("\n").find((l) => l.startsWith("CERT "));
 	if (!line) throw new Error(`certification probe produced no evidence: ${r.status} ${r.stdout.slice(-500)}`);
 	const ev = JSON.parse(line.slice(5));
 	const blocked = (k) => ev[k] !== "REACHED";
-	const controlHits = ev.fs_needle_hits.filter((p) => p.endsWith("/cert-control.txt"));
-	ev.fs_needle_hits = ev.fs_needle_hits.filter((p) => !p.endsWith("/cert-control.txt"));
+	// The control shows up wherever the planting cell's source went (IPython's own
+	// history.sqlite, for one) — only the loop's secrets count against the sandbox.
+	const controlHits = ev.fs_needle_hits.filter((h) => h.secrets.includes("PLANTED_CONTROL")).map((h) => h.path);
+	const strip = (hits) =>
+		hits.map((h) => ({ ...h, secrets: h.secrets.filter((n) => n !== "PLANTED_CONTROL") })).filter((h) => h.secrets.length > 0);
+	ev.fs_needle_hits = strip(ev.fs_needle_hits);
+	ev.proc_needle_hits = strip(ev.proc_needle_hits);
 	const checks = [
 		...["https_example", "https_anthropic", "https_pypi", "tcp_1.1.1.1_443", "tcp_8.8.8.8_53", "dns_github"].map((k) => ({
 			name: `no egress: ${k}`,
 			ok: blocked(k),
 			detail: ev[k],
 		})),
-		{ name: "the scan finds a planted control value", ok: controlHits.length === 1, detail: controlHits },
+		{
+			name: "the scan finds a planted control value",
+			ok: controlHits.some((p) => p.endsWith("/cert-control.txt")),
+			detail: controlHits,
+		},
 		{ name: "kernel env has no secret-shaped names", ok: ev.kernel_env_secretish_names.length === 0, detail: ev.kernel_env_secretish_names },
-		{ name: "kernel env holds no loop secret", ok: ev.kernel_env_needle_hits.length === 0, detail: ev.kernel_env_needle_hits },
+		{
+			name: "kernel env holds no loop secret",
+			ok: Object.keys(ev.kernel_env_needle_hits).length === 0,
+			detail: ev.kernel_env_needle_hits,
+		},
 		{ name: "no process env/cmdline holds a loop secret", ok: ev.proc_needle_hits.length === 0, detail: ev.proc_needle_hits },
 		{
 			name: "no readable file holds a loop secret",
@@ -155,6 +171,6 @@ export async function certifySandbox({ km, secrets, toolDoorWorks }) {
 		ok: checks.every((c) => c.ok),
 		checks,
 		secretsChecked: present.map(([k]) => k).filter((k) => k !== "PLANTED_CONTROL"),
-		needleDigest: createHash("sha256").update(needles.join("\n")).digest("hex").slice(0, 12),
+		needleDigest: createHash("sha256").update(Object.keys(needles).join("\n")).digest("hex").slice(0, 12),
 	};
 }
