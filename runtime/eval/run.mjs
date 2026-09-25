@@ -164,8 +164,9 @@ mkdirSync(jobDir, { recursive: true });
  * and on Linux it is airtight, because srt removes the network namespace entirely
  * and routes through Unix sockets, so unsetting http_proxy leaves no route at all.
  *
- * Applied by patching the kernel spawn (scripts/neutralize-prime.mjs), gated on
- * HARNESS_KERNEL_SANDBOX_SETTINGS so an unsandboxed run stays byte-identical.
+ * Applied by patching the kernel spawn (scripts/neutralize-prime.mjs). The kernel
+ * FAILS CLOSED: --no-sandbox does not merely omit the settings, it must say
+ * HARNESS_KERNEL_SANDBOX=off -- bare execution is a recorded choice, not a default.
  */
 const sandboxed = !argv.includes("--no-sandbox");
 const srtBin = join(ROOT, "node_modules/.bin/srt");
@@ -305,7 +306,10 @@ const runEnv = {
 			...(argv.includes("--adopt-bg") || argv.includes("--adopt-quiet") ? { HARNESS_ADOPT_BACKGROUND: "1" } : {}),
 			...(argv.includes("--adopt-quiet") ? { HARNESS_ADOPT_QUIET: "1" } : {}),
 			// Read by the patched kernel spawn; absent means no sandbox.
-			...(sandboxed ? { HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettings, HARNESS_KERNEL_SANDBOX_BIN: srtBin } : {}),
+			// The kernel fails closed; bare must be said, never implied by absence.
+			...(sandboxed
+				? { HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettings, HARNESS_KERNEL_SANDBOX_BIN: srtBin }
+				: { HARNESS_KERNEL_SANDBOX: "off" }),
 			// Also read by the patched kernel spawn (scripts/patches/kernel-env.ts).
 			...(envInherit ? {} : { HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW }),
 			// The one route out. Both survive the allow-list above on the HARNESS_*

@@ -124,6 +124,11 @@ BOUNDARY_VARS = (
     "HARNESS_KERNEL_ENV_SCRUB",
     "HARNESS_KERNEL_SANDBOX_SETTINGS",
     "HARNESS_KERNEL_SANDBOX_BIN",
+    # The explicit bare-kernel marker. The kernel fails closed, so a parent
+    # that chose off must pass the choice down or every child kernel refuses
+    # to start -- and a child must never end up LESS confined than its parent
+    # by dropping settings while keeping silence.
+    "HARNESS_KERNEL_SANDBOX",
 )
 
 

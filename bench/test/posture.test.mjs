@@ -189,3 +189,47 @@ describe("the MCP transports carry the egress token only when there is one", () 
 		assert.match(ext, /EGRESS_TOKEN \? \{ "x-egress-token": EGRESS_TOKEN \} : \{\}/);
 	});
 });
+
+describe("the kernel fails closed", () => {
+	// The variable is the transport for the posture, never the policy. The old
+	// gate ran bare on silence, and silence is how the product arm shipped
+	// model-authored code execution with no boundary for weeks: nothing forced
+	// any launcher to set the variable, and nothing recorded that it hadn't.
+	const kernel = read("vendor/prime-agent/packages/coding-agent/src/core/kernel/index.ts");
+
+	it("the vendored kernel refuses silence", () => {
+		assert.match(kernel, /!sandboxSettings && process\.env\.HARNESS_KERNEL_SANDBOX !== "off"/);
+		assert.match(kernel, /refusing to start an unsandboxed kernel/);
+	});
+
+	it("the patch generator produces the same refusal", () => {
+		// The vendored tree is patch OUTPUT; a fix applied there but not in
+		// scripts/neutralize-prime.mjs evaporates on the next re-vendor.
+		const gen = read("scripts/neutralize-prime.mjs");
+		assert.match(gen, /refusing to start an unsandboxed kernel/);
+		assert.match(gen, /HARNESS_KERNEL_SANDBOX !== "off"/);
+	});
+
+	// Every launcher that can legitimately run bare must SAY so — otherwise its
+	// next run dies at kernel start, which is the fail-closed behaviour working,
+	// but dying in CI is not how the condition should be discovered.
+	const explicitOff = [
+		["runtime/eval/run.mjs", /HARNESS_KERNEL_SANDBOX: "off"/],
+		["bench/run-task.mjs", /HARNESS_KERNEL_SANDBOX: "off"/],
+		["bench/appworld/run-task.mjs", /HARNESS_KERNEL_SANDBOX: "off"/],
+		["bench/terminal/prime_agent.py", /"HARNESS_KERNEL_SANDBOX": "off"/],
+	];
+	for (const [file, pattern] of explicitOff) {
+		it(`${file} says bare explicitly when it chooses bare`, () => {
+			assert.match(read(file), pattern);
+		});
+	}
+
+	it("the subagent spec carries the choice to children", () => {
+		// A child that inherits settings but not the off-marker would refuse to
+		// start under a parent that chose bare; one that inherits neither would
+		// run less confined than its parent. Both are boundary state.
+		const py = read("runtime/subagents.py");
+		assert.match(py, /"HARNESS_KERNEL_SANDBOX",/);
+	});
+});

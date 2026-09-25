@@ -174,7 +174,9 @@ describe("the compiled harness is current", () => {
 		// Both branches, because a build that dropped either leaves a posture the
 		// harness thinks it has.
 		const kernel = readFileSync(join(DIST, "core/kernel/index.js"), "utf8");
-		for (const marker of ["HARNESS_KERNEL_ENV_ALLOW", "HARNESS_KERNEL_ENV_SCRUB", "kernelSpawnEnv"]) {
+		// "refusing to start an unsandboxed kernel": the fail-closed gate. A build
+		// that dropped it reverts to running bare on silence — the exact hole.
+		for (const marker of ["HARNESS_KERNEL_ENV_ALLOW", "HARNESS_KERNEL_ENV_SCRUB", "kernelSpawnEnv", "refusing to start an unsandboxed kernel"]) {
 			assert.match(kernel, new RegExp(marker), `${marker} missing from dist/core/kernel/index.js`);
 		}
 	});

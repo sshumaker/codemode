@@ -1,7 +1,7 @@
 // TODO: reconsider persistent kernel vs stateless `python -c` once RLM-1 weights land.
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -69,8 +69,8 @@ function kernelSpawnEnv(base: NodeJS.ProcessEnv, overrides?: Record<string, stri
 
 const DELIM = Buffer.from("<IDS|MSG>");
 const PROTOCOL_VERSION = "5.3";
-const PORTS_RESOLVE_TIMEOUT_MS = 5000;
-const READY_TIMEOUT_MS = 5000;
+const PORTS_RESOLVE_TIMEOUT_MS = Number(process.env.HARNESS_KERNEL_PORTS_TIMEOUT_MS) || 5000;
+const READY_TIMEOUT_MS = Number(process.env.HARNESS_KERNEL_READY_TIMEOUT_MS) || 5000;
 // Loopback PUB/SUB subscription propagation is usually sub-ms, but keep a small guard before first execute.
 const IOPUB_SUBSCRIBE_DELAY_MS = 50;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
@@ -693,6 +693,17 @@ export class KernelManager {
 			// scripts/neutralize-prime.mjs and runtime/eval/run.mjs.
 			const sandboxSettings = process.env.HARNESS_KERNEL_SANDBOX_SETTINGS;
 			const sandboxBin = process.env.HARNESS_KERNEL_SANDBOX_BIN ?? "srt";
+			if (!sandboxSettings && process.env.HARNESS_KERNEL_SANDBOX !== "off") {
+				// FAIL CLOSED. An unset variable used to mean "run bare", and that
+				// silence is how an arm shipped model-authored code execution with
+				// no boundary for weeks -- nothing forced launchers to set it.
+				// Unsandboxed is a condition a launcher must SAY, and record.
+				throw new Error(
+					"refusing to start an unsandboxed kernel: set HARNESS_KERNEL_SANDBOX_SETTINGS " +
+						"(runtime/posture.mjs srtSettings + pythonPrefixes build it) or set " +
+						"HARNESS_KERNEL_SANDBOX=off explicitly and record it in the run's provenance",
+				);
+			}
 			const kernelArgv: [string, string[]] = sandboxSettings
 				// srt takes SPLIT argv, not one command string: the README's
 				// `srt "cmd"` form fails with "command not found".
@@ -705,9 +716,32 @@ export class KernelManager {
 			});
 			this.kernel = kernel;
 
+			// HARNESS_KERNEL_STDERR_LOG: also persist kernel stderr. Upstream keeps
+			// it in memory and shows it only when the kernel dies, so a warning on
+			// a HEALTHY kernel is discarded — IPython's "IPYTHONDIR is not a
+			// writable location, using a temp directory" went unseen for two days
+			// (2026-09-03..05) while every startup hook was dead in both arms.
+			// Touched at spawn so an absent file means "bundle lacks this patch",
+			// not "the kernel was quiet"; appended, never buffered, so the lines
+			// survive a SIGKILL of this process.
+			const stderrLog = process.env.HARNESS_KERNEL_STDERR_LOG;
+			if (stderrLog) {
+				try {
+					appendFileSync(stderrLog, "");
+				} catch {
+					// a full disk must not take the kernel down with it
+				}
+			}
 			kernel.stderr?.on("data", (buf: Buffer) => {
 				const s = buf.toString();
 				this.kernelStderr += s;
+				if (stderrLog) {
+					try {
+						appendFileSync(stderrLog, s);
+					} catch {
+						// see above
+					}
+				}
 			});
 
 			kernel.on("error", (err) => {

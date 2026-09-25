@@ -25,7 +25,7 @@
  *
  * Idempotent: safe to re-run after bumping the vendored upstream.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -206,6 +206,195 @@ sub(
 	`\t\ttools: cloneArray(config.tools),`,
 	`\t\ttools: cloneArray(config.tools),\n\t\tinitialActiveToolNames: cloneArray(config.initialActiveToolNames),`,
 	"clone initialActiveToolNames",
+);
+
+// --- cell errors: the exception, not a re-print of the docstring ------------
+// Measured on the product port: a client-side ArgumentError rendered 1,500+ chars
+// into the cell result with the message LAST, because IPython prints source
+// context around each frame and the lines above a generated wrapper's
+// `return await _call(...)` are its whole docstring. OFF unless
+// HARNESS_TRACEBACK_TRIM=1: the condition belongs in the run's environment, not
+// in a build timestamp — a rebuild is how the trim leaked into two eval jobs
+// that had not asked for it.
+log("\ntraceback hygiene:");
+
+sub(
+	"core/tools/ipython.ts",
+	"const RLM_BOOTSTRAP_BASE_CODE = `",
+	`${patch("traceback-trim.ts")}\n\nconst RLM_BOOTSTRAP_BASE_CODE = \``,
+	"trim cell tracebacks to the exception and the raising lines",
+	"function trimCellTraceback(",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	'\t\t\t\t\ttext += (text ? "\\n" : "") + r.error.traceback.join("\\n");',
+	'\t\t\t\t\ttext += (text ? "\\n" : "") + trimCellTraceback(r.error.traceback);',
+	"render the trimmed traceback",
+);
+
+// --- cells that hunt the machine instead of using api/ ----------------------
+// H1 probe, job 6p8nIAVw: 62 of 75 cells grepped ~/src/harness for a tool named
+// in the brief, with the full tool index and a "do not search the filesystem"
+// rule in the system prompt throughout. The correction moves to the error
+// channel, which this project has measured to work where prompts do not.
+// OFF unless HARNESS_FS_GUARD=1.
+log("\nfilesystem guard:");
+
+sub(
+	"core/tools/ipython.ts",
+	"const RLM_BOOTSTRAP_BASE_CODE = `",
+	`${patch("fs-guard.ts")}\n\nconst RLM_BOOTSTRAP_BASE_CODE = \``,
+	"refuse cells that reach outside the job's working directory",
+	"export function fsGuardCheck(",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\tconst code = applyShellSettingsToBashMagicCell(params.code, options);",
+	"\t\t\t\tconst code = applyShellSettingsToBashMagicCell(params.code, options);\n" +
+		"\t\t\t\t// Before the kernel sees it: the refusal has to arrive as this cell's own\n" +
+		"\t\t\t\t// error, since that is the channel the correction is delivered on.\n" +
+		"\t\t\t\tconst fsRefusal = fsGuardCheck(code, cwd);\n" +
+		"\t\t\t\tif (fsRefusal) {\n" +
+		"\t\t\t\t\tclearTimeout(cellTimer);\n" +
+		"\t\t\t\t\treturn {\n" +
+		"\t\t\t\t\t\tcontent: [{ type: \"text\", text: fsRefusal }],\n" +
+		"\t\t\t\t\t\tdetails: { durationMs: 0, status: \"error\", errorEname: \"FilesystemGuard\", stdout: \"\", stderr: fsRefusal },\n" +
+		"\t\t\t\t\t\tisError: true,\n" +
+		"\t\t\t\t\t};\n" +
+		"\t\t\t\t}",
+	"refuse the cell before it executes",
+	// NOT the `const fsRefusal = ...` line this sub inserts: the exec-guard sub
+	// below REWRITES that line into a chained one, so the naive marker stops
+	// matching after a full run and a second run re-inserts the whole block --
+	// two `const fsRefusal` declarations and a build that will not compile. The
+	// patcher was non-idempotent by construction; `errorEname` is written here
+	// and rewritten by nothing.
+	'errorEname: "FilesystemGuard"',
+);
+
+// --- Symlink-blind find/grep --------------------------------------------------
+// The arm links the compiled api package into the working directory as a
+// SYMLINK (work/api -> bundle/api). fd and rg do not follow symlinks by default,
+// so `find **/__init__.py` and `grep "def wait_for"` returned "No files found" /
+// "No matches found" for the api tree in every run since the file tools were
+// added (h83 pos 8: a nudged session concluded there was no api module and spent
+// ten cells introspecting). `read` and `ls` open the path directly and were never
+// affected. --follow makes the two walkers see what the other tools see; the
+// sandbox already resolves the symlink target for reads (tool-sandbox.ts).
+sub(
+	"core/tools/find.ts",
+	'const args: string[] = ["--glob", "--color=never", "--hidden"];',
+	'const args: string[] = ["--glob", "--color=never", "--hidden", "--follow"];',
+	"find follows symlinks (api/ is a symlink)",
+	'"--hidden", "--follow"];',
+);
+sub(
+	"core/tools/grep.ts",
+	'const args: string[] = ["--json", "--line-number", "--color=never", "--hidden"];',
+	'const args: string[] = ["--json", "--line-number", "--color=never", "--hidden", "--follow"];',
+	"grep follows symlinks (api/ is a symlink)",
+	'"--color=never", "--hidden", "--follow"];',
+);
+
+// --- W121: file tools execute inside the kernel's sandbox --------------------
+// srt wraps the ipykernel child; the node orchestrator stays outside on the
+// rationale that it runs only harness code. Activating read/grep/find/ls in
+// the codemode arm breaks that premise: their paths are model-chosen.
+// So their filesystem work runs as sandboxed children under the SAME settings
+// file the kernel uses -- one policy, one enforcement engine, no node-side
+// path-check reimplementation to drift. Identity passthrough when the
+// HARNESS_KERNEL_SANDBOX_* pair is unset.
+log("\ntool sandbox:");
+
+sub(
+	"core/tools/path-utils.ts",
+	'import { accessSync, constants } from "node:fs";',
+	`${patch("tool-sandbox.ts")}\n\nimport { accessSync, constants } from "node:fs";`,
+	"sandboxed fs operations for the file tools",
+	"export function toolSandboxWrap",
+);
+
+// After the ported-tool import block, not before it: scripts/port-vanilla-tools.mjs
+// recognises its own block by adjacency to the ipython.js import, and re-inserts
+// the whole block (duplicate imports, a build that will not compile) when anything
+// lands between the two.
+sub(
+	"core/tools/index.ts",
+	'import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.js";',
+	'import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.js";\nimport { toolSandboxOptions } from "./path-utils.js";',
+	"index.ts imports the sandbox options factory",
+);
+
+// Both definition factories: agent-session builds via createAllToolDefinitions;
+// createToolDefinition is the single-tool path other callers use. The sandbox
+// ops spread LAST so they win for read/grep/ls; ipython options pass through.
+sub(
+	"core/tools/index.ts",
+	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\tswitch (toolName) {",
+	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\toptions = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };\n\tswitch (toolName) {",
+	"createToolDefinition applies sandbox ops",
+);
+
+sub(
+	"core/tools/index.ts",
+	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\treturn {",
+	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\toptions = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };\n\treturn {",
+	"createAllToolDefinitions applies sandbox ops",
+);
+
+// The two helper-binary spawns. Wrapping the ARGV keeps real rg/fd semantics
+// and puts the search itself under seatbelt; the scrubbed env keeps provider
+// keys out of the sandboxed child (kernelSpawnEnv's law, applied to tools).
+sub(
+	"core/tools/grep.ts",
+	'import { spawn } from "child_process";',
+	'import { spawn } from "child_process";\nimport { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";',
+	"grep.ts imports the sandbox wrap",
+);
+
+sub(
+	"core/tools/grep.ts",
+	'const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });',
+	'const sbRg = toolSandboxWrap(rgPath, args);\n\t\t\t\t\t\tconst child = spawn(sbRg.bin, sbRg.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });',
+	"rg runs inside the sandbox",
+);
+
+sub(
+	"core/tools/find.ts",
+	'import { spawn } from "child_process";',
+	'import { spawn } from "child_process";\nimport { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";',
+	"find.ts imports the sandbox wrap",
+);
+
+sub(
+	"core/tools/find.ts",
+	'const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });',
+	'const sbFd = toolSandboxWrap(fdPath, args);\n\t\t\t\t\t\tconst child = spawn(sbFd.bin, sbFd.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });',
+	"fd runs inside the sandbox",
+);
+
+// --- cells that run commands this environment does not have -----------------
+// The hole the FS guard leaves: it blocks rooted paths, so `which opsctl`
+// and `pip list` walk past it (job dl3D-iS5). Separate flag from the FS guard —
+// two interventions on the same cells are two conditions.
+log("\nexec guard:");
+
+sub(
+	"core/tools/ipython.ts",
+	"const RLM_BOOTSTRAP_BASE_CODE = `",
+	`${patch("exec-guard.ts")}\n\nconst RLM_BOOTSTRAP_BASE_CODE = \``,
+	"refuse commands that are not in this environment",
+	"export function execGuardCheck(",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"const fsRefusal = fsGuardCheck(code, cwd);",
+	"const fsRefusal = fsGuardCheck(code, cwd) ?? execGuardCheck(code) ?? readBatchGateCheck(code);",
+	"check the guards and the one-time gate on the one pre-execution path",
+	"?? readBatchGateCheck(code)",
 );
 
 // --- optional: show the kernel namespace after every cell -------------------
@@ -551,8 +740,58 @@ sub(
 // removes the network namespace entirely and routes over Unix sockets, so unsetting
 // http_proxy leaves no route rather than an unfiltered one.
 //
-// Gated on HARNESS_KERNEL_SANDBOX_SETTINGS: with it unset the spawn is byte-identical
-// to upstream, so an unsandboxed run is unchanged and the two are comparable.
+// FAIL CLOSED on HARNESS_KERNEL_SANDBOX_SETTINGS: with it unset the kernel REFUSES to
+// start unless HARNESS_KERNEL_SANDBOX=off says the launcher chose bare on purpose.
+// The old gate ran bare on silence, and silence is how the product arm shipped
+// model-authored code execution with no boundary -- the variable is the transport
+// for the posture, never the policy. Off remains available (it is a measured
+// benchmark condition) but must be said, so it lands in provenance.
+log("\nkernel boot budget:");
+
+// W42/W43: the boot handshake gives up after a HARDCODED 5s. The kernel venv is
+// 341 MB across 17,192 files and faults in on first boot -- measured 15x cold vs
+// warm on AppWorld, and 70s -> 310s with six concurrent workers. A boot slower
+// than 5s never completes, the rebuild path faults just as cold, and the round
+// spends its whole budget on the same error: one measured round burned 99 cells
+// that way, scored as a weak agent.
+//
+// W43's venv warm is the primary fix and should make this moot. This is the
+// fallback, and the lever to reach for if `stopped_by: dead-kernel` survives it.
+// Default-preserving: unset means literally 5000, so an unflagged build stays
+// byte-faithful to upstream.
+sub(
+	"core/kernel/index.ts",
+	"const PORTS_RESOLVE_TIMEOUT_MS = 5000;",
+	'const PORTS_RESOLVE_TIMEOUT_MS = Number(process.env.HARNESS_KERNEL_PORTS_TIMEOUT_MS) || 5000;',
+	"kernel port resolution honours HARNESS_KERNEL_PORTS_TIMEOUT_MS",
+	"HARNESS_KERNEL_PORTS_TIMEOUT_MS",
+);
+
+sub(
+	"core/kernel/index.ts",
+	"const READY_TIMEOUT_MS = 5000;",
+	'const READY_TIMEOUT_MS = Number(process.env.HARNESS_KERNEL_READY_TIMEOUT_MS) || 5000;',
+	"kernel readiness handshake honours HARNESS_KERNEL_READY_TIMEOUT_MS",
+	"HARNESS_KERNEL_READY_TIMEOUT_MS",
+);
+
+// Kernel stderr is where IPython's startup warnings go; upstream never writes
+// it anywhere unless the kernel dies. See scripts/patches/kernel-stderr-log.ts.
+sub(
+	"core/kernel/index.ts",
+	'import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
+	'import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
+	"kernel/index.ts imports appendFileSync for the stderr log",
+	"appendFileSync",
+);
+sub(
+	"core/kernel/index.ts",
+	`\t\t\tkernel.stderr?.on("data", (buf: Buffer) => {\n\t\t\t\tconst s = buf.toString();\n\t\t\t\tthis.kernelStderr += s;\n\t\t\t});`,
+	patch("kernel-stderr-log.ts"),
+	"kernel stderr is persisted to HARNESS_KERNEL_STDERR_LOG",
+	"HARNESS_KERNEL_STDERR_LOG",
+);
+
 log("\nsandboxed kernel:");
 
 sub(
@@ -562,6 +801,17 @@ sub(
 		`\t\t\t// scripts/neutralize-prime.mjs and runtime/eval/run.mjs.\n` +
 		`\t\t\tconst sandboxSettings = process.env.HARNESS_KERNEL_SANDBOX_SETTINGS;\n` +
 		`\t\t\tconst sandboxBin = process.env.HARNESS_KERNEL_SANDBOX_BIN ?? "srt";\n` +
+		`\t\t\tif (!sandboxSettings && process.env.HARNESS_KERNEL_SANDBOX !== "off") {\n` +
+		`\t\t\t\t// FAIL CLOSED. An unset variable used to mean "run bare", and that\n` +
+		`\t\t\t\t// silence is how an arm shipped model-authored code execution with\n` +
+		`\t\t\t\t// no boundary for weeks -- nothing forced launchers to set it.\n` +
+		`\t\t\t\t// Unsandboxed is a condition a launcher must SAY, and record.\n` +
+		`\t\t\t\tthrow new Error(\n` +
+		`\t\t\t\t\t"refusing to start an unsandboxed kernel: set HARNESS_KERNEL_SANDBOX_SETTINGS " +\n` +
+		`\t\t\t\t\t\t"(runtime/posture.mjs srtSettings + pythonPrefixes build it) or set " +\n` +
+		`\t\t\t\t\t\t"HARNESS_KERNEL_SANDBOX=off explicitly and record it in the run's provenance",\n` +
+		`\t\t\t\t);\n` +
+		`\t\t\t}\n` +
 		`\t\t\tconst kernelArgv: [string, string[]] = sandboxSettings\n` +
 		`\t\t\t\t// srt takes SPLIT argv, not one command string: the README's\n` +
 		`\t\t\t\t// \`srt "cmd"\` form fails with "command not found".\n` +
@@ -570,6 +820,31 @@ sub(
 		`\t\t\tconst kernel = spawn(kernelArgv[0], kernelArgv[1], {`,
 	"sandbox the ipython kernel",
 	"HARNESS_KERNEL_SANDBOX_SETTINGS",
+);
+
+// The fail-closed check, for a tree the sub above patched BEFORE it carried one.
+// That sub's marker (HARNESS_KERNEL_SANDBOX_SETTINGS) is already present there, so
+// it reports `present` and never inserts the check: exactly the silent staleness
+// assertPatchesInSync below exists to name. A pristine tree gets the check from
+// the sub above and this one reports `present`.
+sub(
+	"core/kernel/index.ts",
+	`\t\t\tconst sandboxBin = process.env.HARNESS_KERNEL_SANDBOX_BIN ?? "srt";\n\t\t\tconst kernelArgv`,
+	`\t\t\tconst sandboxBin = process.env.HARNESS_KERNEL_SANDBOX_BIN ?? "srt";\n` +
+		`\t\t\tif (!sandboxSettings && process.env.HARNESS_KERNEL_SANDBOX !== "off") {\n` +
+		`\t\t\t\t// FAIL CLOSED. An unset variable used to mean "run bare", and that\n` +
+		`\t\t\t\t// silence is how an arm shipped model-authored code execution with\n` +
+		`\t\t\t\t// no boundary for weeks -- nothing forced launchers to set it.\n` +
+		`\t\t\t\t// Unsandboxed is a condition a launcher must SAY, and record.\n` +
+		`\t\t\t\tthrow new Error(\n` +
+		`\t\t\t\t\t"refusing to start an unsandboxed kernel: set HARNESS_KERNEL_SANDBOX_SETTINGS " +\n` +
+		`\t\t\t\t\t\t"(runtime/posture.mjs srtSettings + pythonPrefixes build it) or set " +\n` +
+		`\t\t\t\t\t\t"HARNESS_KERNEL_SANDBOX=off explicitly and record it in the run's provenance",\n` +
+		`\t\t\t\t);\n` +
+		`\t\t\t}\n` +
+		`\t\t\tconst kernelArgv`,
+	"the kernel fails closed without sandbox settings",
+	"refusing to start an unsandboxed kernel",
 );
 
 // The full-transcript upload is installed unconditionally upstream and no env
@@ -594,5 +869,68 @@ sub(
 	"trace upload is opt-in",
 	'process.env.PRIME_AGENT_TRACES === "1"',
 );
+
+/**
+ * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.
+ *
+ * `sub`'s already-applied check is a short stable marker, deliberately, so that
+ * editing a patch body does not cause a double insertion. The cost of that choice
+ * is silent staleness: once the marker exists, an edited patch file is never
+ * re-applied and the vendored tree keeps running the OLD body while the patch file
+ * -- the thing a reader treats as the source of truth -- shows the new one.
+ *
+ * Measured: the filesystem guard's path matcher read `~45` (from `arms bent ~45°`
+ * in a creative prompt) as a home-relative path and refused the whole cell. The
+ * fix was written to `scripts/patches/fs-guard.ts`, this script reported
+ * `present ... :: refuse cells that reach outside...`, the build succeeded, the
+ * tests still failed, and the vendored tree still held the unfixed regex. Nothing
+ * in the pipeline said so.
+ *
+ * So the sync is asserted rather than assumed, per "a documented check is not an
+ * executed check". This is a WARNING, not a throw: patch bodies are also rewritten
+ * in place by later `sub` calls in this file (the exec-guard chains onto the fs
+ * guard's line), so exact absence is strong evidence of drift but not proof of it.
+ * It names the file, which is all a reader needs to go look.
+ */
+function assertPatchesInSync() {
+	log("\npatch-file sync:");
+	const dir = join(ROOT, "scripts/patches");
+	let drifted = 0;
+	for (const name of readdirSync(dir).filter((f) => f.endsWith(".ts")).sort()) {
+		const body = readFileSync(join(dir, name), "utf8").trimEnd();
+		// The patch's own first declaration is enough to locate it; comparing whole
+		// bodies would flag every legitimate downstream rewrite as drift.
+		const probe = body.split("\n").filter((l) => l.trim() && !l.trim().startsWith("*") && !l.trim().startsWith("/*") && !l.trim().startsWith("//"));
+		const hit = walkPrime().some((file) => {
+			const src = readFileSync(file, "utf8");
+			return probe.every((line) => src.includes(line.trim()));
+		});
+		if (hit) log(`  in sync  ${name}`);
+		else {
+			drifted++;
+			log(`  DRIFT    ${name} :: the vendored tree does not contain this patch body verbatim.`);
+			log("           The marker-based already-applied check will NOT re-apply an edited");
+			log("           patch. Sync the vendored copy, rebuild, and re-run the tests.");
+		}
+	}
+	if (!drifted) log("  all patch bodies present verbatim");
+}
+
+/** Every .ts under the vendored source tree. */
+function walkPrime() {
+	const out = [];
+	const stack = [join(PRIME)];
+	while (stack.length) {
+		for (const e of readdirSync(stack.pop(), { withFileTypes: true })) {
+			const full = join(e.parentPath ?? e.path, e.name);
+			if (e.isDirectory()) {
+				if (e.name !== "node_modules" && e.name !== "dist") stack.push(full);
+			} else if (e.name.endsWith(".ts")) out.push(full);
+		}
+	}
+	return out;
+}
+
+assertPatchesInSync();
 
 log("\ndone.");

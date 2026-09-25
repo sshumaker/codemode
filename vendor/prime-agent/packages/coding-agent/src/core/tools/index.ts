@@ -47,6 +47,7 @@ import { createFindTool, createFindToolDefinition, type FindToolOptions } from "
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.js";
 import { createBashTool, createBashToolDefinition, type BashToolOptions } from "./bash.js";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.js";
+import { toolSandboxOptions } from "./path-utils.js";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
@@ -67,6 +68,7 @@ export interface ToolsOptions {
 }
 
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
+	options = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };
 	switch (toolName) {
 		case "read":
 			return createReadToolDefinition(cwd, options?.read);
@@ -113,6 +115,7 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 }
 
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
+	options = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };
 	return {
 		read: createReadToolDefinition(cwd, options?.read),
 		bash: createBashToolDefinition(cwd, options?.bash),

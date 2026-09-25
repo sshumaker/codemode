@@ -846,7 +846,8 @@ async function main() {
 						HARNESS_KERNEL_SANDBOX_BIN: join(ROOT, "node_modules/.bin/srt"),
 						HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW,
 					}
-				: {}),
+				// The kernel fails closed; posture=off must be said, not implied.
+				: { HARNESS_KERNEL_SANDBOX: "off" }),
 			// Both arms' transports read these. The env-server speaks the MCP proxy's
 			// protocol precisely so nothing here needs an AppWorld-specific branch.
 			// Under the posture they read the egress route instead — one door.
