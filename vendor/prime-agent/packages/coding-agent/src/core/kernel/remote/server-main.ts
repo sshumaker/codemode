@@ -11,6 +11,7 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getPackageDir } from "../../../config.js";
+import { ensureTool } from "../../../utils/tools-manager.js";
 import { ensureKernelPython, type KernelPythonSkill } from "../bootstrap.js";
 import { KernelManager } from "../index.js";
 import { CHILD_ENV_ALLOW, KernelServer, kernelServerConfigFromEnv } from "./server.js";
@@ -57,6 +58,8 @@ async function prebake(): Promise<void> {
 	const log = (line: string) => process.stdout.write(`[prebake] ${line}\n`);
 	log(`skills: ${pythonSkills.map((s) => s.name).join(", ") || "(none)"}`);
 	const python = await ensureKernelPython({ pythonSkills, onProgress: log });
+	// The file tools' helpers, fetched now: after the lock there is no network to fetch them.
+	for (const tool of ["rg", "fd"] as const) log(`${tool}: ${(await ensureTool(tool, true)) ?? "UNAVAILABLE"}`);
 	log(`kernel python ${python}`);
 	mkdirSync(config.defaultCwd, { recursive: true });
 	const kernel = new KernelManager({ cwd: config.defaultCwd, pythonSkills });
@@ -76,6 +79,8 @@ await server.listen();
 process.stdout.write(`kernel-server listening on ${server.port}\n`);
 
 const stop = () => {
+	// Kernels get a bounded chance to flush their snapshots; the exit is not held past it.
+	setTimeout(() => process.exit(0), 8000).unref();
 	void server.close().finally(() => process.exit(0));
 };
 process.on("SIGTERM", stop);

@@ -68,6 +68,19 @@ function hashDir(dir) {
 	return hash.digest("hex").slice(0, 16);
 }
 
+/** Daytona's edge answers 502/503/504 now and then; setup commands here are idempotent. */
+async function retryTransient(fn, attempts = 4) {
+	for (let i = 1; ; i++) {
+		try {
+			return await fn();
+		} catch (error) {
+			const status = error?.statusCode;
+			if (i >= attempts || ![502, 503, 504].includes(status)) throw error;
+			await new Promise((r) => setTimeout(r, 1000 * i));
+		}
+	}
+}
+
 /** A remote path under the conversation's work dir; refuses anything that escapes it. */
 function underWork(workDir, rel) {
 	const p = posix.normalize(rel.startsWith("/") ? rel : posix.join(workDir, rel));
@@ -206,8 +219,10 @@ export class DaytonaKernelProvider {
 
 	/** Where the runtime is in this sandbox, and which bundle version it holds. */
 	async layoutOf(sb, home) {
-		const probe = await sb.process.executeCommand(
+		const probe = await retryTransient(() =>
+			sb.process.executeCommand(
 			`for r in ${IMAGE_RUNTIME_ROOT} ${home}/.harness-runtime; do if [ -f $r/kpkg/VERSION ]; then echo "$r $(cat $r/kpkg/VERSION)"; exit 0; fi; done; echo "none"`,
+			),
 		);
 		const [root, version] = probe.result.trim().split(/\s+/);
 		const runtimeRoot = root === "none" ? `${home}/.harness-runtime` : root;
@@ -215,7 +230,7 @@ export class DaytonaKernelProvider {
 	}
 
 	async exec(sb, command, timeoutSec = 600) {
-		const r = await sb.process.executeCommand(command, undefined, undefined, timeoutSec);
+		const r = await retryTransient(() => sb.process.executeCommand(command, undefined, undefined, timeoutSec));
 		if (r.exitCode !== 0) throw new Error(`sandbox command failed (${r.exitCode}): ${command.slice(0, 120)}\n${r.result.slice(-2000)}`);
 		return r.result;
 	}
@@ -237,8 +252,6 @@ export class DaytonaKernelProvider {
 			`set -e; mkdir -p ${layout.root}/kpkg ${layout.root}/bin; cd ${layout.root}/kpkg; ` +
 				`rm -rf dist VERSION package.json; tar -xzf ${layout.home}/.kpkg-upload.tgz; rm ${layout.home}/.kpkg-upload.tgz; ` +
 				`[ -d node_modules/zeromq ] || npm install --omit=dev --no-audit --no-fund --no-package-lock zeromq@${ZEROMQ_VERSION} >/dev/null 2>&1; ` +
-				`command -v rg >/dev/null || (sudo -n apt-get install -y -q ripgrep fd-find >/dev/null 2>&1 || true); ` +
-				`[ -x /usr/bin/fdfind ] && [ ! -e ${layout.root}/bin/fd ] && ln -s /usr/bin/fdfind ${layout.root}/bin/fd || true; ` +
 				`[ -x ${layout.root}/bin/uv ] || (curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=${layout.root}/bin UV_NO_MODIFY_PATH=1 sh >/dev/null 2>&1)`,
 			600,
 		);
@@ -260,11 +273,13 @@ export class DaytonaKernelProvider {
 
 	/** The server's /healthz, asked from inside the sandbox; `probe` forces a fresh egress probe. */
 	async health(sb, probe = false) {
-		const r = await sb.process.executeCommand(
+		const r = await retryTransient(() =>
+			sb.process.executeCommand(
 			`node -e "fetch('http://127.0.0.1:${KERNEL_PORT}/healthz${probe ? "?probe=1" : ""}').then(r=>r.text()).then(t=>console.log(t),()=>console.log('DOWN'))"`,
 			undefined,
 			undefined,
 			30,
+			),
 		);
 		const text = r.result.trim();
 		return text.startsWith("{") ? JSON.parse(text) : undefined;

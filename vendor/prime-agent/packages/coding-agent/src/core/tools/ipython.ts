@@ -19,7 +19,7 @@ import {
 } from "../kernel/index.js";
 import { isRemoteKernelEnabled } from "../kernel/remote/config.js";
 import { RemoteKernelManager } from "../kernel/remote/manager.js";
-import { createRemoteKernelManager, remoteKernelCwd } from "../kernel/remote/tools.js";
+import { createRemoteKernelManager } from "../kernel/remote/tools.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { parseIpythonBashCell } from "./ipython-cell-code.js";
@@ -1319,7 +1319,7 @@ export function createIpythonToolDefinition(
 				const code = applyShellSettingsToBashMagicCell(params.code, options);
 				// Before the kernel sees it: the refusal has to arrive as this cell's own
 				// error, since that is the channel the correction is delivered on.
-				const fsRefusal = fsGuardCheck(code, remoteKernelCwd() ?? cwd) ?? execGuardCheck(code) ?? readBatchGateCheck(code);
+				const fsRefusal = fsGuardCheck(code, cwd) ?? execGuardCheck(code) ?? readBatchGateCheck(code);
 				if (fsRefusal) {
 					clearTimeout(cellTimer);
 					return {

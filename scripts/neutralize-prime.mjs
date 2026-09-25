@@ -917,7 +917,7 @@ sub(
 	'import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";',
 	'import { isRemoteKernelEnabled } from "../kernel/remote/config.js";\n' +
 		'import { RemoteKernelManager } from "../kernel/remote/manager.js";\n' +
-		'import { createRemoteKernelManager, remoteKernelCwd } from "../kernel/remote/tools.js";\n' +
+		'import { createRemoteKernelManager } from "../kernel/remote/tools.js";\n' +
 		'import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";',
 	"ipython.ts imports the remote kernel",
 	"../kernel/remote/manager.js",
@@ -952,15 +952,6 @@ sub(
 		"\t\t\t\t\t\tm instanceof RemoteKernelManager ? await m.snapshotExists() : existsSync(snapshotPathIn(snapshotDir));",
 	"remote snapshot existence is asked of the sandbox",
 	"await m.snapshotExists()",
-);
-
-// The guards judge a cell's paths against the world the cell runs in.
-sub(
-	"core/tools/ipython.ts",
-	"fsGuardCheck(code, cwd)",
-	"fsGuardCheck(code, remoteKernelCwd() ?? cwd)",
-	"fs guard judges remote cells against the sandbox cwd",
-	"remoteKernelCwd() ?? cwd",
 );
 
 // ws is what both ends speak; it was only a transitive dependency before.

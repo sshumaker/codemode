@@ -138,6 +138,12 @@ export class RemoteKernelManager extends KernelManager {
 			);
 			this.posture = result?.posture;
 			this.running = true;
+			if (this.posture) {
+				options.onBootstrapProgress?.(
+					`Kernel boundary: ${this.posture.boundary}; egress ${this.posture.egress}` +
+						(this.posture.egressOverride ? ` (allowed: ${this.posture.egressOverride})` : ""),
+				);
+			}
 		} catch (error) {
 			throw mapError(error);
 		}

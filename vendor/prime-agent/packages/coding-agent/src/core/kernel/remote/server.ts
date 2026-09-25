@@ -23,6 +23,7 @@ import { connect as netConnect } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { type RawData, type WebSocket, WebSocketServer } from "ws";
+import { ensureTool } from "../../../utils/tools-manager.js";
 import { getKernelVenvDir, type KernelPythonSkill } from "../bootstrap.js";
 import { type HostRequestHandlers, KernelBusyAfterInterruptError, KernelManager } from "../index.js";
 import { manifestPathIn, snapshotPathIn } from "../state-snapshot.js";
@@ -186,7 +187,20 @@ export async function probeEgress(
 	const one = async (target: { host: string; port: number }) => {
 		const label = `${target.host}:${target.port}`;
 		try {
-			const address = /^[\d.]+$/.test(target.host) ? target.host : (await lookup(target.host)).address;
+			// A blocked resolver can take far longer than the connect timeout to give up.
+			const address = /^[\d.]+$/.test(target.host)
+				? target.host
+				: (
+						await Promise.race([
+							lookup(target.host),
+							new Promise<never>((_, reject) =>
+								setTimeout(
+									() => reject(Object.assign(new Error("timeout"), { code: `timeout after ${timeoutMs}ms` })),
+									timeoutMs,
+								).unref(),
+							),
+						])
+					).address;
 			const outcome = await new Promise<string>((resolve) => {
 				const socket = netConnect({ host: address, port: target.port });
 				const timer = setTimeout(() => {
@@ -301,7 +315,10 @@ export class KernelServer {
 		if (this.idleTimer) clearInterval(this.idleTimer);
 		if (this.probeTimer) clearInterval(this.probeTimer);
 		await Promise.allSettled([...this.sessions.values()].map((s) => this.disposeSession(s, "server closing")));
+		for (const client of this.wss?.clients ?? []) client.terminate();
 		this.wss?.close();
+		this.http?.closeAllConnections();
+		this.tunnel?.closeAllConnections();
 		await Promise.all(
 			[this.http, this.tunnel].map(
 				(s) => new Promise<void>((resolve) => (s ? s.close(() => resolve()) : resolve())),
@@ -800,9 +817,9 @@ export class KernelServer {
 				return this.kernelPython;
 			}
 			case "rg":
-				return (await which("rg")) ?? "rg";
 			case "fd":
-				return (await which("fd")) ?? (await which("fdfind")) ?? "fd";
+				// prime's own resolution (PATH, then its managed bin dir); prebake fetched them.
+				return (await ensureTool(bin, true)) ?? (bin === "fd" ? await which("fdfind") : undefined) ?? bin;
 			case "bash":
 				return "/bin/bash";
 			default:
