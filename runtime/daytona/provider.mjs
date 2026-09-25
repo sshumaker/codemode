@@ -404,6 +404,47 @@ export class DaytonaKernelProvider {
 	}
 
 	/**
+	 * Hold a conversation's sandbox awake while a turn runs. Traffic on the kernel's
+	 * WebSocket does NOT count as Daytona activity (measured: a sandbox with a live,
+	 * heartbeating kernel link auto-stopped on schedule), so a turn that waits 15
+	 * minutes on an approval would otherwise be stopped under it. Returns release().
+	 */
+	keepAlive(conversationId, { intervalMs = 60_000 } = {}) {
+		let sandbox;
+		const beat = async () => {
+			try {
+				sandbox ??= await this.find(conversationId);
+				await sandbox?.refreshActivity();
+			} catch (error) {
+				this.log(`keepAlive ${conversationId}: ${error.message}`);
+			}
+		};
+		void beat();
+		const timer = setInterval(beat, intervalMs);
+		timer.unref?.();
+		return () => clearInterval(timer);
+	}
+
+	/** Every regular file under `dir` (default `outputs`), recursively, in one sandbox call. */
+	async listTree(conversationId, dir = "outputs") {
+		const { sb, workDir } = await this.started(conversationId);
+		const root = underWork(workDir, dir);
+		const r = await retryTransient(() =>
+			sb.process.executeCommand(
+				`cd ${sh(workDir)} && [ -d ${sh(root)} ] && find ${sh(posix.relative(workDir, root) || ".")} -type f -not -name '.*' -printf '%p\\t%s\\t%T@\\n' || true`,
+			),
+		);
+		return r.result
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => {
+				const [path, size, mtime] = line.split("\t");
+				return { path, size: Number(size), mtimeMs: Math.round(Number(mtime) * 1000) };
+			})
+			.sort((a, b) => a.path.localeCompare(b.path));
+	}
+
+	/**
 	 * Sandboxes carrying this provider's labels. With `knownConversationIds`, only
 	 * those whose conversation is not in the set (the gateway deleted it, or crashed
 	 * before recording it); without, every labelled sandbox.

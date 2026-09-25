@@ -105,7 +105,11 @@ export function defineKernelSuite(label, makeTarget, { longBlockSeconds = 60 } =
 			return l;
 		};
 
+		const savedFlags = { HARNESS_MCP_TIMEOUT_S: process.env.HARNESS_MCP_TIMEOUT_S, HARNESS_DISPLAY_IMAGES: process.env.HARNESS_DISPLAY_IMAGES };
 		before(async () => {
+			// Loop-side flags a local kernel would inherit; the remote one must see them too.
+			process.env.HARNESS_MCP_TIMEOUT_S = "960";
+			process.env.HARNESS_DISPLAY_IMAGES = "1";
 			target = await makeTarget();
 			proxy = await startFixtureProxy();
 			await target.putTree(fixtureApiTree(), "api");
@@ -123,6 +127,10 @@ export function defineKernelSuite(label, makeTarget, { longBlockSeconds = 60 } =
 			target.timings.firstCellMs = Math.round(performance.now() - t2);
 		});
 		after(async () => {
+			for (const [k, v] of Object.entries(savedFlags)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 			await km?.dispose();
 			await link?.close({ bye: true });
 			await proxy?.close();
@@ -167,6 +175,23 @@ display({"application/vnd.prime-agent.attachment+json": {"mime_type": "image/png
 print(hashlib.sha256(payload.encode()).hexdigest())`);
 			const bigAtt = big.attachments?.[0];
 			assert.equal(createHash("sha256").update(bigAtt.data).digest("hex"), big.stdout.trim());
+		});
+
+		it("carries the loop's harness flags: the tool timeout, and plt.show() as an image", async () => {
+			const env = await km.execute("import os\nprint(os.environ.get('HARNESS_MCP_TIMEOUT_S'))");
+			assert.equal(env.stdout.trim(), "960");
+			const has = await km.execute("import importlib.util\nprint(importlib.util.find_spec('matplotlib') is not None)");
+			if (has.stdout.trim() !== "True") {
+				assert.ok(target.pipInstall, "matplotlib must be in the sandbox's kernel venv");
+				target.pipInstall("matplotlib");
+			}
+			const r = await km.execute(
+				"import matplotlib\nmatplotlib.use('module://matplotlib_inline.backend_inline')\nimport matplotlib.pyplot as plt\nplt.plot([0, 1, 2], [0, 1, 4])\nplt.show()",
+			);
+			assert.equal(r.status, "ok", r.error?.evalue ?? r.stderr);
+			const png = r.attachments?.find((a) => a.mimeType === "image/png");
+			assert.ok(png, `no image attachment: ${JSON.stringify(r.attachments?.map((a) => a.mimeType))}`);
+			assert.equal(Buffer.from(png.data, "base64").subarray(0, 4).toString("hex"), "89504e47");
 		});
 
 		it("answers host requests on the loop, and raises for unknown types", async () => {

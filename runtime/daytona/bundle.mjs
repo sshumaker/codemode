@@ -6,6 +6,7 @@
  *   <out>/dist/kernel-server.mjs    server-main.js bundled; zeromq stays external
  *   <out>/dist/skills/              the bundled Python skills
  *   <out>/dist/prime-agent-runtime/ the rlm runtime the kernel venv installs
+ *   <out>/kernel-requirements.txt   the pinned analysis stack (bench/container), less appnope
  *   <out>/VERSION                   content hash of all of the above
  *
  * The version names the snapshot (harness-assistant-kernel-<version>), so a change
@@ -77,6 +78,12 @@ export async function buildKernelServerBundle(out = join(tmpdir(), `harness-kern
 	);
 	cpSync(join(DIST, "skills"), join(out, "dist/skills"), { recursive: true });
 	cpSync(join(DIST, "prime-agent-runtime"), join(out, "dist/prime-agent-runtime"), { recursive: true });
+	// Pinned analysis stack for the sandbox kernel; appnope is darwin-only.
+	const reqs = readFileSync(join(ROOT, "bench/container/kernel-requirements.txt"), "utf8")
+		.split("\n")
+		.filter((l) => !/^appnope\b/.test(l))
+		.join("\n");
+	writeFileSync(join(out, "kernel-requirements.txt"), reqs);
 	const version = hashTree(out);
 	writeFileSync(join(out, "VERSION"), `${version}\n`);
 	return { dir: out, version };

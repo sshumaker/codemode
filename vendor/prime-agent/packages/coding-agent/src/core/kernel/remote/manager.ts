@@ -26,6 +26,7 @@ import {
 	type KernelStartOptions,
 } from "../index.js";
 import type { RestoreResult, SnapshotResult } from "../state-snapshot.js";
+import { forwardedKernelEnv } from "./config.js";
 import type { RemoteKernelLink } from "./link.js";
 import { RemoteKernelError } from "./link.js";
 import type { RemotePathMap } from "./pathmap.js";
@@ -125,7 +126,7 @@ export class RemoteKernelManager extends KernelManager {
 					kernel: this.kernelId,
 					options: {
 						cwd: this.remote.remoteCwd,
-						env: this.remote.env,
+						env: { ...forwardedKernelEnv(), ...this.remote.env },
 						sessionId: this.remote.sessionId,
 						username: this.remote.username,
 						pythonSkills,

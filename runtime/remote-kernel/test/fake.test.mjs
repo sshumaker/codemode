@@ -5,7 +5,8 @@ import assert from "node:assert/strict";
 import { cpSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DIST, startFakeServer } from "./fake-server.mjs";
+import { spawnSync } from "node:child_process";
+import { DIST, startFakeServer, TEST_VENV } from "./fake-server.mjs";
 import { describe, it } from "node:test";
 import { assertPrimeTurn, hasModelKey, runPrimeTurn } from "./prime-turn.mjs";
 import { defineKernelSuite, fixtureApiTree, startFixtureProxy } from "./suite.mjs";
@@ -23,6 +24,10 @@ defineKernelSuite(
 			connection: () => ({ url: srv.url, token: srv.token }),
 			putTree: async (dir, rel) => cpSync(dir, join(srv.cwd, rel), { recursive: true }),
 			sandboxRead: async (p) => readFileSync(p),
+			pipInstall: (pkg) => {
+				const r = spawnSync("uv", ["pip", "install", "-q", "--python", join(TEST_VENV, "bin/python"), pkg], { stdio: "inherit" });
+				assert.equal(r.status, 0, `uv pip install ${pkg}`);
+			},
 			cleanup: async () => {
 				await srv.stop();
 				if (process.env.RK_PRINT_TIMINGS) console.log("fake timings", JSON.stringify(timings));

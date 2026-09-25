@@ -8,6 +8,7 @@
  *                                     one kernel to warm it, and exit. Run while the
  *                                     sandbox (or the image build) still has network.
  */
+import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getPackageDir } from "../../../config.js";
@@ -61,10 +62,19 @@ async function prebake(): Promise<void> {
 	// The file tools' helpers, fetched now: after the lock there is no network to fetch them.
 	for (const tool of ["rg", "fd"] as const) log(`${tool}: ${(await ensureTool(tool, true)) ?? "UNAVAILABLE"}`);
 	log(`kernel python ${python}`);
+	// The analysis stack a product kernel carries (bench/container/kernel-requirements.txt,
+	// the host venv's pins) plus matplotlib, as the gateway's local kernel has.
+	const requirements = join(getPackageDir(), "kernel-requirements.txt");
+	if (existsSync(requirements)) {
+		const r = spawnSync("uv", ["pip", "install", "--python", python, "-r", requirements, "matplotlib"], {
+			stdio: ["ignore", "inherit", "inherit"],
+		});
+		log(`analysis stack: ${r.status === 0 ? "installed" : `FAILED (exit ${r.status})`}`);
+	}
 	mkdirSync(config.defaultCwd, { recursive: true });
 	const kernel = new KernelManager({ cwd: config.defaultCwd, pythonSkills });
 	await kernel.start({ onBootstrapProgress: log });
-	const warm = await kernel.execute("import pandas, numpy, PIL, dill\nprint('warm')");
+	const warm = await kernel.execute("import pandas, numpy, PIL, dill, matplotlib.pyplot\nprint('warm')");
 	log(`warm cell: ${warm.status} ${warm.stdout.trim()}`);
 	await kernel.dispose();
 }

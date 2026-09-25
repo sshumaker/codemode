@@ -705,6 +705,7 @@ export class KernelServer {
 		);
 		if (dropped.length)
 			this.config.log(`kernel ${kernelId.slice(0, 8)}: dropped secret-shaped env ${dropped.join(",")}`);
+		adoptHarnessFlags(env);
 		const cwd = options.cwd ?? this.config.defaultCwd;
 		mkdirSync(cwd, { recursive: true });
 		for (const mapping of options.pathMap ?? []) mirrorPath(mapping.local, mapping.remote, this.config.log);
@@ -916,6 +917,30 @@ export class KernelServer {
 			clearTimeout(timer);
 		}
 	}
+}
+
+/** Flags this server itself enforces; a loop cannot turn them. */
+const SERVER_OWNED = new Set([
+	"HARNESS_KERNEL_SANDBOX",
+	"HARNESS_KERNEL_ENV_ALLOW",
+	"HARNESS_MCP_PROXY",
+	"HARNESS_EGRESS_TOKEN",
+]);
+
+/**
+ * Some harness flags are read by KernelManager itself (HARNESS_DISPLAY_IMAGES, the boot
+ * timeouts), in this process, not the kernel's. One server serves one conversation, so
+ * adopting the loop's flags process-wide is the same thing a local kernel's loop would
+ * have had in its own env.
+ */
+export function adoptHarnessFlags(env: Record<string, string>, target: NodeJS.ProcessEnv = process.env): string[] {
+	const adopted: string[] = [];
+	for (const [name, value] of Object.entries(env)) {
+		if (!name.startsWith("HARNESS_") || SERVER_OWNED.has(name)) continue;
+		target[name] = value;
+		adopted.push(name);
+	}
+	return adopted;
 }
 
 /**

@@ -22,6 +22,12 @@
  *   HARNESS_EGRESS_TOKEN                added to tunnelled tool calls on the loop side only
  *   HARNESS_REMOTE_TOOL_TIMEOUT_MS      per tool call; default 16 min (a call may wait
  *                                       15 min for a human's approval)
+ *   HARNESS_REMOTE_KERNEL_ENV           JSON object of extra env for the remote kernel
+ *                                       (e.g. IPYTHONDIR pointing at an uploaded profile)
+ *
+ * Every other HARNESS_* behaviour flag in the loop's env (HARNESS_MCP_TIMEOUT_S,
+ * HARNESS_DISPLAY_IMAGES, HARNESS_RUN_ID, ...) is forwarded to the kernel server,
+ * the way a local kernel inherits it; see forwardedKernelEnv.
  */
 import { readFileSync } from "node:fs";
 import type { PathMapping } from "./protocol.js";
@@ -94,5 +100,34 @@ export function remoteKernelConfigFromEnv(env: NodeJS.ProcessEnv = process.env):
 		toolProxy: env.HARNESS_REMOTE_TOOL_PROXY || env.HARNESS_MCP_PROXY || undefined,
 		egressToken: env.HARNESS_EGRESS_TOKEN || undefined,
 		toolTimeoutMs: Number(env.HARNESS_REMOTE_TOOL_TIMEOUT_MS ?? 16 * 60_000),
+	};
+}
+
+/** Loop plumbing and loop-local paths: meaningful here, wrong or dangerous in the sandbox. */
+const NOT_FORWARDED = [
+	/^HARNESS_REMOTE_/,
+	/^HARNESS_MCP_PROXY$/,
+	/^HARNESS_EGRESS_TOKEN$/,
+	/^HARNESS_KERNEL_SANDBOX/,
+	/^HARNESS_KERNEL_ENV_/,
+	/^HARNESS_TOOL_SANDBOX_/,
+	/_(DIR|PATH|LOG|FILE|SETTINGS|BIN|ROOT)$/,
+];
+
+/**
+ * What the remote kernel should see of the loop's env: the harness behaviour flags a
+ * local kernel would have inherited, plus HARNESS_REMOTE_KERNEL_ENV. The server
+ * still drops anything secret-shaped (server.ts kernelEnvFor).
+ */
+export function forwardedKernelEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [name, value] of Object.entries(env)) {
+		if (value === undefined || !name.startsWith("HARNESS_")) continue;
+		if (NOT_FORWARDED.some((re) => re.test(name))) continue;
+		out[name] = value;
+	}
+	return {
+		...out,
+		...parseJson<Record<string, string>>("HARNESS_REMOTE_KERNEL_ENV", env.HARNESS_REMOTE_KERNEL_ENV, {}),
 	};
 }

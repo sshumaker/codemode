@@ -79,6 +79,10 @@ export declare class DaytonaKernelProvider {
 	stop(conversationId: string): Promise<{ stopped: boolean; sandboxId?: string; state?: string }>;
 	destroy(conversationId: string): Promise<{ destroyed: boolean; sandboxId?: string }>;
 	touch(conversationId: string): Promise<void>;
+	/** refreshActivity() every intervalMs (default 60 s) until the returned function is called. */
+	keepAlive(conversationId: string, opts?: { intervalMs?: number }): () => void;
+	/** Every regular file under dir (default "outputs"), recursively: {path relative to the work dir, size, mtimeMs}. */
+	listTree(conversationId: string, dir?: string): Promise<{ path: string; size: number; mtimeMs: number }[]>;
 	listOrphans(opts?: { knownConversationIds?: Iterable<string> }): Promise<Orphan[]>;
 	reap(opts?: { knownConversationIds?: Iterable<string> }): Promise<Orphan[]>;
 	uploadFile(conversationId: string, path: string, data: Buffer | string): Promise<string>;

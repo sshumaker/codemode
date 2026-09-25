@@ -13,7 +13,7 @@ const { ReliableChannel } = await import(`${R}/channel.js`);
 const { RemotePathMap } = await import(`${R}/pathmap.js`);
 const server = await import(`${R}/server.js`);
 const { hashSkillPackage, placeSkills, remoteSkill } = await import(`${R}/skills.js`);
-const { remoteKernelConfigFromEnv, toWebSocketUrl } = await import(`${R}/config.js`);
+const { forwardedKernelEnv, remoteKernelConfigFromEnv, toWebSocketUrl } = await import(`${R}/config.js`);
 const { KernelBusyAfterInterruptError } = await import(`${DIST}/core/kernel/index.js`);
 
 describe("protocol codec", () => {
@@ -220,5 +220,40 @@ describe("skill packages", () => {
 		const remote = remoteSkill(p, "/state/skills");
 		assert.equal(remote.packagePath, `/state/skills/${p.hash}/my-skill`);
 		assert.equal(remote.pyprojectPath, `/state/skills/${p.hash}/my-skill/pyproject.toml`);
+	});
+});
+
+describe("flag forwarding", () => {
+	it("forwards harness behaviour flags, never plumbing, secrets' carriers, or loop paths", () => {
+		const env = forwardedKernelEnv({
+			HARNESS_MCP_TIMEOUT_S: "960",
+			HARNESS_DISPLAY_IMAGES: "1",
+			HARNESS_RUN_ID: "r1",
+			HARNESS_WAIT_TOKEN: "nonce",
+			HARNESS_MCP_PROXY: "http://gw/r/mcp",
+			HARNESS_EGRESS_TOKEN: "egress",
+			HARNESS_REMOTE_KERNEL_TOKEN: "t",
+			HARNESS_KERNEL_SANDBOX_SETTINGS: "/x.json",
+			HARNESS_KERNEL_STDERR_LOG: "/Users/me/log",
+			ANTHROPIC_API_KEY: "sk",
+			HARNESS_REMOTE_KERNEL_ENV: JSON.stringify({ IPYTHONDIR: "/home/daytona/.ipython-aw" }),
+		});
+		assert.deepEqual(env, {
+			HARNESS_MCP_TIMEOUT_S: "960",
+			HARNESS_DISPLAY_IMAGES: "1",
+			HARNESS_RUN_ID: "r1",
+			HARNESS_WAIT_TOKEN: "nonce",
+			IPYTHONDIR: "/home/daytona/.ipython-aw",
+		});
+	});
+
+	it("adopts flags server-wide except the ones the server owns", () => {
+		const target = {};
+		const adopted = server.adoptHarnessFlags(
+			{ HARNESS_DISPLAY_IMAGES: "1", HARNESS_KERNEL_SANDBOX: "on", HARNESS_MCP_PROXY: "x", PATH: "/evil" },
+			target,
+		);
+		assert.deepEqual(adopted, ["HARNESS_DISPLAY_IMAGES"]);
+		assert.deepEqual(target, { HARNESS_DISPLAY_IMAGES: "1" });
 	});
 });
