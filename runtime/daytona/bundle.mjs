@@ -48,8 +48,27 @@ export function hashTree(dir) {
 	return hash.digest("hex").slice(0, 12);
 }
 
+const building = new Map();
+
+/**
+ * Build the kernel-server bundle into `out`, once per process and `out`: concurrent
+ * callers share one build. Two builds into the same dir race its rmSync, and the first
+ * to finish calls esbuild's stop(), which kills the service the other build is still
+ * waiting on, so its promise never settles (seen as a gateway whose second concurrent
+ * ensure() hung forever with nothing pending).
+ */
+export function buildKernelServerBundle(out = join(tmpdir(), `harness-kernel-server-${process.pid}`)) {
+	let pending = building.get(out);
+	if (!pending) {
+		pending = buildOnce(out);
+		building.set(out, pending);
+		pending.catch(() => building.delete(out));
+	}
+	return pending;
+}
+
 /** Build into `out` (default: a fresh temp dir); returns {dir, version}. */
-export async function buildKernelServerBundle(out = join(tmpdir(), `harness-kernel-server-${process.pid}`)) {
+async function buildOnce(out) {
 	const entry = join(DIST, "core/kernel/remote/server-main.js");
 	if (!existsSync(entry)) throw new Error(`${entry} missing — run: cd vendor/prime-agent/packages/coding-agent && npm run build`);
 	const src = join(CODING_AGENT, "src/core/kernel/remote/server.ts");

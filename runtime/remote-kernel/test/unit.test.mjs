@@ -199,6 +199,16 @@ describe("config", () => {
 	});
 });
 
+describe("kernel-server bundle", () => {
+	it("concurrent builds into one dir share a single build, and every caller settles", async () => {
+		const { buildKernelServerBundle } = await import("../../daytona/bundle.mjs");
+		const out = mkdtempSync(join(tmpdir(), "rk-bundle-"));
+		const results = await Promise.all([buildKernelServerBundle(out), buildKernelServerBundle(out), buildKernelServerBundle(out)]);
+		assert.equal(new Set(results.map((r) => r.version)).size, 1);
+		assert.ok(results.every((r) => r === results[0]), "one build, shared");
+	});
+});
+
 describe("skill packages", () => {
 	it("hash by content, ignore build junk, and land at a content-addressed path", () => {
 		const root = mkdtempSync(join(tmpdir(), "rk-skill-"));
