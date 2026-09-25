@@ -17,7 +17,9 @@ import {
 	KernelManager,
 	type KernelSentAgentMessage,
 } from "../kernel/index.js";
-import { RemoteKernelManager } from "../kernel/remote.js";
+import { isRemoteKernelEnabled } from "../kernel/remote/config.js";
+import { RemoteKernelManager } from "../kernel/remote/manager.js";
+import { createRemoteKernelManager, remoteKernelCwd } from "../kernel/remote/tools.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { parseIpythonBashCell } from "./ipython-cell-code.js";
@@ -978,22 +980,19 @@ export class IpythonKernelProvisioner {
 					startupSignal,
 				);
 			}
-			// SPIKE: HARNESS_REMOTE_KERNEL_URL swaps in the WebSocket-backed kernel (remote.ts).
-			const remoteUrl = process.env.HARNESS_REMOTE_KERNEL_URL;
-			const snapshotDir = remoteUrl ? undefined : this.options?.snapshotDir;
-			const m = remoteUrl
-				? (new RemoteKernelManager({
-						url: remoteUrl,
-						headers: process.env.HARNESS_REMOTE_KERNEL_PREVIEW_TOKEN
-							? { "x-daytona-preview-token": process.env.HARNESS_REMOTE_KERNEL_PREVIEW_TOKEN }
-							: undefined,
-						token: process.env.HARNESS_REMOTE_KERNEL_TOKEN,
-						remoteCwd: process.env.HARNESS_REMOTE_KERNEL_CWD,
+			const snapshotDir = this.options?.snapshotDir;
+			// HARNESS_REMOTE_KERNEL_URL: the kernel runs in a sandbox elsewhere, behind
+			// the same KernelManager surface. Its snapshot lives on the sandbox's disk,
+			// keyed by session id, so a restarted loop or sandbox revives the namespace.
+			const m = isRemoteKernelEnabled()
+				? createRemoteKernelManager({
+						localCwd: this.cwd,
 						env: this.options?.env,
 						sessionId: this.options?.sessionId,
 						hostHandlers: this.options?.hostHandlers,
 						pythonSkills: this.options?.pythonSkills,
-					}) as unknown as KernelManager)
+						snapshotKey: snapshotDir ? (this.options?.sessionId ?? snapshotDir) : undefined,
+					})
 				: new KernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,
@@ -1027,7 +1026,8 @@ export class IpythonKernelProvisioner {
 				// Revive a prior session's namespace before the bootstrap, so the bootstrap
 				// then overwrites live handles (rlm, skills) on top of anything restored.
 				if (snapshotDir) {
-					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+					const snapshotExisted =
+						m instanceof RemoteKernelManager ? await m.snapshotExists() : existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring IPython state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
 					if (snapshotExisted) {
@@ -1319,7 +1319,7 @@ export function createIpythonToolDefinition(
 				const code = applyShellSettingsToBashMagicCell(params.code, options);
 				// Before the kernel sees it: the refusal has to arrive as this cell's own
 				// error, since that is the channel the correction is delivered on.
-				const fsRefusal = fsGuardCheck(code, cwd) ?? execGuardCheck(code) ?? readBatchGateCheck(code);
+				const fsRefusal = fsGuardCheck(code, remoteKernelCwd() ?? cwd) ?? execGuardCheck(code) ?? readBatchGateCheck(code);
 				if (fsRefusal) {
 					clearTimeout(cellTimer);
 					return {

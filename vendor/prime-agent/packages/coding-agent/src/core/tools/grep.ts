@@ -2,8 +2,7 @@ import { readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
-import { spawn } from "child_process";
-import { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";
+import { toolSandboxSpawn } from "./path-utils.js";
 import path from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
@@ -224,8 +223,7 @@ export function createGrepToolDefinition(
 						if (glob) args.push("--glob", glob);
 						args.push("--", pattern, searchPath);
 
-						const sbRg = toolSandboxWrap(rgPath, args);
-						const child = spawn(sbRg.bin, sbRg.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });
+						const child = toolSandboxSpawn(rgPath, args, { mapOutput: true });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						let matchCount = 0;

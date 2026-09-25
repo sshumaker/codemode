@@ -25,7 +25,7 @@
  *
  * Idempotent: safe to re-run after bumping the vendored upstream.
  */
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -333,14 +333,14 @@ sub(
 sub(
 	"core/tools/index.ts",
 	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\tswitch (toolName) {",
-	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\toptions = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };\n\tswitch (toolName) {",
+	"export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {\n\toptions = { ...options, ...(toolSandboxOptions(cwd, options as Record<string, unknown>) as Partial<ToolsOptions>) };\n\tswitch (toolName) {",
 	"createToolDefinition applies sandbox ops",
 );
 
 sub(
 	"core/tools/index.ts",
 	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\treturn {",
-	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\toptions = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };\n\treturn {",
+	"export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {\n\toptions = { ...options, ...(toolSandboxOptions(cwd, options as Record<string, unknown>) as Partial<ToolsOptions>) };\n\treturn {",
 	"createAllToolDefinitions applies sandbox ops",
 );
 
@@ -350,28 +350,30 @@ sub(
 sub(
 	"core/tools/grep.ts",
 	'import { spawn } from "child_process";',
-	'import { spawn } from "child_process";\nimport { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";',
-	"grep.ts imports the sandbox wrap",
+	'import { toolSandboxSpawn } from "./path-utils.js";',
+	"grep.ts spawns through the sandbox chokepoint",
 );
 
+// mapOutput: rg prints absolute paths, which in the remote shape are the
+// sandbox's; the chokepoint rewrites them back so formatPath's relativising works.
 sub(
 	"core/tools/grep.ts",
 	'const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });',
-	'const sbRg = toolSandboxWrap(rgPath, args);\n\t\t\t\t\t\tconst child = spawn(sbRg.bin, sbRg.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });',
+	"const child = toolSandboxSpawn(rgPath, args, { mapOutput: true });",
 	"rg runs inside the sandbox",
 );
 
 sub(
 	"core/tools/find.ts",
 	'import { spawn } from "child_process";',
-	'import { spawn } from "child_process";\nimport { toolSandboxChildEnv, toolSandboxWrap } from "./path-utils.js";',
-	"find.ts imports the sandbox wrap",
+	'import { toolSandboxSpawn } from "./path-utils.js";',
+	"find.ts spawns through the sandbox chokepoint",
 );
 
 sub(
 	"core/tools/find.ts",
 	'const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });',
-	'const sbFd = toolSandboxWrap(fdPath, args);\n\t\t\t\t\t\tconst child = spawn(sbFd.bin, sbFd.args, { stdio: ["ignore", "pipe", "pipe"], env: toolSandboxChildEnv() });',
+	"const child = toolSandboxSpawn(fdPath, args, { mapOutput: true });",
 	"fd runs inside the sandbox",
 );
 
@@ -869,6 +871,121 @@ sub(
 	"trace upload is opt-in",
 	'process.env.PRIME_AGENT_TRACES === "1"',
 );
+
+// --- remote kernel: the kernel in a sandbox on another machine ---------------
+//
+// Hands, not brain, taken one step further: the loop stays where the credentials
+// are, and the kernel (plus every file tool) runs inside a remote sandbox — a
+// Daytona sandbox, in the assistant — reached over one WebSocket. The modules are
+// whole files under scripts/patches/remote-kernel/, placed verbatim into
+// core/kernel/remote/; what follows are the three seams that choose them.
+//
+// The remote backend declares the sandbox as the boundary: the loop never starts a
+// local kernel, and the in-sandbox server refuses to start one while its own probe
+// can reach the internet (server.ts startKernel). See runtime/daytona/README.md.
+log("\nremote kernel:");
+
+const REMOTE_KERNEL_FILES = [
+	"protocol.ts",
+	"channel.ts",
+	"config.ts",
+	"pathmap.ts",
+	"skills.ts",
+	"link.ts",
+	"manager.ts",
+	"tools.ts",
+	"server.ts",
+	"server-main.ts",
+];
+
+/** Place a whole-file patch; the file under scripts/patches is the source of truth. */
+function place(relPath, patchPath, label) {
+	const path = join(PRIME, relPath);
+	const body = readFileSync(join(ROOT, "scripts/patches", patchPath), "utf8");
+	mkdirSync(dirname(path), { recursive: true });
+	if (existsSync(path) && readFileSync(path, "utf8") === body) return log(`  present ${relPath} :: ${label}`);
+	writeFileSync(path, body);
+	log(`  placed  ${relPath} :: ${label}`);
+}
+
+for (const name of REMOTE_KERNEL_FILES) {
+	place(`core/kernel/remote/${name}`, `remote-kernel/${name}`, "remote kernel module");
+}
+
+sub(
+	"core/tools/ipython.ts",
+	'import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";',
+	'import { isRemoteKernelEnabled } from "../kernel/remote/config.js";\n' +
+		'import { RemoteKernelManager } from "../kernel/remote/manager.js";\n' +
+		'import { createRemoteKernelManager, remoteKernelCwd } from "../kernel/remote/tools.js";\n' +
+		'import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";',
+	"ipython.ts imports the remote kernel",
+	"../kernel/remote/manager.js",
+);
+
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\tconst snapshotDir = this.options?.snapshotDir;\n\t\t\tconst m = new KernelManager({",
+	"\t\t\tconst snapshotDir = this.options?.snapshotDir;\n" +
+		"\t\t\t// HARNESS_REMOTE_KERNEL_URL: the kernel runs in a sandbox elsewhere, behind\n" +
+		"\t\t\t// the same KernelManager surface. Its snapshot lives on the sandbox's disk,\n" +
+		"\t\t\t// keyed by session id, so a restarted loop or sandbox revives the namespace.\n" +
+		"\t\t\tconst m = isRemoteKernelEnabled()\n" +
+		"\t\t\t\t? createRemoteKernelManager({\n" +
+		"\t\t\t\t\t\tlocalCwd: this.cwd,\n" +
+		"\t\t\t\t\t\tenv: this.options?.env,\n" +
+		"\t\t\t\t\t\tsessionId: this.options?.sessionId,\n" +
+		"\t\t\t\t\t\thostHandlers: this.options?.hostHandlers,\n" +
+		"\t\t\t\t\t\tpythonSkills: this.options?.pythonSkills,\n" +
+		"\t\t\t\t\t\tsnapshotKey: snapshotDir ? (this.options?.sessionId ?? snapshotDir) : undefined,\n" +
+		"\t\t\t\t\t})\n" +
+		"\t\t\t\t: new KernelManager({",
+	"remote kernel swaps in behind the provisioner",
+	"createRemoteKernelManager({",
+);
+
+// The snapshot is on the sandbox's disk; asking the loop's disk would always say no.
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\t\tconst snapshotExisted = existsSync(snapshotPathIn(snapshotDir));",
+	"\t\t\t\t\tconst snapshotExisted =\n" +
+		"\t\t\t\t\t\tm instanceof RemoteKernelManager ? await m.snapshotExists() : existsSync(snapshotPathIn(snapshotDir));",
+	"remote snapshot existence is asked of the sandbox",
+	"await m.snapshotExists()",
+);
+
+// The guards judge a cell's paths against the world the cell runs in.
+sub(
+	"core/tools/ipython.ts",
+	"fsGuardCheck(code, cwd)",
+	"fsGuardCheck(code, remoteKernelCwd() ?? cwd)",
+	"fs guard judges remote cells against the sandbox cwd",
+	"remoteKernelCwd() ?? cwd",
+);
+
+// ws is what both ends speak; it was only a transitive dependency before.
+subPackageJson(
+	'\t\t"uuid": "^14.0.0",\n',
+	'\t\t"uuid": "^14.0.0",\n\t\t"ws": "^8.21.0",\n',
+	"ws is a declared dependency",
+	'"ws": "^8.21.0"',
+);
+subPackageJson(
+	'\t\t"@types/proper-lockfile": "^4.1.4",\n',
+	'\t\t"@types/proper-lockfile": "^4.1.4",\n\t\t"@types/ws": "^8.18.1",\n',
+	"@types/ws for the remote kernel",
+	'"@types/ws"',
+);
+
+/** sub() for the coding-agent package.json, which sits beside src/. */
+function subPackageJson(find, replace, label, marker) {
+	const path = join(PRIME, "..", "package.json");
+	const src = readFileSync(path, "utf8");
+	if (src.includes(marker)) return log(`  present package.json :: ${label}`);
+	if (src.split(find).length - 1 !== 1) throw new Error(`package.json: expected 1 match for ${label}`);
+	writeFileSync(path, src.replace(find, () => replace));
+	log(`  patched package.json :: ${label}`);
+}
 
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.

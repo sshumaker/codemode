@@ -68,7 +68,7 @@ export interface ToolsOptions {
 }
 
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
-	options = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };
+	options = { ...options, ...(toolSandboxOptions(cwd, options as Record<string, unknown>) as Partial<ToolsOptions>) };
 	switch (toolName) {
 		case "read":
 			return createReadToolDefinition(cwd, options?.read);
@@ -115,7 +115,7 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 }
 
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
-	options = { ...options, ...(toolSandboxOptions() as Partial<ToolsOptions>) };
+	options = { ...options, ...(toolSandboxOptions(cwd, options as Record<string, unknown>) as Partial<ToolsOptions>) };
 	return {
 		read: createReadToolDefinition(cwd, options?.read),
 		bash: createBashToolDefinition(cwd, options?.bash),

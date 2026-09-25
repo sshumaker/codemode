@@ -1,7 +1,14 @@
-import { spawn as toolSandboxSpawn } from "child_process";
+import { spawn as toolSandboxSpawnProcess } from "child_process";
 import { writeFileSync as toolSandboxWriteFileSync } from "node:fs";
 import { join as toolSandboxJoin } from "node:path";
 import { fileTypeFromBuffer as toolSandboxFileType } from "file-type";
+import {
+	registerRemoteLocalCwd,
+	type RemoteSpawnOptions,
+	remoteToolChild,
+	remoteToolsActive,
+	type ToolChild,
+} from "../kernel/remote/tools.js";
 
 /**
  * W121: the read/grep/find/ls tools execute INSIDE the kernel's sandbox.
@@ -33,6 +40,12 @@ import { fileTypeFromBuffer as toolSandboxFileType } from "file-type";
  * OFF (identity passthrough) unless both HARNESS_KERNEL_SANDBOX_BIN and
  * HARNESS_KERNEL_SANDBOX_SETTINGS are set — the same pair the kernel launcher
  * keys on, so tools and cells are governed together or not at all.
+ *
+ * REMOTE (HARNESS_REMOTE_KERNEL_URL set): the kernel lives in a sandbox on
+ * another machine, so the same ops run THERE, over the kernel's own socket
+ * (kernel/remote/tools.ts), and loop-side paths are translated to the
+ * sandbox's. write/edit/bash join read/grep/find/ls in that mode: with the
+ * kernel remote, a local write would put the bytes where no cell can see them.
  */
 
 // The op and path travel as HARNESS_* ENV, not argv: srt shell-joins the
@@ -100,6 +113,12 @@ const TOOL_SANDBOX_OPS_PY = [
 	"    elif op=='stat':",
 	"        st=os.stat(p); sys.stdout.write(json.dumps({'dir':os.path.isdir(p),'size':st.st_size,'mtimeMs':st.st_mtime*1000}))",
 	"    elif op=='readdir': sys.stdout.write(json.dumps(sorted(os.listdir(p))))",
+	// Remote-only ops (write/edit): the content arrives on stdin, never in argv/env.
+	"    elif op=='write': open(p,'wb').write(sys.stdin.buffer.read())",
+	"    elif op=='mkdir': os.makedirs(p,exist_ok=True)",
+	"    elif op=='access_rw':",
+	"        if not os.path.exists(p): raise FileNotFoundError(p)",
+	"        if not os.access(p,os.R_OK|os.W_OK): raise PermissionError(p)",
 	"    else: sys.stderr.write('unknown op: '+op); sys.exit(64)",
 	"except FileNotFoundError: sys.stderr.write('ENOENT'); sys.exit(2)",
 	"except IsADirectoryError: sys.stderr.write('EISDIR'); sys.exit(5)",
@@ -169,12 +188,37 @@ function toolSandboxEisdir(op: string, p: string): string {
 	return `${plain}. Use ls to list a directory.`;
 }
 
-function sandboxedFsOp(op: string, p: string): Promise<Buffer> {
-	const { bin, args } = toolSandboxWrap(toolSandboxPython(), [toolSandboxScriptPath()]);
+/** Bare tool name the sandbox resolves itself, for a loop-side binary path. */
+function toolSandboxRemoteBin(bin: string): string {
+	const name = bin.split("/").pop() ?? bin;
+	if (name === "fdfind") return "fd";
+	if (name.startsWith("python")) return "python";
+	return name;
+}
+
+/**
+ * The one way a file tool starts a process: remote over the kernel's socket, srt-
+ * wrapped when the local sandbox is on, plain otherwise. grep/find call it for
+ * rg/fd; the fs ops below call it for the ops script.
+ */
+export function toolSandboxSpawn(bin: string, args: string[], options: RemoteSpawnOptions = {}): ToolChild {
+	if (remoteToolsActive()) return remoteToolChild(toolSandboxRemoteBin(bin), args, options);
+	const wrapped = toolSandboxWrap(bin, args);
+	return toolSandboxSpawnProcess(wrapped.bin, wrapped.args, {
+		stdio: ["ignore", "pipe", "pipe"],
+		env: { ...toolSandboxChildEnv(), ...options.env },
+	});
+}
+
+function sandboxedFsOp(op: string, p: string, stdin?: Buffer): Promise<Buffer> {
+	// Remote: the script travels inline; there is no loop-side file the sandbox could read.
+	const remote = remoteToolsActive();
+	const bin = remote ? "python" : toolSandboxPython();
+	const args = remote ? ["-c", TOOL_SANDBOX_OPS_PY] : [toolSandboxScriptPath()];
 	return new Promise((resolve, reject) => {
 		const child = toolSandboxSpawn(bin, args, {
-			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...toolSandboxChildEnv(), HARNESS_TOOL_SANDBOX_OP: op, HARNESS_TOOL_SANDBOX_PATH: p },
+			env: { HARNESS_TOOL_SANDBOX_OP: op, HARNESS_TOOL_SANDBOX_PATH: p },
+			stdin,
 		});
 		const out: Buffer[] = [];
 		const err: Buffer[] = [];
@@ -234,10 +278,17 @@ function sandboxedFsOp(op: string, p: string): Promise<Buffer> {
  * semantics inside the sandbox beat a reimplementation outside it. (Its
  * host-side pathExists probes are metadata only.)
  */
-export function toolSandboxOptions(): Record<string, unknown> {
-	if (!toolSandboxActive()) return {};
+export function toolSandboxOptions(cwd?: string, base?: Record<string, unknown>): Record<string, unknown> {
+	const remote = remoteToolsActive();
+	if (!toolSandboxActive() && !remote) return {};
+	if (remote && cwd) registerRemoteLocalCwd(cwd);
+	// Keep the caller's non-ops settings (bash's commandPrefix, for one); only
+	// `operations` is the sandbox's to decide.
+	const keep = (name: string) => (base?.[name] as Record<string, unknown> | undefined) ?? {};
 	return {
+		...(remote ? toolSandboxRemoteOnlyOptions(keep) : {}),
 		read: {
+			...keep("read"),
 			operations: {
 				access: async (p: string) => {
 					await sandboxedFsOp("access", p);
@@ -258,12 +309,14 @@ export function toolSandboxOptions(): Record<string, unknown> {
 			},
 		},
 		grep: {
+			...keep("grep"),
 			operations: {
 				isDirectory: async (p: string) => (await sandboxedFsOp("isdir", p)).toString() === "1",
 				readFile: async (p: string) => (await sandboxedFsOp("readtext", p)).toString(),
 			},
 		},
 		ls: {
+			...keep("ls"),
 			operations: {
 				exists: async (p: string) => (await sandboxedFsOp("exists", p)).toString() === "1",
 				stat: async (p: string) => {
@@ -275,6 +328,71 @@ export function toolSandboxOptions(): Record<string, unknown> {
 					return { isDirectory: () => j.dir, size: j.size, mtimeMs: j.mtimeMs };
 				},
 				readdir: async (p: string) => JSON.parse((await sandboxedFsOp("readdir", p)).toString()) as string[],
+			},
+		},
+	};
+}
+
+/** write/edit/bash, which only route when the kernel is remote (see the header). */
+function toolSandboxRemoteOnlyOptions(keep: (name: string) => Record<string, unknown>): Record<string, unknown> {
+	return {
+		write: {
+			...keep("write"),
+			operations: {
+				writeFile: async (p: string, content: string) => {
+					await sandboxedFsOp("write", p, Buffer.from(content, "utf8"));
+				},
+				mkdir: async (dir: string) => {
+					await sandboxedFsOp("mkdir", dir);
+				},
+			},
+		},
+		edit: {
+			...keep("edit"),
+			operations: {
+				readFile: (p: string) => sandboxedFsOp("read", p),
+				writeFile: async (p: string, content: string) => {
+					await sandboxedFsOp("write", p, Buffer.from(content, "utf8"));
+				},
+				access: async (p: string) => {
+					await sandboxedFsOp("access_rw", p);
+				},
+			},
+		},
+		bash: {
+			...keep("bash"),
+			operations: {
+				exec: (
+					command: string,
+					cwd: string,
+					options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number },
+				) =>
+					new Promise<{ exitCode: number | null }>((resolve, reject) => {
+						const child = remoteToolChild("bash", ["-c", command], { cwd });
+						let timedOut = false;
+						const timer =
+							options.timeout && options.timeout > 0
+								? setTimeout(() => {
+										timedOut = true;
+										child.kill("SIGKILL");
+									}, options.timeout * 1000)
+								: undefined;
+						const onAbort = () => child.kill("SIGKILL");
+						options.signal?.addEventListener("abort", onAbort, { once: true });
+						child.stdout.on("data", options.onData);
+						child.stderr.on("data", options.onData);
+						child.on("error", (error) => {
+							clearTimeout(timer);
+							reject(error);
+						});
+						child.on("close", (code) => {
+							clearTimeout(timer);
+							options.signal?.removeEventListener("abort", onAbort);
+							if (options.signal?.aborted) reject(new Error("aborted"));
+							else if (timedOut) reject(new Error(`timeout:${options.timeout}`));
+							else resolve({ exitCode: code });
+						});
+					}),
 			},
 		},
 	};
