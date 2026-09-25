@@ -10,7 +10,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { generate, pyIdent, pyPackage } from "../generate.mjs";
-import { loadTasks } from "../tasks.mjs";
+import { assertResolvable, runsPerArm } from "../power.mjs";
+import { loadTasks, requireTaskSet } from "../tasks.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const RUN_TASK = readFileSync(join(ROOT, "bench/run-task.mjs"), "utf8");
@@ -87,7 +88,13 @@ describe("both arms receive the same tool catalogue", { skip: haveSchemas ? fals
 		// A tool present to one arm and absent from the other is a capability
 		// difference wearing a token-saving costume.
 		const all = catalogue();
-		for (const task of loadTasks().slice(0, 25)) {
+		requireTaskSet();
+		const tasks = loadTasks().slice(0, 25);
+		// Without this the loop iterates nothing when the task set is absent, and the
+		// arms-carry-the-same-catalogue invariant reports itself as upheld on zero
+		// tasks — a fairness check that cannot fail is not a fairness check.
+		assert.equal(tasks.length, 25, `expected 25 tasks to pair, got ${tasks.length}`);
+		for (const task of tasks) {
 			const selected = all.filter((s) => task.exposedServers.includes(s.server));
 			const { toolDefs, files } = generate(selected);
 			const modules = Object.keys(files).filter(
@@ -476,5 +483,159 @@ describe("the paired analysis carries its own null control", () => {
 		assert.match(source, /\.filter\(\(\[a, b\]\) => have\(\.\.\.a\) && have\(\.\.\.b\)\)/);
 		assert.match(source, /SKIPPED — a cell it needs was not run/);
 		assert.match(source, /interaction: SKIPPED — needs all four corners/);
+	});
+});
+
+describe("a comparison must be able to resolve the effect it claims", () => {
+	// This file already pins "single-sample LLM judging, whose noise matched the
+	// effect being claimed" as a confound. This is the same defect one level up:
+	// a comparison whose RUN-level noise exceeds the effect it reports.
+	//
+	// Measured 2026-08-31, Decomposed bank, GLM 5.2, N=40: seven near-identical
+	// configs span 0.359-0.564 on references_required (range 0.205) because 27 of 39
+	// positions are bistable. Six single-knob variants, one run per arm, produced
+	// -0.083..-0.216 and two p<0.05 — all of it an artifact of one lucky baseline
+	// run (+0.154 vs the pooled mean, 20-6, p=0.0047, leave-one-out).
+	//
+	// Those run-level sds are the fixture: observed on that bank, model and N, so
+	// they live here as test data rather than as a default anyone can borrow.
+	const DECOMPOSED_SD_N40 = { references_required: 0.075, skill_pick: 0.055, references_forbidden: 0.042 };
+
+	it("refuses the design that produced the six phantom rung results", () => {
+		// One run per arm against references_required, which is exactly what was run.
+		assert.throws(
+			() =>
+				assertResolvable({
+					label: "references_required @ n=1",
+					sd: DECOMPOSED_SD_N40.references_required,
+					effect: 0.1,
+					runs: 1,
+				}),
+			/cannot resolve/,
+			"n=1 on the noisiest dimension must be refused, not warned about",
+		);
+	});
+
+	it("names the n it would need, so the refusal is actionable", () => {
+		try {
+			assertResolvable({ label: "x", sd: DECOMPOSED_SD_N40.references_required, effect: 0.1, runs: 1 });
+			assert.fail("should have thrown");
+		} catch (err) {
+			assert.match(err.message, /needs 9\b/, "should name 9 runs/arm for +0.10 on references_required");
+		}
+	});
+
+	it("admits a design that IS powered", () => {
+		// references_forbidden is the cheapest dimension: sd 0.042 -> 2.8 runs/arm
+		// for +0.10, which is why the first properly-powered experiment targets it.
+		assert.doesNotThrow(() =>
+			assertResolvable({
+				label: "references_forbidden @ n=3",
+				sd: DECOMPOSED_SD_N40.references_forbidden,
+				effect: 0.1,
+				runs: 3,
+			}),
+		);
+	});
+
+	it("orders the dimensions by cost, so the cheapest endpoint is visible", () => {
+		const cost = (dim) => runsPerArm({ sd: DECOMPOSED_SD_N40[dim], effect: 0.1 });
+		assert.ok(
+			cost("references_forbidden") < cost("skill_pick") && cost("skill_pick") < cost("references_required"),
+			"references_forbidden < skill_pick < references_required at a fixed effect",
+		);
+	});
+
+	it("refuses an untabulated power level instead of rounding it down", () => {
+		// The first version of runsPerArm used `power >= 0.9 ? z90 : z80`, so
+		// power: 0.85 silently returned the 80% answer and 0.95 the 90% one — it
+		// UNDERSTATED n, the one direction that lets a bad design through the gate
+		// built to stop them. A plausible number and no error, inside the module
+		// written to prevent exactly that.
+		assert.throws(() => runsPerArm({ sd: 1, effect: 1, power: 0.85 }), /not tabulated/);
+		// and the tabulated levels are strictly increasing in n
+		const n80 = runsPerArm({ sd: 1, effect: 1, power: 0.8 });
+		const n90 = runsPerArm({ sd: 1, effect: 1, power: 0.9 });
+		const n95 = runsPerArm({ sd: 1, effect: 1, power: 0.95 });
+		assert.ok(n80 < n90 && n90 < n95, `not monotone: ${n80} ${n90} ${n95}`);
+		// textbook anchors, so a future edit to the quantiles is caught
+		assert.ok(Math.abs(n80 - 15.7) < 0.05, `80% power should need 15.7, got ${n80}`);
+		assert.ok(Math.abs(n90 - 21.0) < 0.05, `90% power should need 21.0, got ${n90}`);
+	});
+
+	it("scales as 1/effect^2, so halving the effect quadruples the runs", () => {
+		const a = runsPerArm({ sd: 0.075, effect: 0.1 });
+		const b = runsPerArm({ sd: 0.075, effect: 0.05 });
+		assert.ok(Math.abs(b / a - 4) < 0.001, `expected 4x, got ${(b / a).toFixed(3)}`);
+	});
+});
+
+describe("subagents are symmetric across the arms, or absent from both", () => {
+	// DESIGN.md section Subagents: "Required in both arms, sharing one
+	// implementation, so only the invocation surface differs" — vanilla gets
+	// task(prompt), codemode gets spawn(prompt, name=...). That prose did not
+	// prevent the asymmetry it forbids, which is why it is a test now.
+	//
+	// FOUND 2026-09-01: prime's native rlm.run()
+	// is live in the codemode arm and was never neutralised —
+	// scripts/neutralize-prime.mjs contains ZERO mentions of rlm, though DESIGN.md
+	// says our implementation "Replaces prime's rlm.run()". Two product/GLM jobs
+	// reached it by introspecting the runtime (dir(), inspect.getsource()) and
+	// spawned children on anthropic/claude-haiku-4-5 — a DIFFERENT MODEL than the
+	// arm under test, while stock/vanilla has no subagent surface at all.
+	//
+	// These are marked `todo` because the fix is a posture DECISION, not a bug:
+	// either neutralise rlm.run, or adopt it and pin the child model to the
+	// parent's. Both are legitimate; picking one changes what the arm IS and so
+	// splits the corpus. The tests exist now so the invariant is executable the
+	// moment the posture is chosen, and so it cannot quietly regress afterwards.
+
+	const NEUTRALIZE = join(ROOT, "scripts/neutralize-prime.mjs");
+	const haveNeutralize = existsSync(NEUTRALIZE);
+
+	it("prime's native rlm.run is neutralised, per DESIGN.md's \"replaces\"",
+		{ todo: "posture undecided — see the FOUND note above" },
+		() => {
+			// Keys on the MECHANISM, not on a mention. An earlier version asserted
+			// neutralize-prime.mjs matched /\brlm\b/, which a comment reading "we
+			// deliberately do not neutralise rlm" would satisfy — a proxy, and exactly
+			// what CLAUDE.md forbids ("assert on the observable effect"). The prelude's
+			// _GUARDS table is how os.posix_spawn and pty.spawn are shadowed; an entry
+			// there is what actually makes rlm.run unreachable from a cell.
+			const prelude = readFileSync(join(ROOT, "runtime/kernel-prelude.py"), "utf8");
+			assert.match(prelude, /\(\s*"rlm"\s*,\s*"run"/, "no _GUARDS entry for rlm.run");
+		});
+
+	it("the vanilla arm has a matched subagent surface",
+		{ todo: "vanilla task() not built — see the FOUND note above" },
+		() => {
+			// Any of the arm extensions must register a subagent tool, whatever it
+			// is named, or codemode's spawn is a capability the other arm lacks.
+			const arms = ["bash-tool-extension.ts", "mcp-tools-extension.ts", "read-ledger-extension.ts"]
+				.map((f) => join(ROOT, "bench/arms", f))
+				.filter((f) => existsSync(f))
+				.map((f) => readFileSync(f, "utf8"))
+				.join("\n");
+			assert.match(arms, /name: ["'](task|spawn|subagent)["']/,
+				"no subagent tool registered for vanilla");
+		});
+
+	it("our own spawn path REFUSES an unstated child model rather than defaulting", () => {
+		// NOT a todo: this already holds, and the test exists to keep it holding.
+		//
+		// An earlier version asserted runtime/subagents.py contains no
+		// "claude-haiku-4-5" — vacuously true (0 occurrences), so it would have
+		// PASSED while the actual bug stood. The haiku default is prime's rlm
+		// default, not ours; that file was never the right place to look.
+		//
+		// What our code does is correct and worth pinning: resolve_model RAISES when
+		// no model is stated, because "defaulting to a hard-coded model would
+		// silently confound every cost comparison the moment the parent is run on
+		// anything else".
+		const sub = join(ROOT, "runtime/subagents.py");
+		if (!existsSync(sub)) return;
+		const src = readFileSync(sub, "utf8");
+		assert.match(src, /def resolve_model/, "resolve_model is gone");
+		assert.match(src, /no model for the subagent/, "resolve_model no longer refuses an unstated model");
 	});
 });

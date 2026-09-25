@@ -723,6 +723,68 @@ deduplicated behind the agent's back. The fix is affordance-side — make "what 
 already hold?" cheap and habitual (a `%whos`-first nudge; a fetched-collection registry
 the agent writes to deliberately). High value, and the cost is a prompt experiment.
 
+#### Measurement design for that experiment, added 2026-09-01
+
+"The cost is a prompt experiment" understates it, and the endpoint has to be chosen
+before running. Computed with `bench/power.mjs` conventions (80% power, two-sided):
+
+**Option A — mean duplicates per task. REJECTED, and not by computing n.** Mean
+38.4 with a worst task of **1,853**: one task is 48x the mean, so the sample mean
+is mostly a property of whether that task landed in the sample. It is not an
+endpoint. This is the trap that produced six phantom results on the Decomposed
+bank (`a private write-up` §3b) — an effect quoted against noise
+wider than itself.
+
+**Option B — binary per task: "exceeded 20 duplicate calls?"** Converts the skewed
+count into a proportion with bounded variance.
+
+| base rate | reduction | tasks/arm |
+|---|---|---|
+| 50% | 50% | 58 |
+| 50% | 35% | 123 |
+| 40% | 50% | 81 |
+| 30% | 50% | 121 |
+| 30% | 35% | 264 |
+
+**Option C — paired per task, sign test on duplicate counts.** Same tasks both
+arms; robust to the skew because it ranks rather than averages.
+
+| discordant split favouring the nudge | discordant pairs needed |
+|---|---|
+| 75% | 29 |
+| 70% | 47 |
+| 65% | 85 |
+
+**Take C** — cheapest, and the only one that survives the distribution's shape.
+It is also the design that worked for the guard-fix turn result (W11 §1b): paired
+per item against two baseline runs, sign test governing, with a work-done control
+beside it so "fewer calls" cannot be a regression wearing a win's clothes — here
+that control is **task success**, since an arm that stops early also stops
+duplicating.
+
+**But the suite is smaller than it looks, and this bounds what C can detect.** An
+earlier version of this note said "the 110-task suite can supply ~50 discordant
+pairs". That is wrong twice over. The duplicate problem lives in the **enriched
+slice (n=50)** — 38.4/task, 31.9% of calls — while the unbiased slice (n=60) sits
+at 1.5/task and 4.1%, i.e. there is essentially nothing there to reduce. So the
+experiment runs on **50 tasks, not 110**.
+
+Assuming discordance similar to the guard-fix comparison (33 of 34 pairs
+discordant), 50 tasks yields roughly 48 discordant pairs:
+
+| nudge produces | pairs needed | 50 enriched tasks enough? |
+|---|---|---|
+| 75% split | 29 | yes, comfortably |
+| 70% split | 47 | **only just** |
+| 65% split | 85 | **no — needs ~88 enriched tasks** |
+
+So C is adequate **only if the nudge is strong**. If it produces a 65% split the
+enriched slice must grow to ~88 tasks before the experiment can see it, and
+running at n=50 anyway would produce a null that means "underpowered", not "no
+effect". Decide which case is being tested before spending — the discordance
+figure is borrowed from a different bank and should be measured on the first few
+tasks rather than assumed.
+
 ### 7. Where we are ahead of cc
 
 Honest in both directions:

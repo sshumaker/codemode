@@ -264,10 +264,79 @@ const SCORE_KEYS = [
 	"parallelism_and_efficiency",
 ];
 
+/**
+ * A run that did not finish has no answer to judge.
+ *
+ * Measured 2026-08-31: 30 timed-out runs were scored as if they had answered, and
+ * they land at a mean 3.61 against 6.26 for completed runs — a −2.35 within-task
+ * penalty, lower in 10 of 10 tasks. The judge is not wrong about them: fulfilment
+ * and grounding SHOULD floor when the deliverable is absent. The harness is wrong to
+ * hand it a decapitated run. `finalText` proves the absence — a fragment or empty in
+ * 29 of 31 timed-out runs against 26 of 946 completed, a 34x rate difference, with
+ * survivors reading "Now the conferences." and "so I'll pivot to recent clinical
+ * trial literature."
+ *
+ * The penalty is NOT arm-neutral: it concentrates in the arm that takes more turns,
+ * so it biases arm comparison against codemode.
+ *
+ * There was no gating here to make symmetric. `budget` (23) and `refused` (4) runs
+ * happen to carry no judge, but so do 138 COMPLETED runs — because those sweeps ran
+ * without `--judge`, not because anything excluded them. The exclusion had to be
+ * added, not repaired.
+ *
+ * Deliberately not fixed by raising the deadline: the deadline is legitimate cost
+ * control, and scoring a killed run is the defect. Raising it converts a scoring
+ * error into a spend increase and leaves the defect in place.
+ */
+const SCORABLE_STOP_REASON = "completed";
+
+function sessionDiedAtCompaction(dir) {
+	const sessions = join(dir, "agent-home", "sessions");
+	if (!existsSync(sessions)) return false;
+	for (const f of readdirSync(sessions)) {
+		if (!f.endsWith(".jsonl")) continue;
+		let last;
+		try {
+			const lines = readFileSync(join(sessions, f), "utf8").split("\n");
+			for (let i = lines.length - 1; i >= 0; i--) {
+				const l = lines[i].trim();
+				if (!l.startsWith("{")) continue;
+				last = JSON.parse(l);
+				break;
+			}
+		} catch {
+			continue;
+		}
+		if (last?.type === "compaction") return true;
+		if (last?.type === "custom_message" && String(last.content ?? "").includes("too short to compact")) return true;
+	}
+	return false;
+}
+
 async function judgeRun(dir) {
 	const resultPath = join(dir, "result.json");
 	const run = JSON.parse(readFileSync(resultPath, "utf8"));
 	if (run.judge && !force) return { ...run, skipped: true };
+
+	const stopReason = run.summary?.stopReason;
+	if (stopReason && stopReason !== SCORABLE_STOP_REASON) {
+		// Recorded rather than silently dropped, so the count is visible in the run
+		// record and a later reader can tell "not scored" from "scored zero".
+		return { ...run, unscorable: { reason: stopReason, finalTextChars: (run.summary?.finalText ?? "").length } };
+	}
+
+	// Same defect class as the timeout fix above, one layer deeper: a run whose
+	// next request could not be built (one oversized tool result overflowed the
+	// window; compaction either skipped -- turn-boundary cuts cannot discard a
+	// result inside the FINAL turn -- or ran and the continuation still died)
+	// exits 0 with stopReason "completed", and the judge then scores a stump.
+	// 22+1 such runs found 2026-09-01, every one vanilla, all openapi_explorer /
+	// hugging_face family. The session-side signature: the LAST session event is
+	// a compaction entry or the "too short to compact" skip message — a session
+	// that survived either is always followed by more messages.
+	if (sessionDiedAtCompaction(dir)) {
+		return { ...run, unscorable: { reason: "died-mid-turn (oversized result; compaction could not rescue; exit recorded completed)", finalTextChars: (run.summary?.finalText ?? "").length } };
+	}
 
 	const task = findTask(run.task.id);
 	const calls = trajectory(run.runId);
@@ -294,6 +363,16 @@ async function judgeRun(dir) {
 		samples.length > 1
 			? Math.sqrt(samples.reduce((a, b) => a + (b - overall) ** 2, 0) / (samples.length - 1))
 			: 0;
+
+	// Log the inputs, not just the verdicts (CLAUDE.md): a deterministic-looking
+	// judge disagreed 3.67 vs 6.56 across arms on near-identical evidence
+	// (huge_icons_000, triage 2026-09-01) and nothing on disk could say why,
+	// because neither the assembled prompt nor any rationale was kept. With this
+	// file the verdict is re-derivable tomorrow, after the corpus moves on.
+	writeFileSync(
+		join(dir, "judge-trace.json"),
+		`${JSON.stringify({ model: judgeModel, at: new Date().toISOString(), prompt, samples: raw }, null, 2)}\n`,
+	);
 
 	run.judge = {
 		model: judgeModel,
