@@ -6,6 +6,7 @@ import { after, before, describe, it } from "node:test";
 import { DIST, startFakeServer } from "./fake-server.mjs";
 
 const { RemoteKernelLink } = await import(`${DIST}/core/kernel/remote/link.js`);
+const { RemoteKernelPendingError } = await import(`${DIST}/core/kernel/remote/config.js`);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -109,6 +110,34 @@ describe("remote kernel link", () => {
 		await link.ping();
 		assert.equal(link.state, "open");
 		await link.close({ bye: true });
+	});
+
+	it("waits while the connect info is pending, without spending connect attempts, then connects", async () => {
+		let pendingUntil = Date.now() + 1200;
+		const link = new RemoteKernelLink({
+			connection: () => {
+				if (Date.now() < pendingUntil) throw new RemoteKernelPendingError("still starting");
+				return { url: srv.url, token: srv.token };
+			},
+			pingIntervalMs: 200,
+			deadAfterMs: 1500,
+			connectTimeoutMs: 3000,
+		});
+		const t0 = Date.now();
+		await link.ping();
+		assert.equal(link.state, "open");
+		assert.ok(Date.now() - t0 >= 1100, "it waited for the file");
+		assert.ok(Date.now() - t0 < 2500, "and connected promptly once it was filled in");
+		await link.close({ bye: true });
+		pendingUntil = Infinity;
+		const stuck = new RemoteKernelLink({
+			connection: () => {
+				throw new RemoteKernelPendingError("still starting");
+			},
+			pendingWaitMs: 300,
+		});
+		await assert.rejects(stuck.ping(), /sandbox unreachable \(still starting\)/);
+		await stuck.close();
 	});
 
 	it("bye disposes the session on the server at once", async () => {

@@ -997,6 +997,30 @@ sub(
 	"?? harnessDisplayImage(c.data)",
 );
 
+// --- thinking display: summarized holds thinking back until it ends -----------
+//
+// Anthropic's "summarized" display sends the thinking summary only once the
+// thinking block is over, so the first streamed byte of a turn that thinks lands
+// seconds after the model started (Sonnet 5, effort medium: 5.45 s vs 1.7 s
+// omitted). A caller that shows "thinking" rather than the thoughts opts into
+// "omitted" with HARNESS_THINKING_DISPLAY; unset keeps upstream's default.
+log("\nthinking display:");
+const AI_ANTHROPIC = "../../ai/src/providers/anthropic.ts";
+sub(
+	AI_ANTHROPIC,
+	'export type AnthropicThinkingDisplay = "summarized" | "omitted";',
+	`export type AnthropicThinkingDisplay = "summarized" | "omitted";\n\n${patch("thinking-display.ts")}`,
+	"HARNESS_THINKING_DISPLAY helper",
+	"function harnessThinkingDisplay",
+);
+sub(
+	AI_ANTHROPIC,
+	'const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? "summarized";',
+	'const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? harnessThinkingDisplay() ?? "summarized";',
+	"thinking display defaults to HARNESS_THINKING_DISPLAY",
+	"?? harnessThinkingDisplay() ??",
+);
+
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.
  *
@@ -1046,7 +1070,8 @@ function assertPatchesInSync() {
 /** Every .ts under the vendored source tree. */
 function walkPrime() {
 	const out = [];
-	const stack = [join(PRIME)];
+	// The ai package too: the thinking-display patch lives in its anthropic provider.
+	const stack = [join(PRIME), join(PRIME, "../../ai/src")];
 	while (stack.length) {
 		for (const e of readdirSync(stack.pop(), { withFileTypes: true })) {
 			const full = join(e.parentPath ?? e.path, e.name);

@@ -10,7 +10,14 @@
  *   HARNESS_REMOTE_KERNEL_CONNECT_FILE  JSON {url, token, headers}; re-read on every
  *                                       (re)connect and wins over the three above, so
  *                                       a restarted sandbox's new preview token reaches
- *                                       a running loop without restarting it
+ *                                       a running loop without restarting it.
+ *                                       {"pending": true} means the launcher is still
+ *                                       bringing the sandbox up: a connect waits for the
+ *                                       real contents instead of failing, so the loop can
+ *                                       start (and the model can think) in parallel.
+ *                                       {"error": "..."} fails the connect with that text
+ *   HARNESS_REMOTE_KERNEL_PENDING_WAIT_MS  how long a connect waits on a pending file
+ *                                       (default 180 s)
  *   HARNESS_REMOTE_KERNEL_CWD           the kernel's working directory in the sandbox
  *   HARNESS_REMOTE_KERNEL_PATH_MAP      JSON [{local, remote}] for trees the gateway
  *                                       uploaded (api/, skills/); the loop cwd -> the
@@ -38,8 +45,17 @@ export interface RemoteKernelConnection {
 	headers?: Record<string, string>;
 }
 
+/** The connect file says the sandbox is still coming up: try again shortly, do not fail. */
+export class RemoteKernelPendingError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RemoteKernelPendingError";
+	}
+}
+
 export interface RemoteKernelConfig {
 	connection: () => RemoteKernelConnection;
+	pendingWaitMs: number;
 	remoteCwd?: string;
 	pathMap: PathMapping[];
 	graceMs: number;
@@ -70,7 +86,13 @@ function parseJson<T>(name: string, text: string | undefined, fallback: T): T {
 function connectionFromEnv(env: NodeJS.ProcessEnv): RemoteKernelConnection {
 	const file = env.HARNESS_REMOTE_KERNEL_CONNECT_FILE;
 	if (file) {
-		const fromFile = parseJson<Partial<RemoteKernelConnection>>(file, readFileSync(file, "utf8"), {});
+		const fromFile = parseJson<Partial<RemoteKernelConnection> & { pending?: boolean; error?: string }>(
+			file,
+			readFileSync(file, "utf8"),
+			{},
+		);
+		if (fromFile.pending) throw new RemoteKernelPendingError(`${file}: the sandbox is still starting`);
+		if (fromFile.error) throw new Error(`the sandbox could not start (${fromFile.error})`);
 		if (!fromFile.url) throw new Error(`${file} has no url`);
 		return { url: toWebSocketUrl(fromFile.url), token: fromFile.token, headers: fromFile.headers };
 	}
@@ -92,6 +114,7 @@ export function remoteKernelConfigFromEnv(env: NodeJS.ProcessEnv = process.env):
 	const pathMap = parseJson<PathMapping[]>("HARNESS_REMOTE_KERNEL_PATH_MAP", env.HARNESS_REMOTE_KERNEL_PATH_MAP, []);
 	return {
 		connection: () => connectionFromEnv(env),
+		pendingWaitMs: Number(env.HARNESS_REMOTE_KERNEL_PENDING_WAIT_MS ?? 180_000),
 		remoteCwd: env.HARNESS_REMOTE_KERNEL_CWD || undefined,
 		pathMap,
 		graceMs: Number(env.HARNESS_REMOTE_KERNEL_GRACE_MS ?? 4 * 60_000),

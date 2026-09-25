@@ -24,7 +24,7 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import { ReliableChannel } from "./channel.js";
-import type { RemoteKernelConnection } from "./config.js";
+import { type RemoteKernelConnection, RemoteKernelPendingError } from "./config.js";
 import {
 	type ClientMessage,
 	type ControlFrame,
@@ -67,6 +67,8 @@ export interface RemoteKernelLinkOptions {
 	pingIntervalMs?: number;
 	deadAfterMs?: number;
 	connectTimeoutMs?: number;
+	/** How long a connect keeps polling while connection() says the sandbox is pending. */
+	pendingWaitMs?: number;
 	/** Replaces the ws client, for tests that need to cut or stall the socket. */
 	socketFactory?: (url: string, headers: Record<string, string>) => WebSocket;
 	log?: (line: string) => void;
@@ -85,6 +87,7 @@ export class RemoteKernelError extends Error {
 }
 
 const BACKOFF_MS = [100, 250, 500, 1000, 2000, 4000, 5000];
+const PENDING_POLL_MS = 50;
 
 export class RemoteKernelLink {
 	private readonly options: Required<Omit<RemoteKernelLinkOptions, "socketFactory" | "log">> &
@@ -105,6 +108,8 @@ export class RemoteKernelLink {
 	private attempt = 0;
 	private retryTimer?: ReturnType<typeof setTimeout>;
 	private everOpened = false;
+	/** When connection() first said "pending" in the current wait, 0 when not waiting. */
+	private pendingSince = 0;
 	/** Kernels (and other long-lived users) that want the session kept alive. */
 	private holders = 0;
 	handlers: LinkHandlers = {};
@@ -119,6 +124,7 @@ export class RemoteKernelLink {
 			pingIntervalMs: 10_000,
 			deadAfterMs: 30_000,
 			connectTimeoutMs: 20_000,
+			pendingWaitMs: 180_000,
 			...options,
 		};
 		this.channel = this.newChannel();
@@ -183,9 +189,12 @@ export class RemoteKernelLink {
 		try {
 			connection = this.options.connection();
 		} catch (error) {
+			if (error instanceof RemoteKernelPendingError && this.waitForPending()) return;
+			this.pendingSince = 0;
 			this.onConnectFailed(error as Error);
 			return;
 		}
+		this.pendingSince = 0;
 		const headers = connection.headers ?? {};
 		const ws = this.options.socketFactory
 			? this.options.socketFactory(connection.url, headers)
@@ -299,6 +308,21 @@ export class RemoteKernelLink {
 			: `sandbox unreachable (${error.message})`;
 		if (lost) this.loseSession(reason);
 		this.fail(new RemoteKernelError("session_lost", `Kernel exited: remote ${reason}`));
+	}
+
+	/**
+	 * The launcher is still bringing the sandbox up: poll connection() without spending a
+	 * connect attempt, until it answers or pendingWaitMs runs out. False when out of time.
+	 */
+	private waitForPending(): boolean {
+		if (this._state === "closed") return false;
+		if (!this.pendingSince) {
+			this.pendingSince = Date.now();
+			this.log("waiting for the sandbox to come up");
+		}
+		if (Date.now() - this.pendingSince > this.options.pendingWaitMs) return false;
+		this.retryTimer = setTimeout(() => this.connectOnce(), PENDING_POLL_MS);
+		return true;
 	}
 
 	private scheduleRetry(): void {

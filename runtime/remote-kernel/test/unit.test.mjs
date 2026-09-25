@@ -13,7 +13,9 @@ const { ReliableChannel } = await import(`${R}/channel.js`);
 const { RemotePathMap } = await import(`${R}/pathmap.js`);
 const server = await import(`${R}/server.js`);
 const { hashSkillPackage, placeSkills, remoteSkill } = await import(`${R}/skills.js`);
-const { forwardedKernelEnv, remoteKernelConfigFromEnv, toWebSocketUrl } = await import(`${R}/config.js`);
+const { forwardedKernelEnv, remoteKernelConfigFromEnv, RemoteKernelPendingError, toWebSocketUrl } = await import(
+	`${R}/config.js`
+);
 const { KernelBusyAfterInterruptError } = await import(`${DIST}/core/kernel/index.js`);
 
 describe("protocol codec", () => {
@@ -196,6 +198,54 @@ describe("config", () => {
 		const env = remoteKernelConfigFromEnv({ HARNESS_REMOTE_KERNEL_URL: "http://h:1", HARNESS_REMOTE_KERNEL_PREVIEW_TOKEN: "p" });
 		assert.deepEqual(env.connection().headers, { "x-daytona-preview-token": "p" });
 		assert.equal(toWebSocketUrl("https://a"), "wss://a");
+	});
+
+	it("a pending connect file asks the caller to wait; an error file fails with its text", () => {
+		const dir = mkdtempSync(join(tmpdir(), "rk-cfg-"));
+		const file = join(dir, "connect.json");
+		writeFileSync(file, JSON.stringify({ pending: true }));
+		const cfg = remoteKernelConfigFromEnv({ HARNESS_REMOTE_KERNEL_CONNECT_FILE: file });
+		assert.equal(cfg.pendingWaitMs, 180_000);
+		assert.throws(() => cfg.connection(), (e) => e instanceof RemoteKernelPendingError);
+		writeFileSync(file, JSON.stringify({ error: "no capacity" }));
+		assert.throws(
+			() => cfg.connection(),
+			(e) => !(e instanceof RemoteKernelPendingError) && /could not start \(no capacity\)/.test(e.message),
+		);
+		writeFileSync(file, JSON.stringify({ url: "https://h", token: "t" }));
+		assert.equal(cfg.connection().url, "wss://h");
+	});
+});
+
+describe("daytona provider verify", () => {
+	it("asks the server's /healthz through the preview proxy with the preview header, and checks version and egress", async () => {
+		const { createServer } = await import("node:http");
+		const { DaytonaKernelProvider } = await import("../../daytona/provider.mjs");
+		let health = { ok: true, version: "v1", posture: { egress: "blocked" } };
+		let seen;
+		const srv = createServer((req, res) => {
+			seen = { url: req.url, preview: req.headers["x-daytona-preview-token"] };
+			if (req.headers["x-daytona-preview-token"] !== "pt") {
+				res.writeHead(401).end();
+				return;
+			}
+			res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(health));
+		});
+		await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+		const url = `ws://127.0.0.1:${srv.address().port}`;
+		const p = new DaytonaKernelProvider({ daytona: {} });
+		const info = { url, headers: { "x-daytona-preview-token": "pt" }, version: "v1" };
+		try {
+			assert.equal((await p.verify(info))?.version, "v1");
+			assert.deepEqual(seen, { url: "/healthz", preview: "pt" });
+			assert.equal(await p.verify({ ...info, headers: { "x-daytona-preview-token": "stale" } }), undefined, "a stale preview token");
+			assert.equal(await p.verify({ ...info, version: "v2" }), undefined, "another bundle");
+			health = { ...health, posture: { egress: "open" } };
+			assert.equal(await p.verify(info), undefined, "egress not locked");
+		} finally {
+			srv.close();
+		}
+		assert.equal(await p.verify(info, { timeoutMs: 500 }), undefined, "down");
 	});
 });
 

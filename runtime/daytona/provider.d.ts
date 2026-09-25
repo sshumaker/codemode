@@ -78,6 +78,11 @@ export declare class DaytonaKernelProvider {
 	/** Dispose the Daytona client; call on shutdown. */
 	close(): Promise<void>;
 	ensure(conversationId: string, opts?: { mounts?: Mount[] }): Promise<KernelConnectionInfo>;
+	/**
+	 * The server `info` describes answers /healthz through the preview proxy, on the same
+	 * bundle version, with egress blocked. Undefined otherwise (then call ensure()).
+	 */
+	verify(info: KernelConnectionInfo, opts?: { timeoutMs?: number }): Promise<{ ok: true; version: string; posture: ServerPosture } | undefined>;
 	/** Record that a sandbox was just relabelled to this conversation, so find() fetches it by id. */
 	bind(conversationId: string, sandboxId: string): void;
 	stop(conversationId: string): Promise<{ stopped: boolean; sandboxId?: string; state?: string }>;

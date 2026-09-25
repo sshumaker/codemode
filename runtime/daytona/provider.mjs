@@ -243,6 +243,30 @@ export class DaytonaKernelProvider {
 		};
 	}
 
+	/**
+	 * Is the kernel server `info` describes up, on the same bundle, with egress locked?
+	 * Asked from outside, through the preview proxy: one HTTPS round trip, no sandbox
+	 * command. A warm pool uses it at claim time instead of a full ensure(), which
+	 * re-runs every setup step (lock check, server health from inside, one probe per
+	 * mount) and measured 1.5-8 s on a sandbox that was already ready. Resolves to the
+	 * server's health, or undefined for anything else (down, a restarted sandbox's
+	 * new preview token, a timeout): the caller then falls back to ensure().
+	 * @param {import("./provider.d.ts").KernelConnectionInfo} info
+	 */
+	async verify(info, { timeoutMs = 5000 } = {}) {
+		try {
+			const res = await fetch(`${info.url.replace(/^ws/, "http")}/healthz`, {
+				headers: info.headers ?? {},
+				signal: AbortSignal.timeout(timeoutMs),
+			});
+			if (!res.ok) return undefined;
+			const health = await res.json();
+			return health?.ok && health.version === info.version && health.posture?.egress === "blocked" ? health : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/** Wait out a transition (someone else is stopping or starting it) before acting. */
 	async settled(sb, timeoutMs = 180_000) {
 		const moving = new Set(["stopping", "starting", "creating", "restoring", "pulling_snapshot", "building_snapshot"]);

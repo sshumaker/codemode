@@ -48,6 +48,7 @@ export function remoteRuntime(): RemoteRuntime {
 		graceMs: config.graceMs,
 		pingIntervalMs: config.pingIntervalMs,
 		deadAfterMs: config.deadAfterMs,
+		pendingWaitMs: config.pendingWaitMs,
 		log: process.env.HARNESS_REMOTE_KERNEL_DEBUG === "1" ? (line) => process.stderr.write(`${line}\n`) : undefined,
 	});
 	link.handlers.hostRequest = dispatchHostRequest;
