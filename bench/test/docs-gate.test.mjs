@@ -395,7 +395,10 @@ describe("pyType: schema information must survive into the signature", () => {
 		});
 		const by = Object.fromEntries(t.params.map((p) => [p.name, p.type]));
 		assert.equal(by.status, 'Literal["success", "fail"]');
-		assert.equal(by.ids, "list[int]");
+		// The strict form still leads; `| int` is the T2 adapter widening an
+		// array-of-scalars parameter, and the point of this assertion — that `items`
+		// survives into the signature rather than collapsing to `list` — is unchanged.
+		assert.equal(by.ids, "list[int] | int");
 	});
 
 	it("additionalProperties makes a typed map, not a bare dict", () => {

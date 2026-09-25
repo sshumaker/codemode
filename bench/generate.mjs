@@ -14,6 +14,7 @@
  *
  * See docs/DESIGN.md.
  */
+import { isNestedShape, paramAdapter, paramExample } from "./pythonic-args.mjs";
 
 /** JSON Schema type -> Python type hint. */
 const PY_TYPES = {
@@ -154,24 +155,89 @@ function pyType(schema) {
 	return PY_TYPES[schema.type] ?? "Any";
 }
 
+/**
+ * The signature type for a parameter the T1 adapter widens.
+ *
+ * The strict form stays first, because it is the one the schema declares and the
+ * one the server sees; the two accepted alternatives follow. `list[dict[str, str]]`
+ * rather than the bare `list[dict]` pyType would emit whenever every property is
+ * a string — the item shape is the thing the model was getting wrong, so erasing
+ * it from the signature is the last place to save characters.
+ */
+function adaptedType(schema, adapter) {
+	if (adapter.kind === "singleton") {
+		// `list[str] | str`, not `Any`: the strict form stays first and the ONE extra
+		// shape is named, so the signature still says what the server wants.
+		return `${pyType(schema)} | ${PY_TYPES[adapter.itemType] ?? "Any"}`;
+	}
+	const strict = adapter.allStrings ? "list[dict[str, str]]" : pyType(schema);
+	return `${strict} | list[str] | dict[str, str]`;
+}
+
+/** The `_client` helper a parameter's adapter is coerced by, and its arguments. */
+function coercion(param) {
+	const { adapter, pyName } = param;
+	if (adapter.kind === "singleton") {
+		return { helper: "as_list", call: `_as_list(${pyName}, ${JSON.stringify(adapter.itemType)})` };
+	}
+	return {
+		helper: "labeled_ids",
+		call:
+			`_labeled_ids(${pyName}, ${JSON.stringify(adapter.labelKey)},` +
+			` ${JSON.stringify(adapter.idKey)}, ${JSON.stringify(adapter.stem)})`,
+	};
+}
+
+/** The import alias each helper is called through, in a stable order. */
+const HELPER_IMPORTS = {
+	labeled_ids: "labeled_ids as _labeled_ids",
+	as_list: "as_list as _as_list",
+	wait_bridge: "wait_bridge as _wait_bridge",
+};
+
+/** `call as _call` plus whatever coercion helpers these tools actually use. */
+function clientImport(tools, from, waitBridge = false) {
+	const helpers = new Set();
+	for (const tool of tools) for (const p of tool.params) if (p.adapter) helpers.add(coercion(p).helper);
+	if (waitBridge && tools.some((t) => waitToolParam(t))) helpers.add("wait_bridge");
+	const extra = Object.keys(HELPER_IMPORTS)
+		.filter((h) => helpers.has(h))
+		.map((h) => HELPER_IMPORTS[h]);
+	return `from ${from} import ${["call as _call", ...extra].join(", ")}`;
+}
+
 /** Normalize one MCP tool into the shape every renderer consumes. */
 export function normalizeTool(tool) {
 	const schema = tool.inputSchema ?? tool.input_schema ?? { type: "object", properties: {} };
 	const properties = schema.properties ?? {};
 	const required = new Set(schema.required ?? []);
 
-	const params = Object.entries(properties).map(([name, spec]) => ({
-		name,
-		pyName: pyIdent(name),
-		required: required.has(name),
-		type: pyType(spec),
-		description: (spec?.description ?? "").trim(),
-		// The server-side default, surfaced in the docstring. Vanilla's tool defs
-		// carry it in the raw schema; dropping it here made 363 AppWorld defaults
-		// visible to one arm and invisible to the other — an asymmetry against
-		// the fairness invariant (2026-08-15 review, P1.5).
-		serverDefault: spec !== null && typeof spec === "object" && "default" in spec ? spec.default : undefined,
-	}));
+	const params = Object.entries(properties).map(([name, spec]) => {
+		// Schema-shape-driven, computed once, here — so the signature, the docstring,
+		// the INDEX line, the resident L4 docs and the validator's example table are
+		// all rendered from one decision about one parameter and cannot disagree
+		// about what shape it accepts.
+		const adapter = paramAdapter(spec, name);
+		return {
+			name,
+			pyName: pyIdent(name),
+			required: required.has(name),
+			type: adapter ? adaptedType(spec, adapter) : pyType(spec),
+			description: (spec?.description ?? "").trim(),
+			// The coercion this parameter accepts, if any: `{labelKey, idKey, stem}`.
+			adapter,
+			// A literal of the right shape, for the error channel. Every container gets
+			// one; only a container OF containers (`nested`) is worth the characters in
+			// an INDEX line or a docstring.
+			example: paramExample(spec, name),
+			nested: isNestedShape(spec),
+			// The server-side default, surfaced in the docstring. Vanilla's tool defs
+			// carry it in the raw schema; dropping it here made 363 AppWorld defaults
+			// visible to one arm and invisible to the other — an asymmetry against
+			// the fairness invariant (2026-08-15 review, P1.5).
+			serverDefault: spec !== null && typeof spec === "object" && "default" in spec ? spec.default : undefined,
+		};
+	});
 
 	// Two wire names can normalize to one identifier (`page-index` and
 	// `page_index`): the second becomes `page_index_2` instead of a SyntaxError
@@ -191,6 +257,10 @@ export function normalizeTool(tool) {
 		name: tool.name,
 		pyName: pyIdent(tool.name),
 		description: (tool.description ?? "").trim(),
+		// Optional, and optional per TOOL rather than per server: the registry knows
+		// which of its actions are image work and which are video work, and a
+		// catalogue that does not say simply groups as it always did.
+		category: String(tool.category ?? "").trim(),
 		schema,
 		params,
 	};
@@ -236,6 +306,66 @@ export function serverDefaultNote(param) {
 	// escape DISPLAYED — seen in a live trace as `Server-side default: "success\".`
 	const safe = literal.replace(/\\/g, "\\\\").replace(/"""/g, '\\"\\"\\"');
 	return `Server-side default: ${safe}.`;
+}
+
+/**
+ * The T1 adapter's accepted alternatives, as one docstring line — or null.
+ *
+ * Stated in the docstring rather than only in the widened type hint because the
+ * generated labels are the part a type cannot express: a caller handing over bare
+ * ids is agreeing to labels it did not choose, and it should be able to see what
+ * they will be before the judge's output comes back naming `asset_2`.
+ */
+export function adapterNote(param) {
+	if (!param?.adapter) return null;
+	const adapter = param.adapter;
+	if (adapter.kind === "singleton") {
+		// Short on purpose: this note lands on 23 AppWorld parameters and 23 product
+		// ones, so a sentence is a per-parameter tax across the whole tree.
+		return `Also accepts a single ${PY_TYPES[adapter.itemType] ?? "value"}, wrapped as a one-item list.`;
+	}
+	const { labelKey, idKey, stem } = adapter;
+	return (
+		`Also accepts a plain list of ${idKey} strings — labels are generated` +
+		` ('${stem}_1', '${stem}_2', ...) — or a {${labelKey}: ${idKey}} dict.`
+	);
+}
+
+/**
+ * One literal example of a nested parameter, as a docstring line — or null.
+ *
+ * Only for a container OF containers, and only where an example could be derived
+ * from the schema. The flat parameters in the measured traces never failed, and a
+ * docstring that exemplifies `page_index=1` spends characters teaching nothing.
+ */
+/**
+ * The one sentence a wait-bridged tool's docstring gains — or null.
+ *
+ * Scott-ordered, and it teaches the affordance where the model reads rather than
+ * in a prompt it has already stopped attending to. The verb matters: "yields the
+ * REPL" is what actually happens (runtime/jobs.py raises WaitSignal, the cell
+ * ends, the host waits with the kernel released), and the last clause is the
+ * behaviour change we want — the cap is no longer a reason to ask for less time
+ * than the job needs.
+ */
+export function waitNote(tool, param) {
+	if (!param) return null;
+	return (
+		`Long waits YIELD THE REPL: this cell ends while the host waits, and the kernel` +
+		` resumes with the result when the wait resolves or the next hop is due. Each` +
+		` server call waits at most ${waitToolCap(tool, param)}s; request the ${param.pyName} you actually need.`
+	);
+}
+
+export function exampleNote(param) {
+	if (!param?.example || !param.nested) return null;
+	// When the example was mined out of this parameter's own description, the
+	// docstring already shows it and a second copy two lines below reads as two
+	// different examples. The INDEX line still needs it: that line carries only the
+	// TOOL's first description line, never a parameter's.
+	const squash = (text) => String(text).replace(/\s+/g, "");
+	if (squash(param.description).includes(squash(param.example))) return null;
+	return `Example: ${param.pyName}=${param.example}`;
 }
 
 export function requiredDefaultNote(param) {
@@ -286,6 +416,18 @@ function applyRequiredDefaults(tool, server, index) {
 }
 
 /**
+ * One parameter as it appears in an INDEX one-liner: `name`, `name?`, or
+ * `name?=<example>` when the value is a nested literal.
+ *
+ * The example is here, in the one-liner, because that is where the measured
+ * behaviour is: GLM 5.2 writes calls straight off this line without opening the
+ * tool module, and 12 of 83 cells in the product port died on a nested literal it
+ * had to invent. A parameter whose shape is flat gets nothing — an INDEX line
+ * carrying `page_index?=1` is longer and teaches nothing.
+ */
+const indexSlot = (p) => `${p.pyName}${p.required ? "" : "?"}${p.nested && p.example ? `=${p.example}` : ""}`;
+
+/**
  * `api.<pkg>.<tool>(required, optional?)` — the call an agent would type.
  *
  * One function because three renderers show this string (the server index, the
@@ -293,7 +435,7 @@ function applyRequiredDefaults(tool, server, index) {
  * is exactly the drift the single-authored-description rule exists to prevent.
  */
 export function pyCallSignature(tool, pkg) {
-	return `api.${pkg}.${tool.pyName}(${tool.params.map((p) => (p.required ? p.pyName : `${p.pyName}?`)).join(", ")})`;
+	return `api.${pkg}.${tool.pyName}(${tool.params.map(indexSlot).join(", ")})`;
 }
 
 /** Signature as shown in a TOC line: required args bare, optional suffixed `?`. */
@@ -380,12 +522,16 @@ export function renderFullDocs(tools, { server, pkg = pyPackage(server), heading
 		for (const p of tool.params) {
 			const required = requiredDefaultNote(p);
 			const dflt = serverDefaultNote(p);
-			if (!p.description && !required && !dflt) continue;
+			const adapted = adapterNote(p);
+			const example = exampleNote(p);
+			if (!p.description && !required && !dflt && !adapted && !example) continue;
 			if (p.description) lines.push(`      ${p.pyName}: ${p.description}${p.required ? "" : " (optional)"}`);
 			// The same sentences the module docstring carries, from the same helpers:
 			// the resident L4 text and the on-disk text must not be able to drift.
 			if (required) lines.push(`        ${required}`);
 			if (dflt) lines.push(`        ${dflt}`);
+			if (adapted) lines.push(`        ${adapted}`);
+			if (example) lines.push(`        ${example}`);
 		}
 		lines.push("");
 	}
@@ -460,11 +606,24 @@ function stripProse(node) {
 export function renderSchemas(normalized) {
 	const packages = {};
 	const tools = {};
+	const examples = {};
 	for (const { server, pyServer, tools: list } of normalized) {
 		packages[server] = pyServer ?? pyPackage(server);
 		tools[server] = Object.fromEntries(list.map((t) => [t.name, stripProse(t.schema)]));
+		// One literal per non-scalar parameter, for the ArgumentError to quote. A
+		// SIBLING table rather than a key inside each schema, so the `schema for
+		// <name>: {...}` line the error already prints stays the schema and nothing
+		// else — and so `_check` can never be handed our own annotation as a
+		// constraint to enforce.
+		const perTool = {};
+		for (const tool of list) {
+			const perParam = {};
+			for (const p of tool.params) if (p.example) perParam[p.name] = p.example;
+			if (Object.keys(perParam).length > 0) perTool[tool.name] = perParam;
+		}
+		if (Object.keys(perTool).length > 0) examples[server] = perTool;
 	}
-	return `${JSON.stringify({ packages, tools }, null, 1)}\n`;
+	return `${JSON.stringify({ packages, tools, examples }, null, 1)}\n`;
 }
 
 /**
@@ -640,6 +799,20 @@ def _schema_for(server: str, tool: str) -> dict | None:
     return ((_table().get("tools") or {}).get(server) or {}).get(tool)
 
 
+def _example(server: str, tool: str, name: str) -> str:
+    """One literal of the right shape for a non-scalar argument, as a suffix line.
+
+    Measured reason this is in the error rather than only in the documentation:
+    GLM 5.2 passed a bare list for \`complete_job.final_outputs\` — declared
+    \`dict[str, list[str]]\` — in 3 of 5 jobs, and each recovery cost a turn spent
+    re-reading the tool module. The shape it needed fits on one line, and this
+    project has repeatedly measured the error channel to be the one a model
+    actually adopts from, where the same sentence in a prompt is not.
+    """
+    literal = ((((_table().get("examples") or {}).get(server) or {}).get(tool)) or {}).get(name)
+    return f"\\n  example: {name}={literal}" if literal else ""
+
+
 def _validate(server: str, tool: str, args: dict) -> None:
     """Check args against the API's own schema before anything leaves this process.
 
@@ -661,6 +834,7 @@ def _validate(server: str, tool: str, args: dict) -> None:
             known = ", ".join(sorted(properties)) or "none"
             raise ArgumentError(
                 f"{call}: missing required argument {name!r}. Parameters: {known}"
+                f"{_example(server, tool, name)}"
             )
 
     if properties and schema.get("additionalProperties") is not True:
@@ -677,9 +851,301 @@ def _validate(server: str, tool: str, args: dict) -> None:
             continue
         problem = _check(value, spec, name)
         if problem:
-            raise ArgumentError(f"{call}: {problem}\\n  schema for {name}: {json.dumps(spec)}")
+            # The example first, then the schema: the actionable line should not be
+            # below a JSON blob a model has to scroll past to reach it.
+            raise ArgumentError(
+                f"{call}: {problem}{_example(server, tool, name)}"
+                f"\\n  schema for {name}: {json.dumps(spec)}"
+            )
 
 `;
+}
+
+/**
+ * The T1 coercion, rendered into `_client.py` only when some tool takes an
+ * adaptable argument.
+ *
+ * In `_client` rather than inlined into 469 modules for the reason the validator
+ * is data-driven: one implementation is one place to be wrong, and the generated
+ * wrappers stay a signature and a call. It is public (no leading underscore) and
+ * documented, because a model that reads the module can then see exactly what
+ * happened to its argument — a silent rewrite of a call's payload is the kind of
+ * helpfulness that becomes unattributable in a trace.
+ *
+ * Deterministic and total: a strict-form value is returned unchanged, an
+ * unrecognised value is returned unchanged for the validator to reject, and
+ * nothing here can turn a valid call into an invalid one.
+ */
+function renderAdapters(helpers) {
+	const labeledIds = `
+
+def labeled_ids(value: object, label_key: str, id_key: str, stem: str) -> object:
+    """Accept a bare id list, or a {label: id} dict, where [{label, id}] is declared.
+
+    The declared shape carries nothing a list of ids does not, except labels — and
+    a label the caller did not choose can be generated, which is what this does:
+
+        ['a1', 'a2']            -> [{label_key: f'{stem}_1', id_key: 'a1'}, ...]
+        {'hero': 'a1'}          -> [{label_key: 'hero', id_key: 'a1'}]
+        [{'label': 'hero', ...}] -> unchanged
+
+    Anything else is returned unchanged, so a value this function does not
+    understand reaches the schema check rather than a rewrite of it.
+    """
+    if isinstance(value, dict):
+        return [{label_key: str(key), id_key: item} for key, item in value.items()]
+    if isinstance(value, (list, tuple)):
+        # Per element, so a partly-labeled list works too: the strict entries are
+        # kept verbatim and only the bare ids get a generated label.
+        return [
+            {label_key: f"{stem}_{i + 1}", id_key: item} if isinstance(item, str) else item
+            for i, item in enumerate(value)
+        ]
+    return value
+
+`;
+
+	const asList = `
+
+def as_list(value: object, item_type: str) -> object:
+    """Wrap a lone scalar in a one-item list, where an array of scalars is declared.
+
+        'abc123'   with item_type 'string'   -> ['abc123']
+        ['abc123']                           -> unchanged
+        5          with item_type 'string'   -> unchanged (the validator says why)
+
+    Only when the scalar's type matches the declared item type, so a genuine type
+    error still reaches the schema check as itself rather than buried in a list.
+    Which parameters get this at all is decided at compile time — an array of
+    objects, or one demanding two items, is never wrapped.
+    """
+    # Python's bool is an int subclass, so it has to be excluded explicitly, or
+    # flags=True would arrive at an array-of-integer parameter as [True].
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return [value] if item_type == "string" else value
+    if isinstance(value, int):
+        return [value] if item_type in ("number", "integer") else value
+    if isinstance(value, float):
+        return [value] if item_type == "number" else value
+    return value
+
+`;
+
+	// Only the helpers some generated module imports. An unused function in the
+	// tree is one more hit in the agent's `grep -ril` and one more thing to read.
+	return [helpers.has("labeled_ids") ? labeledIds : "", helpers.has("as_list") ? asList : ""].join("");
+}
+
+/**
+ * The wait-tool override: a tool that BLOCKS server-side, with a cap the model
+ * keeps exceeding.
+ *
+ * Measured: `wait_for_assets` declares `max_timeout` with `le=60`, and GLM asks for
+ * 120 or 300 — 7+ ArgumentErrors across arms, the single most recurring friction in
+ * the port. The cap is real (the server enforces it), so the fix cannot be to widen
+ * the schema; it has to be to spend more wall-clock than one call is allowed to.
+ *
+ * Deliberately narrow and shape-driven rather than a name list: a tool called
+ * `wait_*` with a numeric `max_timeout`-ish parameter carrying a `maximum`. Anything
+ * else compiles exactly as before.
+ */
+export function waitToolParam(tool) {
+	if (!/^wait(_|$)/.test(tool.name ?? "")) return null;
+	return (
+		tool.params.find(
+			(p) =>
+				/timeout|seconds|duration/.test(p.name) &&
+				typeof (tool.schema?.properties?.[p.name] ?? {}).maximum === "number",
+		) ?? null
+	);
+}
+
+/** The per-call cap the SERVER enforces, from the schema itself. */
+export function waitToolCap(tool, param) {
+	return tool.schema.properties[param.name].maximum;
+}
+
+/**
+ * `wait_bridge`, rendered into `_client.py` when the catalogue has a wait tool.
+ *
+ * The design call, made from the harness primitive rather than from preference.
+ * `jobs.wait(wake_after=N)` (runtime/jobs.py) prints a sentinel, writes the wake
+ * request to disk and raises `WaitSignal` — it ENDS THE CELL. The host then sleeps
+ * outside the kernel and calls the model again. It is not cell-resumable: nothing
+ * after `jobs.wait` in a cell ever runs, by construction. So a compiled wrapper
+ * cannot loop across a wait, and the honest shape is hop-and-yield:
+ *
+ *   hop:   one server call at the cap it allows — the only wait the SERVER can do
+ *   yield: end the cell, release the kernel, let the host spend the remaining time
+ *
+ * What that buys, precisely: today a poll returns immediately (the shim flattens
+ * the product's suspension), so twenty polls burn twenty turns and ~no wall clock.
+ * After this, each turn covers a real host-side sleep with the kernel released, and
+ * `HARNESS_MIN_WAIT_SECONDS` (60 by default) is the floor on a hop.
+ *
+ * What it does NOT do, and why: it does not parse the result to decide whether the
+ * assets resolved. Every `wait_for_assets` call in the traces I have died on the
+ * cap, so the resolved-vs-in-flight response shape is unobserved, and a poller that
+ * guessed it would return a fake success and let the job proceed on an unready
+ * asset — a plausible number instead of an error, which is this project's
+ * signature failure. The model reads the product's own verbatim result each hop and
+ * decides. Collapsing this to two turns needs that shape; see the report.
+ */
+function renderWaitBridge() {
+	return `
+
+async def wait_bridge(server: str, tool: str, args: dict, requested: float | None, cap: float) -> str:
+    """Spend more wall-clock than one call is allowed to, without holding the kernel.
+
+    OFF unless HARNESS_WAIT_BRIDGE=1, and off is the behaviour this tree always had:
+    the request goes through untouched, so a value above the server's cap raises the
+    same ArgumentError it always raised.
+    """
+    if os.environ.get("HARNESS_WAIT_BRIDGE") != "1" or not requested or requested <= cap:
+        return await call(server, tool, args)
+
+    # The hop the server will actually accept. Never more than the cap, so the
+    # validator sees a legal value and the wire is unchanged.
+    hop = dict(args)
+    hop[_wait_param(args, cap)] = cap
+    text = await call(server, tool, hop)
+    remaining = float(requested) - cap
+    if remaining <= 0 or _wait_resolved(text) is not False:
+        # Resolved, or a shape this function does not model. Either way the answer
+        # is the server's own text, returned now — see _wait_resolved.
+        return text
+
+    print(text)
+    print(
+        f"[waited {cap:.0f}s of {float(requested):.0f}s server-side. Ending the cell to spend the"
+        f" remaining {remaining:.0f}s with the kernel released — re-issue this call to continue"
+        " waiting, or read the asset if the result above says it is ready.]"
+    )
+    try:
+        import jobs  # injected by the kernel prelude
+    except ImportError:
+        # No hosted runtime in this kernel: the hop is all the waiting available, and
+        # returning it is exactly what the tree did before this wrapper existed.
+        return text
+    jobs.wait(wake_after=remaining)  # raises WaitSignal: the cell ends here
+    return text  # unreachable; kept so the function's type is honest
+
+
+def _wait_resolved(text: str) -> "bool | None":
+    """True if the wait finished, False if it is still in flight, None if unknown.
+
+    The two shapes, from real streams:
+
+        resolved   {"results": [{"asset_id": ..., "state": "completed", ...}],
+                    "completed": true}
+        in flight  {"suspended": true}  /  {"completed": false}
+
+    Anything else returns None and the caller hands the server's text straight to
+    the model. That third branch is the point: the in-flight shape was never
+    captured live, so a function that assumed one would eventually report a fake
+    completion and let a job proceed on an unready asset. Unknown is a verdict.
+    """
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("suspended") is True:
+        return False
+    completed = payload.get("completed")
+    return completed if isinstance(completed, bool) else None
+
+
+def _wait_param(args: dict, cap: float) -> str:
+    """The timeout argument's own name, so the hop rewrites the right key."""
+    for name in args:
+        if "timeout" in name or "seconds" in name or "duration" in name:
+            return name
+    return "max_timeout"
+
+`;
+}
+
+/**
+ * Split one server's tools into the modules they will be emitted as.
+ *
+ * Measured motivation: the port's consolidated tree produced
+ * `api/creative_actions.py` at 152KB across 45 tools. That is a single file no
+ * API reference on earth is shaped like — `stripe.py` is one module per RESOURCE,
+ * and the affordance rule says get as close to the in-distribution shape as the
+ * constraints allow. The registry already knows each action's category, so the
+ * grouping is read from the catalogue rather than invented here.
+ *
+ * Module naming is FLAT (`api/image.py`) rather than nested
+ * (`api/creative_actions/image.py`), because the ergonomic ask is
+ * `import api.image` and a nested path would spend the win on a directory nobody
+ * types. Flat names can collide across servers, so a category claimed by more than
+ * one server is qualified — `api/<server>_<category>.py` — which keeps every module
+ * one import deep and the collision deterministic rather than last-writer-wins.
+ *
+ * @param claimed Map of category -> number of servers using it, catalogue-wide.
+ */
+export function categoryModules(tools, pyServer, claimed) {
+	const groups = new Map();
+	const ungrouped = [];
+	for (const tool of tools) {
+		if (!tool.category) {
+			ungrouped.push(tool);
+			continue;
+		}
+		const slug = pyIdent(tool.category).toLowerCase();
+		const module = (claimed.get(slug) ?? 0) > 1 ? `${pyServer}_${slug}` : slug;
+		if (!groups.has(module)) groups.set(module, { module, category: tool.category, tools: [] });
+		groups.get(module).tools.push(tool);
+	}
+	return { groups: [...groups.values()], ungrouped };
+}
+
+/** category slug -> how many servers use it, so a collision can be qualified. */
+export function claimedCategories(normalized) {
+	const claimed = new Map();
+	for (const { tools } of normalized) {
+		const slugs = new Set(tools.filter((t) => t.category).map((t) => pyIdent(t.category).toLowerCase()));
+		for (const slug of slugs) claimed.set(slug, (claimed.get(slug) ?? 0) + 1);
+	}
+	return claimed;
+}
+
+/**
+ * The server module, when its tools have moved into category modules: an alias.
+ *
+ * Cheap, and worth it mid-comparison — `api.creative_actions.create_image_x`
+ * keeps working while the model learns `api.image.create_image_x`, so a call shape
+ * from an earlier turn (or an earlier run) does not become an AttributeError. It
+ * re-exports rather than re-documents: the docstrings live in one module each, so
+ * `grep -ril` finds the real one and this file stays a few lines per tool.
+ */
+export function renderServerAlias(server, pyServer, groups, ungroupedText) {
+	const lines = ungroupedText
+		? [ungroupedText.replace(/\n__all__ = \[[\s\S]*$/, "").trimEnd(), "", ""]
+		: [
+				`"""${pyDocstring(server)} — generated from the MCP schema. Do not edit.`,
+				"",
+				"Every API of this app, re-exported from the modules it is documented in.",
+				`Prefer the specific module (\`import api.${groups[0]?.module ?? pyServer}\`) — this alias exists so a`,
+				" call written before the split keeps working.",
+				'"""',
+				"",
+			];
+	const names = [];
+	for (const group of groups) {
+		lines.push(`from .${group.module} import (`);
+		for (const tool of group.tools) {
+			lines.push(`    ${tool.pyName},`);
+			names.push(tool.pyName);
+		}
+		lines.push(")");
+	}
+	lines.push("", "__all__ = [", ...names.map((n) => `    "${n}",`), "]", "");
+	return lines.join("\n");
 }
 
 // --- api tree layout ---------------------------------------------------------
@@ -837,10 +1303,15 @@ export function renderNames(tools, { server, pkg = pyPackage(server), style = "p
  * module's `__name__` is just `api.<pkg>`, which would lose the tool half and make
  * the gate fire once per APP instead of once per API.
  */
-function renderFunction(tool, { server, docsGate = "off", readGate = false, pathLiteral = "__name__" }) {
+function renderFunction(tool, { server, docsGate = "off", readGate = false, waitBridge = false, pathLiteral = "__name__" }) {
 	const mode = docsGateMode(docsGate);
 	const args = tool.params.map((p) => (p.required ? `${p.pyName}: ${p.type}` : `${p.pyName}: ${p.type} | None = None`));
 	const signatureLine = `async def ${tool.pyName}(${args.join(", ")}) -> Any:`;
+	// A wait tool spends wall-clock the caller may ask for more of than one server
+	// call allows. `waitBridge` is bundle-carried; the BEHAVIOUR is env-gated inside
+	// the helper, so an unflagged run of this same tree is unchanged. Resolved here
+	// because both the docstring and the call site below need it.
+	const waitParam = waitBridge ? waitToolParam(tool) : null;
 
 	// Every description is untrusted catalogue text on its way into a `"""…"""`
 	// block — pyDocstring keeps the displayed text identical and the parse safe.
@@ -855,6 +1326,18 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
 			const note = p.description ? ` ${pyDocstring(p.description)}` : "";
 			const opt = p.required ? "" : " Optional.";
 			doc.push(`        ${p.pyName}:${note}${opt}`.trimEnd());
+			// What this parameter accepts beyond its declared shape, and one literal
+			// of that shape. Both from the same helpers the resident L4 docs use, so
+			// the on-disk text and the in-prompt text cannot drift.
+			const adapted = adapterNote(p);
+			if (adapted) doc.push(`            ${pyDocstring(adapted)}`);
+			// The wait affordance sits under the parameter it is about, so the
+			// sentence and the argument it changes are read together.
+			if (waitParam && p.name === waitParam.name) {
+				doc.push(`            ${pyDocstring(waitNote(tool, waitParam))}`);
+			}
+			const example = exampleNote(p);
+			if (example) doc.push(`            ${pyDocstring(example)}`);
 			// One line, and only for a promoted parameter. Without it the signature
 			// says "required" while the description it sits beside still says the
 			// server has a default for it, and the agent is left to reconcile two
@@ -870,6 +1353,10 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
 	}
 	doc.push("", "    Returns:", "        The tool result as returned by the MCP server.", '    """');
 
+	// Deterministic coercion of the pythonic argument shapes, at the top of the
+	// body so the value the docstring documents is the value `_call` validates and
+	// sends. A strict-form argument passes through untouched.
+	const coercions = tool.params.filter((p) => p.adapter).map((p) => `    ${p.pyName} = ${coercion(p).call}`);
 	const callArgs = tool.params.map((p) => `"${p.name}": ${p.pyName}`).join(", ");
 	// `_path` is what arms the gate — `__name__` is already the import path
 	// (`api.<pkg>.<tool>`), so the citation and the package name need no plumbing.
@@ -885,10 +1372,12 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
 			: mode === "redirect" || readGate
 				? `\n        _path=${pathLiteral},`
 				: "";
-	const call = gateArgs
-		? `    return await _call(\n        "${server}",\n        "${tool.name}",\n        {${callArgs}},${gateArgs}\n    )`
-		: `    return await _call("${server}", "${tool.name}", {${callArgs}})`;
-	return [signatureLine, ...doc, call];
+	const call = waitParam
+		? `    return await _wait_bridge(\n        "${server}",\n        "${tool.name}",\n        {${callArgs}},\n        ${waitParam.pyName},\n        ${waitToolCap(tool, waitParam)},\n    )`
+		: gateArgs
+			? `    return await _call(\n        "${server}",\n        "${tool.name}",\n        {${callArgs}},${gateArgs}\n    )`
+			: `    return await _call("${server}", "${tool.name}", {${callArgs}})`;
+	return [signatureLine, ...doc, ...coercions, call];
 }
 
 /**
@@ -897,19 +1386,21 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, path
  * The docstring carries the server's description verbatim, so `grep`, `import`,
  * and `help()` all read the same text and cannot drift.
  */
-export function renderToolModule(tool, { server, docsGate = "off" }) {
+export function renderToolModule(tool, { server, docsGate = "off", waitBridge = false }) {
 	return [
 		`"""${pyDocstring(`${server}.${tool.name}`)} — generated from the MCP schema. Do not edit."""`,
 		"",
 		"from typing import Any, Literal",
 		"",
 		// `_client` lives at the api/ root, one level above the server package.
-		`from .._client import call as _call`,
+		// Coercion helpers are imported only by modules that call them, so a tree
+		// with no adaptable parameter is byte-identical to the pre-adapter one.
+		clientImport([tool], ".._client", waitBridge),
 		"",
 		"",
 		// `__name__` is already the import path (`api.<pkg>.<tool>`), so arming the
 		// gate needs no plumbing in this layout.
-		...renderFunction(tool, { server, docsGate, pathLiteral: "__name__" }),
+		...renderFunction(tool, { server, docsGate, waitBridge, pathLiteral: "__name__" }),
 		"",
 	].join("\n");
 }
@@ -947,7 +1438,7 @@ export function renderAppModule(tools, options) {
  * _call(...)`, 1-based and inclusive — i.e. the signature, the whole docstring and
  * the call. That is what "read this API's contract" means.
  */
-export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), docsGate = "off", readGate = false }) {
+export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), docsGate = "off", readGate = false, waitBridge = false }) {
 	const conventions = appConventions(tools, pkg);
 	const lines = [
 		`"""${pyDocstring(server)} — generated from the MCP schema. Do not edit.`,
@@ -959,8 +1450,10 @@ export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), d
 		"",
 		"from typing import Any, Literal",
 		"",
-		// `_client` is a sibling module here, not a parent package.
-		"from ._client import call as _call",
+		// `_client` is a sibling module here, not a parent package. Coercion helpers
+		// are imported only when some API in this app takes an adaptable argument, so
+		// an app without one renders exactly as it did before.
+		clientImport(tools, "._client", waitBridge),
 	];
 	// NOT `lines.length`: several elements of this array are themselves multi-line
 	// (the gated `_call` is one element carrying four newlines), so the array index
@@ -976,6 +1469,7 @@ export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), d
 			server,
 			docsGate,
 			readGate,
+			waitBridge,
 			// A literal, not `__name__`: this module's `__name__` is only `api.<pkg>`,
 			// so `__name__` would lose the tool half and the gate would fire once per
 			// app instead of once per API.
@@ -990,7 +1484,7 @@ export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), d
 }
 
 /** codemode: the per-server package index, one line per tool. */
-export function renderServerIndex(tools, { server, pkg = pyPackage(server), docsGate = "off" }) {
+export function renderServerIndex(tools, { server, pkg = pyPackage(server), docsGate = "off", waitBridge = false }) {
 	return [
 		`# ${server}`,
 		"",
@@ -1000,7 +1494,12 @@ export function renderServerIndex(tools, { server, pkg = pyPackage(server), docs
 		// than no pointer: it costs a turn and teaches the tree cannot be trusted.
 		...(docsGateMode(docsGate) === "off" ? [] : [`\`api/${pkg}/DOCS.md\` has all of them at once, with this app's conventions.`]),
 		"",
-		...tools.map((t) => `- \`${pyCallSignature(t, pkg)}\` — ${firstLine(t.description)}`),
+		// The marker is on the INDEX line because that is where the model picks a
+		// tool; the sentence explaining it is in the module, one read away.
+		...tools.map(
+			(t) =>
+				`- \`${pyCallSignature(t, pkg)}\`${waitBridge && waitToolParam(t) ? " *(yields the REPL on long waits)*" : ""} — ${firstLine(t.description)}`,
+		),
 		"",
 	].join("\n");
 }
@@ -1029,7 +1528,14 @@ export function renderServerInit(tools, { server }) {
  * Written with stdlib only: the kernel is a bare uv-managed environment and a
  * missing `requests` would silently disable the entire arm.
  */
-export function renderClient({ docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method" } = {}) {
+export function renderClient({
+	docsGate = "off",
+	readGate = false,
+	validateArgs = false,
+	adapters = [],
+	waitBridge = false,
+	apiLayout: layout = "per-method",
+} = {}) {
 	const mode = docsGateMode(docsGate);
 	if (readGate && mode !== "off") {
 		// They are two answers to one question and they compose badly: the docs gate
@@ -1288,6 +1794,13 @@ def _read_first(server: str, tool: str, path: str) -> None:
 
 	const gate = readGate ? readFirst : mode === "redirect" ? redirect : mode === "inline" ? inline : "";
 	const validator = validateArgs ? renderValidator() : "";
+	// Rendered only for the helpers the catalogue actually needs — an unused helper
+	// in the tree is one more thing in the agent's `grep -ril` and one more line of
+	// difference between two trees that are supposed to be identical.
+	const adapter = renderAdapters(new Set(adapters));
+	// Only when the catalogue actually has a wait tool: an unused coroutine in the
+	// transport is one more thing in the agent's `grep -ril`.
+	const waiter = waitBridge ? renderWaitBridge() : "";
 	return `"""Transport for the generated api/ modules. Do not edit.
 
 Every tool module calls \`_client.call\`, which forwards to the shared MCP proxy.
@@ -1317,7 +1830,7 @@ _TIMEOUT = 180
 class McpError(RuntimeError):
     """An MCP tool returned an error, or the server was unreachable."""
 
-${validator}${gate}
+${validator}${adapter}${waiter}${gate}
 async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: str | None = None, _path: str | None = None" : mode === "redirect" || readGate ? ", _path: str | None = None" : ""}) -> str:
     """Invoke an MCP tool and return its text result.
 
@@ -1362,7 +1875,7 @@ async def call(server: str, tool: str, args: dict${mode === "inline" ? ", _doc: 
 }
 
 /** codemode: the top-level index across servers. */
-export function renderRootIndex(catalogue, { docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method" } = {}) {
+export function renderRootIndex(catalogue, { docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method", modules = null } = {}) {
 	const total = catalogue.reduce((n, s) => n + s.tools.length, 0);
 	const mode = docsGateMode(docsGate);
 	// Announced, not sprung. An unexplained exception on a call the agent believes
@@ -1398,10 +1911,15 @@ export function renderRootIndex(catalogue, { docsGate = "off", readGate = false,
 				"",
 			]
 		: [];
+	// Grouped only when the emit actually produced more modules than servers: a
+	// catalogue with no categories must render the index it always rendered.
+	const grouped = Array.isArray(modules) && modules.length > catalogue.length;
 	return [
 		"# api",
 		"",
-		`${catalogue.length} servers, ${total} tools, all async.`,
+		grouped
+			? `${catalogue.length} servers, ${total} tools in ${modules.length} modules, all async.`
+			: `${catalogue.length} servers, ${total} tools, all async.`,
 		"",
 		...announcement,
 		...readGateAnnouncement,
@@ -1411,18 +1929,34 @@ export function renderRootIndex(catalogue, { docsGate = "off", readGate = false,
 		// Per layout, and only the files that exist in it. The consolidated tree has
 		// no per-app INDEX.md because the module is the index.
 		...(apiLayout(layout) === "consolidated"
-			? ["  cat api/<package>.py                # one app: every API, with full parameter docs"]
+			? grouped
+				? ["  cat api/<module>.py                 # one group: every API in it, with full parameter docs"]
+				: ["  cat api/<package>.py                # one app: every API, with full parameter docs"]
 			: ["  cat api/<package>/INDEX.md          # list one server's tools", "  cat api/<package>/<tool>.py         # full parameter documentation"]),
 		"",
 		"Call one:",
-		"  import api.<package>",
-		"  result = await api.<package>.<tool>(...)",
+		...(grouped
+			? ["  import api.<module>", "  result = await api.<module>.<tool>(...)"]
+			: ["  import api.<package>", "  result = await api.<package>.<tool>(...)"]),
 		"",
-		"| package | server | tools |",
-		"| --- | --- | --- |",
-		// The package column is what gets imported; the server column is the name
-		// the task description will use. The agent needs both to bridge them.
-		...catalogue.map((s) => `| \`${s.pyServer}\` | ${s.server} | ${s.tools.length} |`),
+		...(grouped
+			? [
+					"| module | what it holds | server | tools |",
+					"| --- | --- | --- | --- |",
+					// One row per module the agent can import. `category` is the app's own
+					// word for the group, not ours, so the row says what the registry says.
+					...modules.map(
+						(m) =>
+							`| \`api.${m.module}\` | ${m.category ?? "everything else in this app"} | ${m.server} | ${m.count} |`,
+					),
+				]
+			: [
+					"| package | server | tools |",
+					"| --- | --- | --- |",
+					// The package column is what gets imported; the server column is the
+					// name the task description will use. The agent needs both to bridge.
+					...catalogue.map((s) => `| \`${s.pyServer}\` | ${s.server} | ${s.tools.length} |`),
+				]),
 		"",
 	].join("\n");
 }
@@ -1445,7 +1979,14 @@ export function renderRootIndex(catalogue, { docsGate = "off", readGate = false,
  */
 export function generate(
 	catalogue,
-	{ docsGate = "off", readGate = false, validateArgs = false, apiLayout: layout = "per-method", requiredDefaults = null } = {},
+	{
+		docsGate = "off",
+		readGate = false,
+		validateArgs = false,
+		waitBridge = false,
+		apiLayout: layout = "per-method",
+		requiredDefaults = null,
+	} = {},
 ) {
 	const gateMode = docsGateMode(docsGate);
 	const layoutMode = apiLayout(layout);
@@ -1487,18 +2028,41 @@ export function generate(
 		}
 	}
 
+	// Which coercion helpers this catalogue needs. Computed from the normalized
+	// tools rather than passed in as a flag: an adapter is a property of the
+	// SCHEMAS, not a condition of the run, so a catalogue with no adaptable
+	// parameter must render the tree it always rendered.
+	// Whether any tool in this catalogue is a wait tool. Like the adapters, this is a
+	// property of the SCHEMAS: a catalogue without one renders the tree it always did
+	// even with the option on.
+	const hasWaitTool = normalized.some((s) => s.tools.some((t) => waitToolParam(t)));
+	const adapters = new Set(
+		normalized.flatMap((s) =>
+			s.tools.flatMap((t) => t.params.filter((p) => p.adapter).map((p) => coercion(p).helper)),
+		),
+	);
+
 	const toolDefs = [];
 	const tocLines = [];
 	const names = [];
+	// Catalogue-wide, so a category two servers both use can be qualified rather
+	// than silently overwritten by whichever server renders second.
+	const claimed = claimedCategories(normalized);
+	// What the root INDEX lists: one row per emitted module, which is what the agent
+	// imports — the package table stopped being that the moment a server became
+	// several modules.
+	const modules = [];
 	// `__init__.py` at the root so `import api.<pkg>` resolves as a regular
 	// package rather than relying on namespace-package resolution.
 	const files = {
-		"INDEX.md": renderRootIndex(normalized, { docsGate: gateMode, readGate, validateArgs, apiLayout: layoutMode }),
+		// Placeholder: rewritten below, once the modules are known. In the grouped
+		// layout the row set is a property of the emit, not of the catalogue.
+		"INDEX.md": "",
 		"__init__.py": '"""Generated MCP tool catalogue. See INDEX.md."""\n',
 		// Throws on read-gate + docs-gate and on read-gate + per-method, before a
 		// single file is written. A tree that half-satisfies a label is the failure
 		// mode this project keeps rediscovering.
-		"_client.py": renderClient({ docsGate: gateMode, readGate, validateArgs, apiLayout: layoutMode }),
+		"_client.py": renderClient({ docsGate: gateMode, readGate, validateArgs, adapters, waitBridge: waitBridge && hasWaitTool, apiLayout: layoutMode }),
 	};
 	// Only when the gate is on: the map is the gate's evidence, and an unused span
 	// table in the tree is one more hit in the agent's `grep -ril`.
@@ -1516,25 +2080,64 @@ export function generate(
 		names.push(...renderNames(tools, { server, pkg: pyServer }));
 
 		if (layoutMode === "consolidated") {
-			// One module, and nothing else: no per-app INDEX.md (the module is the
-			// index), no DOCS.md (the module is the documentation), no per-method files.
-			const part = renderAppModuleParts(tools, { server, pkg: pyServer, docsGate: gateMode, readGate });
-			files[`${pyServer}.py`] = part.text;
-			if (lineMap) lineMap[pyServer] = part.lineMap;
+			// One module per CATEGORY when the catalogue carries them, and nothing else:
+			// no per-app INDEX.md (the module is the index), no DOCS.md (the module is
+			// the documentation), no per-method files. `_call`'s first argument is the
+			// real server name in every module, so where a function is DOCUMENTED and
+			// where it is DISPATCHED are independent — pinned by test.
+			const { groups, ungrouped } = categoryModules(tools, pyServer, claimed);
+			for (const group of groups) {
+				const part = renderAppModuleParts(group.tools, {
+					server,
+					pkg: group.module,
+					docsGate: gateMode,
+					readGate,
+					waitBridge,
+				});
+				files[`${group.module}.py`] = part.text;
+				if (lineMap) lineMap[group.module] = part.lineMap;
+				modules.push({ module: group.module, server, category: group.category, count: group.tools.length });
+			}
+			// The server module: the ungrouped tools in full, plus an alias for the
+			// grouped ones so a call written before the split keeps working.
+			const rest = groups.length === 0 ? tools : ungrouped;
+			const part =
+				rest.length > 0
+					? renderAppModuleParts(rest, { server, pkg: pyServer, docsGate: gateMode, readGate, waitBridge })
+					: null;
+			if (groups.length === 0) {
+				files[`${pyServer}.py`] = part.text;
+				if (lineMap) lineMap[pyServer] = part.lineMap;
+				modules.push({ module: pyServer, server, category: null, count: tools.length });
+			} else {
+				files[`${pyServer}.py`] = renderServerAlias(server, pyServer, groups, part?.text ?? "");
+				if (lineMap && part) lineMap[pyServer] = part.lineMap;
+				if (rest.length > 0) {
+					modules.push({ module: pyServer, server, category: null, count: rest.length });
+				}
+			}
 			continue;
 		}
-		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server, pkg: pyServer, docsGate: gateMode });
+		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server, pkg: pyServer, docsGate: gateMode, waitBridge });
 		files[`${pyServer}/__init__.py`] = renderServerInit(tools, { server });
 		// The redirect target. Both live modes render it: `redirect` sends the agent
 		// here instead of showing a docstring, `inline` sends it here when a sibling
 		// looks like the better call.
 		if (gateMode !== "off") files[`${pyServer}/DOCS.md`] = renderAppDocs(tools, { server, pkg: pyServer });
 		for (const tool of tools) {
-			files[`${pyServer}/${tool.pyName}.py`] = renderToolModule(tool, { server, docsGate: gateMode });
+			files[`${pyServer}/${tool.pyName}.py`] = renderToolModule(tool, { server, docsGate: gateMode, waitBridge });
 		}
 	}
 
-	// Written last, so it can only ever describe modules that were actually rendered.
+	// Written last, so both can only ever describe modules that were actually
+	// rendered — the same reason the line map is written here.
+	files["INDEX.md"] = renderRootIndex(normalized, {
+		docsGate: gateMode,
+		readGate,
+		validateArgs,
+		apiLayout: layoutMode,
+		modules,
+	});
 	if (lineMap) files["_linemap.json"] = `${JSON.stringify(lineMap, null, 1)}\n`;
 
 	return { toolDefs, tocLines, names, files, normalized };

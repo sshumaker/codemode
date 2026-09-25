@@ -114,7 +114,9 @@ describe("consolidated is one module per app", () => {
 	});
 
 	it("imports the transport as a sibling, since it is now one", () => {
-		assert.match(files["linear.py"], /^from \._client import call as _call$/m);
+		// `call as _call` first, then whatever coercion helpers this app's parameters
+		// need — the claim here is the SIBLING path, not the import list.
+		assert.match(files["linear.py"], /^from \._client import call as _call(, \w+ as _\w+)*$/m);
 		assert.equal(/from \.\._client/.test(files["linear.py"]), false);
 	});
 

@@ -39,10 +39,19 @@ An API key is read from an env file you point at; it is sourced in a subshell
 and never read into the harness. `ANTHROPIC_API_KEY` covers Opus 5 and Sonnet 5;
 GLM 5.2 needs `OPENROUTER_API_KEY` or `ZAI_API_KEY`.
 
+In a `git worktree`, link the task set before running the suite. `vendor/mcp-bench`
+is gitignored, so a worktree has none — and without it fifteen task-driven tests
+either refuse to run or have nothing to iterate:
+
+```bash
+ln -s <primary-checkout>/vendor/mcp-bench vendor/mcp-bench
+# or, to fetch it again: scripts/setup-mcp-bench.sh --clone-only
+```
+
 ## Running
 
 ```bash
-npm test                                    # 128 tests, no API key needed
+npm test                                    # 665 JS + 344 Python tests, no API key needed
 node bench/residency-report.mjs             # resident token cost per arm
 
 node bench/mcp-proxy.mjs &                  # shared MCP server pool + call log

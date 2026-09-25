@@ -74,6 +74,39 @@ export function availableServers() {
 }
 
 /**
+ * Throw unless MCP-Bench's task set is on disk. For tests, at import time.
+ *
+ * `vendor/mcp-bench` is gitignored (53MB, upstream @ 7a8eaea), so it exists only
+ * in a checkout where `scripts/setup-mcp-bench.sh` has been run — never in a
+ * fresh `git worktree`. `loadTasks` answers an absent tier by skipping it, which
+ * is right for a runner that may legitimately have one tier installed and
+ * catastrophic for a test file: every test that iterates tasks then iterates
+ * NOTHING and passes.
+ *
+ * Measured, and the reason this function exists: one commit, two checkouts —
+ * **571 tests in the primary checkout, 557 in a worktree**. Fourteen tests that
+ * never announced they had not run, and one visible symptom, an assertion reading
+ * "no runnable tasks". That was diagnosed as a regression in the compiler, on the
+ * strength of a pass in one checkout and a 0.3ms failure in another, and cost a
+ * review round trip before the variable turned out to be the dataset.
+ *
+ * Hard failure rather than a skip, per this repo's own convention for a missing
+ * vendored input ("vendor/pi-mono missing — see README setup"): a worktree whose
+ * suite goes green while fifteen tests silently do not exist is the exact shape of
+ * "a documented check is not an executed check".
+ */
+export function requireTaskSet() {
+	const missing = Object.values(FILES).filter((file) => !existsSync(join(TASK_DIR, file)));
+	if (missing.length === 0) return;
+	throw new Error(
+		`MCP-Bench task set missing from ${TASK_DIR} (${missing.join(", ")}).\n` +
+			"Tests that iterate tasks would silently iterate nothing, so they refuse to run.\n" +
+			"  scripts/setup-mcp-bench.sh --clone-only    # fetch the pinned dataset, no servers\n" +
+			"  ln -s <primary-checkout>/vendor/mcp-bench vendor/mcp-bench   # or borrow it in a worktree",
+	);
+}
+
+/**
  * Load tasks, flattened across server groups.
  *
  * @param opts.tier       "single" | "multi2" | "multi3" (default all)

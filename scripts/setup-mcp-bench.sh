@@ -24,6 +24,21 @@ SERVERS="$BENCH/mcp_servers"
 [ -x "$HOME/.local/bin/uv" ] && export PATH="$HOME/.local/bin:$PATH"
 command -v uv >/dev/null || { echo "uv not found; install it first" >&2; exit 1; }
 
+# In a worktree, the primary checkout almost certainly already has this. Cloning a
+# second 53MB copy per worktree is waste, and the alternative is one symlink — so
+# say so, once, where somebody is standing right next to the problem. Not an
+# error: re-cloning is legitimate (a detached machine, a corrupted copy), it is
+# just rarely what was meant.
+if [ ! -d "$BENCH" ] && [ -f "$ROOT/.git" ]; then
+	PRIMARY="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+	if [ -n "$PRIMARY" ] && [ -d "$PRIMARY/vendor/mcp-bench" ]; then
+		echo "==> note: this is a worktree and $PRIMARY/vendor/mcp-bench exists."
+		echo "    A symlink is enough for the test suite and costs nothing:"
+		echo "      ln -s $PRIMARY/vendor/mcp-bench $BENCH"
+		echo "    Cloning anyway; take the symlink instead if that is what you wanted."
+	fi
+fi
+
 if [ ! -d "$BENCH" ]; then
 	echo "==> cloning mcp-bench @ ${PIN:0:8}"
 	git clone -q "$REPO" "$BENCH"
