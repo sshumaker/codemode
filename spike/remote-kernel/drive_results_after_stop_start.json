@@ -1,0 +1,125 @@
+{
+ "checks": {
+  "bootstrap": {
+   "pass": true,
+   "detail": {
+    "status": "ok",
+    "stderr": ""
+   }
+  },
+  "a_state": {
+   "pass": true,
+   "detail": {
+    "a1": "set 41\n",
+    "a2": "42"
+   }
+  },
+  "streaming": {
+   "pass": true,
+   "detail": {
+    "chunks": [
+     85,
+     587,
+     1086
+    ],
+    "endMs": 1589,
+    "stdout": "tick 0\ntick 1\ntick 2\n"
+   }
+  },
+  "b_attach_image_skill": {
+   "pass": true,
+   "detail": {
+    "status": "ok",
+    "stdout": "Loaded 1 image(s) into context: /tmp/spike.png\n",
+    "n": 1,
+    "mime": "image/png",
+    "chars": 852,
+    "path": "/tmp/spike.png"
+   }
+  },
+  "b_attachment_decodes": {
+   "pass": true,
+   "detail": {
+    "head": "89504e470d0a1a0a",
+    "bytes": 638
+   }
+  },
+  "b_big_attachment_intact": {
+   "pass": true,
+   "detail": {
+    "chars": 4933336,
+    "remote": "838d35402c06b359",
+    "local": "838d35402c06b359",
+    "clientMs": 794.8596670000002,
+    "serverMs": 103
+   }
+  },
+  "c_host_request": {
+   "pass": true,
+   "detail": {
+    "stdout": "{'echoed': 42, 'handledOn': 'Scotts-MacBook-Pro-2.local', 'handledPid': 18856}\n"
+   }
+  },
+  "c_host_request_unknown_type": {
+   "pass": true,
+   "detail": {
+    "stdout": "raised RuntimeError host request type \"no.such.handler\" is not available in this session\n"
+   }
+  },
+  "d_interrupt": {
+   "pass": true,
+   "detail": {
+    "status": "aborted",
+    "ename": "KeyboardInterrupt",
+    "dMs": 1666,
+    "after": "410",
+    "stdout": "sleeping\n"
+   }
+  },
+  "e_restart": {
+   "pass": true,
+   "detail": {
+    "stdout": "x gone\n",
+    "restartMs": 368
+   }
+  }
+ },
+ "startMs": 931.386541,
+ "progress": [],
+ "bootstrapCellMs": 124.83520799999997,
+ "hostCalls": [
+  {
+   "type": "model.info",
+   "pid": 18856
+  },
+  {
+   "type": "spike.echo",
+   "pid": 18856,
+   "cellSourceCode": "string"
+  }
+ ],
+ "overhead": {
+  "cellClientMs": {
+   "p50": 86.2,
+   "p90": 93.5,
+   "min": 82.7,
+   "n": 25
+  },
+  "cellServerMs": {
+   "p50": 6,
+   "p90": 8,
+   "min": 5,
+   "n": 25
+  },
+  "wsPingMs": {
+   "p50": 82,
+   "p90": 90,
+   "min": 77,
+   "n": 25
+  }
+ },
+ "restartMs": 368.21141700000044,
+ "kernelDeath": {
+  "rejected": "Kernel has been shut down"
+ }
+}

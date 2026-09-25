@@ -17,6 +17,7 @@ import {
 	KernelManager,
 	type KernelSentAgentMessage,
 } from "../kernel/index.js";
+import { RemoteKernelManager } from "../kernel/remote.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { parseIpythonBashCell } from "./ipython-cell-code.js";
@@ -977,8 +978,23 @@ export class IpythonKernelProvisioner {
 					startupSignal,
 				);
 			}
-			const snapshotDir = this.options?.snapshotDir;
-			const m = new KernelManager({
+			// SPIKE: HARNESS_REMOTE_KERNEL_URL swaps in the WebSocket-backed kernel (remote.ts).
+			const remoteUrl = process.env.HARNESS_REMOTE_KERNEL_URL;
+			const snapshotDir = remoteUrl ? undefined : this.options?.snapshotDir;
+			const m = remoteUrl
+				? (new RemoteKernelManager({
+						url: remoteUrl,
+						headers: process.env.HARNESS_REMOTE_KERNEL_PREVIEW_TOKEN
+							? { "x-daytona-preview-token": process.env.HARNESS_REMOTE_KERNEL_PREVIEW_TOKEN }
+							: undefined,
+						token: process.env.HARNESS_REMOTE_KERNEL_TOKEN,
+						remoteCwd: process.env.HARNESS_REMOTE_KERNEL_CWD,
+						env: this.options?.env,
+						sessionId: this.options?.sessionId,
+						hostHandlers: this.options?.hostHandlers,
+						pythonSkills: this.options?.pythonSkills,
+					}) as unknown as KernelManager)
+				: new KernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,
 				env: this.options?.env,

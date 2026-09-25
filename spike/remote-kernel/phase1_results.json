@@ -1,0 +1,77 @@
+{
+ "create_s": [
+  0.89,
+  1.3,
+  0.86
+ ],
+ "image": {
+  "os": "PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"",
+  "python": "Python 3.14.4",
+  "node": "v25.9.0",
+  "uname": "x86_64",
+  "nproc": "48",
+  "mem": "Mem:          386466       92741       85599         155      217997      293725",
+  "whoami": "daytona\n/home/daytona",
+  "pkgs": "ModuleNotFoundError: No module named 'zmq'"
+ },
+ "exec_true": {
+  "p50_ms": 116.4,
+  "p90_ms": 130.5,
+  "min_ms": 96.8,
+  "n": 15
+ },
+ "preview_url_shape": "https://8765-<id>.daytonaproxy01.net",
+ "ws_no_token": "rejected: InvalidStatus: server rejected WebSocket connection: HTTP 401",
+ "ws_connect_s": 0.316,
+ "ws_rtt_small": {
+  "p50_ms": 84.7,
+  "p90_ms": 94.2,
+  "min_ms": 78.5,
+  "n": 40
+ },
+ "ws_rtt_1MB_echo": {
+  "p50_ms": 99.3,
+  "p90_ms": 103.1,
+  "min_ms": 88.4,
+  "n": 10
+ },
+ "ws_signed_url": {
+  "connect_s": 1.388,
+  "p50_ms": 88.8,
+  "p90_ms": 94.3,
+  "min_ms": 80.7,
+  "n": 10
+ },
+ "ws_after_70s_idle": "alive?",
+ "stop_s": 1.29,
+ "persist_home": true,
+ "persist_tmp": "tmp",
+ "ws_server_after_restart": "not-running",
+ "start_from_stopped_s": [
+  0.6,
+  0.69,
+  0.75
+ ],
+ "egress_default": {
+  "pypi.org": "200",
+  "example.com": "200",
+  "api.anthropic.com": "404"
+ },
+ "egress_domain_allow_pypi": {
+  "pypi.org": "200",
+  "example.com": "000FAIL",
+  "api.anthropic.com": "000FAIL"
+ },
+ "inbound_domain_allow_pypi": 200,
+ "egress_block_all": {
+  "pypi.org": "000FAIL",
+  "example.com": "000FAIL",
+  "api.anthropic.com": "000FAIL"
+ },
+ "inbound_block_all": 200,
+ "egress_after_update_domain": {
+  "pypi.org": "200",
+  "example.com": "000FAIL",
+  "api.anthropic.com": "000FAIL"
+ }
+}
