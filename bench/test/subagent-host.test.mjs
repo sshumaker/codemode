@@ -36,6 +36,28 @@ describe("the spawn() host-request handler", () => {
 		assert.deepEqual(Object.keys(harnessSubagentHostHandlers(() => ({}), ON)), [SUBAGENT_HOST_REQUEST]);
 	});
 
+	it("a child gets its end of the conversation only, and its siblings only when allowed", async () => {
+		const CHILD = {
+			HARNESS_SUBAGENTS: "0",
+			HARNESS_SUBAGENT_CHILD: "1",
+			HARNESS_SUBAGENT_DEPTH: "1",
+			HARNESS_SUBAGENT_BROKER_URL: "http://127.0.0.1:9/subagents",
+		};
+		assert.deepEqual(harnessSubagentHostHandlers(() => ({}), { ...CHILD, HARNESS_SUBAGENT_CHILD: "0" }), {});
+		assert.deepEqual(harnessSubagentHostHandlers(() => ({}), { ...CHILD, HARNESS_SUBAGENT_DEPTH: "0" }), {});
+		const fetch = fakeFetch(200, { ok: true, id: "q1" });
+		const h = harnessSubagentHostHandlers(() => ({}), CHILD, fetch);
+		assert.equal((await h[SUBAGENT_HOST_REQUEST]({ op: "ask", question: "which year?" })).id, "q1");
+		assert.equal(fetch.calls[0].url, "http://127.0.0.1:9/subagents/ask");
+		assert.equal(fetch.calls[0].body.parent.depth, 1);
+		for (const op of ["spawn", "wait", "send", "kill"])
+			await assert.rejects(h[SUBAGENT_HOST_REQUEST]({ op }), /not available to this agent/);
+		assert.equal(fetch.calls.length, 1);
+		const sib = harnessSubagentHostHandlers(() => ({}), { ...CHILD, HARNESS_SUBAGENT_SIBLINGS: "1" }, fetch);
+		await sib[SUBAGENT_HOST_REQUEST]({ op: "send", name: "b", text: "hi", mode: "follow_up" });
+		await assert.rejects(sib[SUBAGENT_HOST_REQUEST]({ op: "spawn" }), /not available to this agent/);
+	});
+
 	it("forwards the request with the loop's token, stamped with the parent's model", async () => {
 		const fetch = fakeFetch(200, { ok: true, child: { name: "a", state: "running" } });
 		const h = harnessSubagentHostHandlers(

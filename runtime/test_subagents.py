@@ -166,19 +166,21 @@ class TestArgv(Base):
         argv = self.spec("scout")["argv"]
         self.assertEqual(argv[0], "/usr/bin/node")
         self.assertEqual(argv[1], self.cli)
-        self.assertIn("-p", argv)
-        self.assertEqual(argv[argv.index("--mode") + 1], "json")
+        self.assertNotIn("-p", argv)
+        self.assertEqual(argv[argv.index("--mode") + 1], "rpc")
         self.assertIn("--no-context-files", argv)
         self.assertIn("--no-prompt-templates", argv)
         self.assertIn("--no-extensions", argv)
-        # The prompt is the trailing positional, never a flag value, and never
-        # anything a shell has parsed.
-        self.assertEqual(argv[-1], "do the thing")
+        # RPC mode: the prompt is not in argv at all. It travels in the spec and
+        # goes in on stdin as the first command, so no shell ever parses it.
+        self.assertNotIn("do the thing", argv)
+        self.assertEqual(self.spec("scout")["prompt"], "do the thing")
+        self.assertTrue(self.spec("scout")["rpc"])
 
     def test_a_multiline_prompt_survives_intact(self):
         prompt = "line one\nline two \\n not a newline\n'quoted' \"both\""
         self.spawner.spawn(prompt, name="scout")
-        self.assertEqual(self.spec("scout")["argv"][-1], prompt)
+        self.assertEqual(self.spec("scout")["prompt"], prompt)
 
     def test_tools_accept_a_list_or_a_string_and_default_to_ipython(self):
         self.spawner.spawn("a", name="one", tools=["read", "grep", "ls"])
@@ -995,11 +997,18 @@ class TestWaitGuidance(unittest.TestCase):
 
     def test_every_surface_teaches_the_wake_before_the_gather(self):
         for label, text in [("PROMPT", S.PROMPT), ("HELP", S.HELP), ("spawn", S.spawn.__doc__)]:
-            wake = text.find("jobs.wait(wake_after=")
+            wake = text.find("jobs.wait(")
             self.assertGreaterEqual(wake, 0, f"{label} does not teach jobs.wait")
             gather = text.find("gather_children(")
             if gather >= 0:
                 self.assertLess(wake, gather, f"{label} teaches gather_children first")
+
+    def test_the_taught_surface_is_agents_and_a_named_wait(self):
+        for label, text in [("PROMPT", S.PROMPT), ("HELP", S.HELP)]:
+            self.assertIn("agents.spawn(", text, label)
+            self.assertRegex(text, r"jobs\.wait\(\[a(, b)?\], wake_after=", label)
+        self.assertIn(".send(text, mode=\"follow_up\")", S.HELP)
+        self.assertIn("agents.ask_parent(", S.HELP)
 
     def test_the_gather_is_scoped_to_short_waits(self):
         for label, text in [("HELP", S.HELP), ("spawn", S.spawn.__doc__), ("gather", S.gather_children.__doc__)]:
