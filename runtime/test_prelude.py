@@ -498,7 +498,11 @@ class TestSubagentBinding(PreludeBase):
 
         ip, bound, _ = self.with_flag("1")
         self.assertTrue(bound, "HARNESS_SUBAGENTS=1 did not bind spawn")
-        self.assertIs(ip.user_ns.get("spawn"), S.spawn)
+        import agents as A
+
+        self.assertIsInstance(ip.user_ns.get("agents"), A.Agents)
+        spawn = ip.user_ns.get("spawn")
+        self.assertEqual(getattr(spawn, "__func__", None), A.Agents.spawn, "spawn is agents.spawn")
         self.assertIs(ip.user_ns.get("Agent"), S.Agent)
 
     def test_the_outcome_is_recorded_either_way(self):

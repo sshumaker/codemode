@@ -171,15 +171,34 @@ model allow-list and where the child's kernel runs. `spawn()` stays synchronous:
 answers host requests on the control channel, which ipykernel serves on its own thread
 while the cell blocks (pinned against a real kernel in `runtime/test_subagents_host.py`).
 
-Two waits, both bounded, and the wake is the default. `jobs.wait(wake_after=...)` under
+Two waits, both bounded, and the wake is the default. `jobs.wait(*names,
+wake_after=..., mode="all" | "any")` — names or handles, varargs or one list — under
 `HARNESS_WAIT_MODE=wake` arms a broker-side wake instead of the host sleep: the turn
-ends, and the broker resumes the conversation when the watched children finish or the
-deadline passes. `gather_children(...)` is for short waits only, children expected
-to finish within about a minute: it holds the cell for at most its timeout (default
-300 s, under the cell watchdog when one is set) and returns what finished, with
-`.pending` naming the rest — it never holds the kernel for a child's whole life,
-which is why `spawn` is a job and not an await. The docstrings, `help(spawn)` and the
-`spawn()` receipt all teach the wake first.
+ends, and the broker resumes the conversation when the named children finish (all, or
+the first), when one of them writes to the parent, or at the deadline, and says which.
+Unknown names raise at the call, naming the valid ones. With no names the watch set is
+every running job, as before; under the scheduler (`HARNESS_WAKE_FILE`) a named wait
+also records its mode and each named child's mailbox, and `scheduler.wake_reason`
+wakes on a message too. `gather_children(...)` is for short waits only, children
+expected to finish within about a minute: it holds the cell for at most its timeout
+(default 300 s, under the cell watchdog when one is set) and returns what finished,
+with `.pending` naming the rest — it never holds the kernel for a child's whole life,
+which is why `spawn` is a job and not an await.
+
+The model-facing surface is `agents` (`runtime/agents.py`): `agents.spawn` returns an
+`AgentHandle` (`.result` `.messages` `.send(text, mode)` `.wait(...)`), `agents.get`,
+`agents.list`. Messaging belongs to agents, never to job handles. A child's kernel gets
+the other end, `agents.report(text)` and `agents.ask_parent(question)` (blocking,
+bounded, None on timeout); it has no `spawn`, and reaches its siblings only with
+`HARNESS_SUBAGENT_SIBLINGS=1`. Delivery follows prime's agent-message model: `steer`
+interrupts the child's turn, `follow_up` queues after it, 16 KB per message, 20
+pending. To deliver mid-run, children run in prime's RPC mode, not `-p`: the file and
+broker transports' launcher (`subagent_run.py`) keeps stdin open and pumps the child's
+mailbox (`runtime/agent_mailbox.py`) into it as `prompt` commands with
+`streamingBehavior`; the host transport's broker (the assistant gateway) does the same
+over its own RPC connection. prime runs a queued follow-up as a separate run after
+`agent_end`, so the launcher closes stdin only when nothing it handed over is
+outstanding. The bare `spawn()` builtin is an alias of `agents.spawn`.
 
 Gates: `HARNESS_SUBAGENTS=1` binds `spawn`/`gather_children` (the prelude binds nothing
 at or past `HARNESS_SUBAGENT_MAX_DEPTH`, default 1) and registers the loop handler;

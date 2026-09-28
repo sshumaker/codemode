@@ -1,11 +1,10 @@
 """
-`spawn` — subagents, as jobs.
+`spawn` — subagents, as jobs. The model-facing surface is `agents` (agents.py).
 
-    spawn("read every test file and report the 5 that touch auth", name="scout")
-    jobs.wait(wake_after=120)          # last statement of the cell
+    scout = agents.spawn("read every test file and report the 5 that touch auth", name="scout")
+    jobs.wait([scout], wake_after="10m")   # last statement of the cell
     # ...next turn:
-    s = jobs.get("scout")
-    if s.done: print(s.result)
+    if scout.done: print(scout.result)
 
 Why a job and not an await
 --------------------------
@@ -563,7 +562,8 @@ class Subagents:
                 "max_turns": spec["max_turns"],
                 "max_cost": spec["max_cost"],
                 "depth": self.depth() + 1,
-                "argv": spec["argv"][:-1] + ["<prompt>"],
+                "child_dir": spec["child_dir"],
+                "argv": spec["argv"],
             },
         )
 
@@ -596,8 +596,8 @@ class Subagents:
         child = reply.get("child") or {}
         handle = HostSubagent(name, client, child)
         model = child.get("model") or cfg.model or "the parent's model"
-        print(f"spawned {name} on {model}; end the cell with jobs.wait(wake_after=...) and read "
-              f"jobs.get({name!r}).result when resumed")
+        print(f"spawned {name} on {model}. End the cell with jobs.wait([...], wake_after=...) "
+              f"naming it; when resumed, read agents.get({name!r}).result")
         return handle
 
     # -- argv composition --------------------------------------------------------
@@ -620,12 +620,14 @@ class Subagents:
         if cfg.system_prompt:
             appended.append(cfg.system_prompt)
 
+        # RPC mode, not `-p`: the prompt goes in on stdin as the first command and
+        # the pipe stays open, so the launcher can hand the child what its parent
+        # sends while it runs (subagent_run.RpcChild).
         argv = [
             node,
             cli,
-            "-p",
             "--mode",
-            "json",
+            "rpc",
             "--model",
             model,
             "--tools",
@@ -647,22 +649,23 @@ class Subagents:
         for text in appended:
             argv += ["--append-system-prompt", text]
         # Turn caps are enforced by the launcher, not by `--autonomous-max-turns`:
-        # that flag only applies under `--autonomous`, and print mode is not
-        # autonomous mode. Enforcing it where the stream is already being read means
-        # one mechanism for both caps, and the same one the benchmark runners use
+        # that flag only applies under `--autonomous`, which RPC mode is not.
+        # Enforcing it where the stream is already being read means one mechanism
+        # for both caps, and the same one the benchmark runners use
         # (bench/run-task.mjs enforceBudget).
-        argv.append(prompt)
 
         return {
             "name": name,
             "argv": argv,
+            "rpc": True,
+            "prompt": prompt,
             "cwd": cwd,
             "model": model,
             "tools": tools,
             "max_turns": int(cfg.max_turns) if cfg.max_turns else None,
             "max_cost": float(cfg.max_cost) if cfg.max_cost else None,
             "timeout": _jobs.parse_duration(cfg.timeout) if cfg.timeout is not None else DEFAULT_TIMEOUT,
-            "env": self._child_env(child_dir),
+            "env": self._child_env(child_dir, name),
             # The result sits beside the job's own log, because it is what the parent
             # reads and `<name>.result.txt` next to `<name>.log` is guessable from an
             # `ls`. Everything else goes UNDER `<name>.d/`, and that is not tidiness:
@@ -679,7 +682,7 @@ class Subagents:
             "child_dir": child_dir,
         }
 
-    def _child_env(self, child_dir: str) -> Dict[str, str]:
+    def _child_env(self, child_dir: str, name: str = "") -> Dict[str, str]:
         """
         What the child's environment must differ in. Everything else is inherited.
 
@@ -703,7 +706,14 @@ class Subagents:
             "HARNESS_JOB_CWD": "",  # inherit the child's own --cwd
             "PRIME_AGENT_CODING_AGENT_DIR": os.path.join(child_dir, "agent-home"),
             "HARNESS_PRELUDE_MARKER": os.path.join(child_dir, "prelude-status.txt"),
+            # The child's end of its mailbox (agents.report / agents.ask_parent),
+            # and where its siblings' mailboxes are when sibling messaging is on.
+            "HARNESS_SUBAGENT_SELF_DIR": child_dir,
+            "HARNESS_SUBAGENT_NAME": name,
+            "HARNESS_SUBAGENT_PARENT_JOB_DIR": self.store.job_dir,
         }
+        if str(self._env.get("HARNESS_SUBAGENT_SIBLINGS", "")).strip() == "1":
+            env["HARNESS_SUBAGENT_SIBLINGS"] = "1"
         for var in BOUNDARY_VARS:
             value = self._env.get(var)
             if value:
@@ -836,8 +846,11 @@ class HostSubagents:
     def kill(self, name: str) -> bool:
         return bool(self.request({"op": "kill", "name": name}).get("killed"))
 
-    def wait(self, seconds: int, watch: Sequence[str]) -> Dict[str, Any]:
-        return self.request({"op": "wait", "wake_after": seconds, "watch": list(watch)})
+    def wait(self, seconds: int, watch: Sequence[str], mode: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"op": "wait", "wake_after": seconds, "watch": list(watch)}
+        if mode:
+            payload["mode"] = mode
+        return self.request(payload)
 
 
 _HOST_DONE = ("done", "failed", "killed", "deadline", "limit", "stopped", "died", "missing")
@@ -970,33 +983,38 @@ class _HostJobs:
             lines.append("  ".join(bits))
         return lines
 
-    def arm_wake(self, seconds: int, watch: Sequence[str]) -> Optional[str]:
+    def arm_wake(self, seconds: int, watch: Sequence[str], mode: Optional[str] = None) -> Optional[str]:
         """Ask the loop to resume this conversation. Returns the note to print, or None."""
         client = self._client()
         if client is None:
             return None
-        reply = client.wait(seconds, watch)
+        reply = client.wait(seconds, watch, mode)
         pending = reply.get("pending") or []
-        if pending:
-            return (f"[wake armed: you are resumed when {', '.join(pending)} "
-                    f"{'finishes' if len(pending) == 1 else 'finish'}, or in {seconds}s]")
-        return f"[wake armed: you are resumed in {seconds}s]"
+        if not pending:
+            return f"[wake armed: you are resumed in {seconds}s]"
+        if len(pending) == 1:
+            when = f"{pending[0]} finishes or messages you"
+        elif (reply.get("mode") or mode) == "any":
+            when = f"the first of {', '.join(pending)} finishes, or one messages you"
+        else:
+            when = f"{', '.join(pending)} have all finished, or one messages you"
+        return f"[wake armed: you are resumed when {when}, or in {seconds}s]"
 
 
 async def gather_children(*names: Any, timeout: Any = None) -> "Gathered":
     """
     Wait for children to finish, for a bounded time, and return their answers.
 
-        spawn("list the files under tests/ that import auth", name="scout")
-        results = await gather_children("scout", timeout=60)
+        scout = agents.spawn("list the files under tests/ that import auth", name="scout")
+        results = await gather_children(scout, timeout=60)
         print(results["scout"])                     # the child's final text
         if results.pending:                         # still running at the deadline
-            jobs.wait(wake_after=600)               # LAST statement: resumed when done
+            jobs.wait(results.pending, wake_after="10m")   # LAST statement
 
     For SHORT waits only — children expected to finish within about a minute, like a
-    quick scout. Anything longer is `jobs.wait(wake_after=...)` as the cell's last
-    statement: it ends the turn and releases the kernel, and you are resumed when the
-    children finish. This holds the cell while it waits, which `spawn()` itself never
+    quick scout. Anything longer is `jobs.wait([...], wake_after=...)` as the cell's
+    last statement: it ends the turn and releases the kernel, and you are resumed when
+    the children finish. This holds the cell while it waits, which `spawn()` itself never
     does, so it is bounded: at most `timeout` seconds (default 300, ceiling
     HARNESS_GATHER_MAX_SECONDS and kept under the cell watchdog when one is set). At
     the deadline it RETURNS — it does not raise — with whatever finished; `.pending`
@@ -1039,12 +1057,12 @@ def _names(names: Sequence[Any]) -> List[str]:
     for n in names:
         if isinstance(n, (list, tuple, set)):
             out.extend(_names(list(n)))
-        elif isinstance(n, Job):
-            out.append(n.name)
         elif isinstance(n, str) and n.strip():
             out.append(n.strip())
+        elif isinstance(getattr(n, "name", None), str) and n.name:
+            out.append(n.name)  # a Job, or the AgentHandle agents.spawn returned
         else:
-            raise TypeError(f"gather_children takes child names or the handles spawn() returned, got {n!r}")
+            raise TypeError(f"gather_children takes agent names or the handles agents.spawn returned, got {n!r}")
     return out
 
 
@@ -1140,19 +1158,19 @@ def spawn(prompt: str, name: Optional[str] = None, **kw: Any) -> Job:
     Because it is a job, it does not block: `spawn` returns as soon as the child is
     recorded, and the child outlives this cell and this kernel.
 
-        spawn("read every file under tests/ and report the 5 that touch auth, "
-              "with one line each on what they cover", name="scout")
-        jobs.wait(wake_after=600)          # LAST statement of the cell: the turn ends
-        # ...you are called again when it finishes (or at the deadline):
-        s = jobs.get("scout")
-        if s.done and s.ok:
-            print(s.result)                # the child's final text
+        a = agents.spawn("read every file under tests/ and report the 5 that touch auth, "
+                         "with one line each on what they cover", name="scout")
+        jobs.wait([a], wake_after="10m")   # LAST statement of the cell: the turn ends
+        # ...you are called again when it finishes, messages you, or at the deadline:
+        if a.done and a.ok:
+            print(a.result)                # the child's final text
         else:
-            print(s.state, s.reason)
+            print(a.state, a.reason, a.messages)
 
-    Wait with `jobs.wait`, not a loop of sleeps or polls. Only when every child
-    should finish within about a minute is `await gather_children(..., timeout=60)`
-    the better wait: it blocks this cell, bounded, and returns what finished.
+    The bare `spawn(...)` bound in the kernel is `agents.spawn`. Wait with
+    `jobs.wait`, not a loop of sleeps or polls. Only when every child should finish
+    within about a minute is `await gather_children(a, timeout=60)` the better wait:
+    it blocks this cell, bounded, and returns what finished.
 
     Args:
         prompt: the whole subtask, in words. Self-contained: name the files, the
@@ -1221,13 +1239,13 @@ def list_subagents() -> List[dict]:
 PROMPT = """\
 ## Subagents
 
-`spawn(prompt, name=...)` starts a child agent on a subtask and returns immediately —
-it is a job, so you collect it exactly like one:
+`agents.spawn(prompt, name=...)` starts a child agent on a subtask and returns its
+handle immediately. Wait for children with `jobs.wait`, as the LAST statement:
 
-    spawn("read every file under tests/ and report the 5 that touch auth",
-          name="scout", tools=["read", "grep", "ls"])
-    jobs.wait(wake_after=180)      # LAST statement of the cell
-    print(jobs.get("scout").result)    # next turn: the child's final text
+    a = agents.spawn("read every file under tests/ and report the 5 that touch auth",
+                     name="scout", tools=["read", "grep", "ls"])
+    jobs.wait([a], wake_after="10m")   # resumed when it finishes or messages you
+    print(agents.get("scout").result)  # next turn: the child's final text
 
 name= is required. The child is a separate process with a fresh kernel: it sees your
 prompt and nothing else. Delegate a subtask that is self-contained, that can run
@@ -1237,44 +1255,52 @@ that needs your variables, your edits in progress, or this conversation.\
 
 
 HELP = """\
-spawn — subagents, as jobs
+agents — subagents
 
-  spawn(prompt, name=..., agent=None, tools=None, model=None,
-        max_turns=None, max_cost=None, timeout=None, system_prompt=None, cwd=None)
+  a = agents.spawn(prompt, name=..., agent=None, tools=None, model=None,
+                   max_turns=None, max_cost=None, timeout=None, system_prompt=None, cwd=None)
+  agents.get(name) -> handle          raises on a name you did not start
+  agents.list()    -> [{name, model, state, turns, cost, unread}]
 
-A child agent
-    spawn("read every file under tests/ and report the 5 that touch auth, one line "
-          "each on what they cover", name="scout", tools=["read", "grep", "ls"])
-    jobs.wait(wake_after=180)          # last line; the kernel is released
-    # ... next turn:
-    s = jobs.get("scout")
-    if s.done and s.ok:
-        print(s.result)                # the child's final text
+Fan out, then wait (the default)
+    a = agents.spawn("research topic A ...", name="a")
+    b = agents.spawn("research topic B ...", name="b")
+    jobs.wait([a, b], wake_after="10m")   # LAST statement: the turn ends, the kernel is free
+    # ... you are resumed when both finish, when either sends you a message, or at
+    # the deadline, and told which. Then:
+    print(a.result, b.result)
 
-A subagent IS a job
-    Same manifest, same jobs.get / jobs.kill, same survival across a kernel restart.
-    spawn() returns the moment the child is recorded — it never blocks — and the
-    child runs in its own process with its own fresh kernel.
+    jobs.wait("a", "b", wake_after=...) is the same; mode="any" wakes on the first.
+    One child: a.wait(wake_after="10m"). Never wait in a loop of sleeps or polls.
 
-    .result      the child's final text            .transcript  path to its full JSON stream
-    .turns       assistant turns it took           .cost        dollars it spent
-    .output      the job log: header, one line per turn, then the final text
-    .done .ok .state .reason .exit_code            as for any job
-
-Collecting: a wake by default, a bounded wait for quick ones
-    jobs.wait(wake_after=600)          # LAST statement: the turn ends, you are called
-                                       # again when they finish or at the deadline;
-                                       # then jobs.get("a").result
-    results = await gather_children("a", "b", timeout=60)
+A quick one: a bounded wait in the cell
+    results = await gather_children(a, timeout=60)
         # only when every child should finish within about a minute. Blocks the
-        # cell, returns at the deadline even if some are still running:
+        # cell and returns at the deadline even if some are still running:
         # results["a"] is a's final text; results.pending, .failed, .models
-    Never wait in a loop of sleeps or polls.
+
+The handle
+    .result      the child's final text, "" until it has finished
+    .messages    what it reported or asked, and what you sent it, oldest first
+    .state .done .ok .reason .model .turns .cost .transcript
+    .send(text, mode="follow_up")   queued after its current turn; mode="steer"
+                                    interrupts it. If it is waiting on ask_parent,
+                                    this is the answer.
+    .wait(wake_after=...)           jobs.wait(<this agent>, wake_after=...)
+
+    A child is also a job: jobs.get(name) and jobs.kill(name) work, and it survives
+    a kernel restart. Only agents take messages; job handles never do.
+
+What the child can do (its own `agents`)
+    agents.report("found 3 sources; checking prices next")   # a note to you; wakes a named wait
+    agents.ask_parent("2024 or 2025?")                       # blocks up to 10 min; None if no answer
+    A child cannot spawn, cannot reach the user, and talks to its siblings only when
+    the harness allows it.
 
 Reusable definitions
     scout = Agent(tools=["read", "grep", "ls"], max_turns=20, max_cost=0.25)
-    spawn("find the auth tests",    name="a", agent=scout)
-    spawn("find the billing tests", name="b", agent=scout, max_turns=40)
+    agents.spawn("find the auth tests",    name="a", agent=scout)
+    agents.spawn("find the billing tests", name="b", agent=scout, max_turns=40)
 
     agent= also takes a plain dict. Inline keywords override the definition.
 
@@ -1287,14 +1313,16 @@ Reusable definitions
     timeout      wall clock, default 30m ("10m", "1h", 600 all work)
 
 The handoff is serializable, both ways
-    In: the prompt string. Out: the final text, plus whatever the child wrote to
-    disk. The child does NOT share your kernel namespace — that would race between
-    concurrent children and let a crashing child corrupt you. So a subtask that
-    needs your variables or your half-finished edits is not a subagent task.
+    In: the prompt string, and what you send it. Out: its final text, its messages,
+    and whatever it wrote to disk. The child does NOT share your kernel namespace —
+    that would race between concurrent children and let a crashing child corrupt
+    you. So a subtask that needs your variables or your half-finished edits is not
+    a subagent task.
 
 Limits
     At most 4 children in flight (HARNESS_MAX_SUBAGENTS); the error lists what is
-    already running. A subagent cannot spawn subagents — it reports back instead.\
+    already running. A message is at most 16 KB, and at most 20 may wait undelivered.
+    `spawn(...)` still works and is agents.spawn.\
 """
 
 
@@ -1346,8 +1374,8 @@ def _cli(argv: List[str]) -> int:
         print(PROMPT)
         return 0
     if args.docs:
-        print(f"# spawn (subagents)\n\nAvailable in every cell as `spawn`; no import "
-              f"needed.\n\n```\n{HELP}\n```")
+        print(f"# agents (subagents)\n\n`agents`, `jobs` and `gather_children` are available in "
+              f"every cell; no import needed.\n\n```\n{HELP}\n```")
         return 0
 
     if args.spawn or args.collect:

@@ -105,6 +105,9 @@ class TestEvictionIsNotForever(ChaosBase):
         self.store.submit("echo started; sleep 300", name="victim", strict=False)
         self.assertTrue(wait_until(
             lambda: (self.store._read("victim") or {}).get("state") == "running"))
+        # "running" is recorded before the command's first line has run; kill it
+        # before the echo lands and there is no tail to be the evidence.
+        self.assertTrue(wait_until(lambda: "started" in self.store.get("victim").output))
         self.sigkill("victim")
         # First sighting stamps, second confirms — the fresh kernel polls.
         kernel = self.fresh_kernel()

@@ -51,7 +51,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # The tool wrapper greps stdout for this. Deliberately unmistakable.
 WAIT_SENTINEL = "__HARNESS_WAIT_SECONDS__"
@@ -189,6 +189,66 @@ def parse_duration(v: Any) -> int:
     if n < 0:
         raise ValueError(f"duration must not be negative: {v}")
     return int(n * (mult or 1))
+
+
+# `list` is shadowed below by the module's own jobs.list().
+_SEQUENCES = (type([]), tuple, type(set()))
+
+
+def _flatten_wait_names(items: Sequence[Any]) -> List[str]:
+    """
+    `jobs.wait`'s targets: names or handles, given as varargs or as one list.
+
+    One level of list only. A nested list is almost always a mistake (a list of
+    lists of handles built in a loop), and flattening it silently would hide that.
+    """
+    out: List[str] = []
+    for item in items:
+        if isinstance(item, _SEQUENCES):
+            for inner in item:
+                if isinstance(inner, _SEQUENCES):
+                    raise TypeError(
+                        "jobs.wait takes names or handles, as arguments or as ONE list: "
+                        "jobs.wait(['a', 'b'], wake_after='10m'). A nested list is not allowed."
+                    )
+                out.append(_wait_name(inner))
+        else:
+            out.append(_wait_name(item))
+    return out
+
+
+def _wait_name(item: Any) -> str:
+    if isinstance(item, str) and item.strip():
+        return item.strip()
+    name = getattr(item, "name", None)
+    if isinstance(name, str) and name and not isinstance(item, (int, float)):
+        return name
+    raise TypeError(
+        f"jobs.wait takes job or agent names, or the handles jobs.submit and agents.spawn "
+        f"return; got {item!r}. The deadline is the keyword: wake_after='10m'."
+    )
+
+
+def _legacy_positional_wait(names: Sequence[Any], wake_after: Any, known: Callable[[], List[str]]):
+    """
+    `jobs.wait(60)` and `jobs.wait("5m")` meant the deadline before waits took names.
+
+    Kept working: one positional number is always a duration, and one positional
+    string is a duration only when it parses as one and nothing by that name exists.
+    """
+    if wake_after is not None or len(names) != 1:
+        return names, wake_after
+    only = names[0]
+    if isinstance(only, (int, float)) and not isinstance(only, bool):
+        return (), only
+    if isinstance(only, str):
+        try:
+            parse_duration(only)
+        except ValueError:
+            return names, wake_after
+        if only.strip() not in known():
+            return (), only
+    return names, wake_after
 
 
 # --------------------------------------------------------------------------------
@@ -1451,18 +1511,32 @@ class JobStore:
             self._handles[name] = handle
         return handle
 
-    def wait(self, wake_after: Any = None) -> None:
+    def wait(self, *names: Any, wake_after: Any = None, mode: Optional[str] = None) -> None:
         """
         Put a deadline on the agent's attention. **Must be the last statement in the
         cell**, and it does not block: the kernel is released and the host waits.
 
-        This is also how you poll — check first, then wait, in one cell.
+            jobs.wait("build", wake_after="10m")             # wake when build finishes
+            jobs.wait([a, b], wake_after="10m")              # handles or names, a list or varargs
+            jobs.wait("a", "b", wake_after="10m", mode="any")  # the first of them
+            jobs.wait(wake_after=60)                         # no names: the deadline
+
+        Named waits wake when all (default) or any of the named jobs and agents
+        finish, when a named agent sends you a message, or at the deadline —
+        whichever comes first. This is also how you poll — check first, then wait,
+        in one cell.
         """
+        names, wake_after = _legacy_positional_wait(names, wake_after, self._known_names)
         if wake_after is None:
             raise TypeError(
-                "jobs.wait(wake_after=…) requires a duration, e.g. wake_after='5m'. "
+                "jobs.wait(..., wake_after=…) requires a duration, e.g. wake_after='5m'. "
                 "Check your jobs first, then wait — both in this cell."
             )
+        watch = self._resolve_watch(names)
+        if mode is not None and mode not in ("all", "any"):
+            raise ValueError(f"mode must be 'all' or 'any', got {mode!r}")
+        if watch and mode is None:
+            mode = "all"
         seconds = parse_duration(wake_after)
         clamped = max(self._min_wait, min(seconds, self._max_wait))
         pending = []
@@ -1473,21 +1547,25 @@ class JobStore:
                 pending.append(f"{fresh['name']}{mark}")
         for provider in _EXTERNAL:
             pending.extend(provider.live())
+        live_names = [p.split(" ")[0] for p in pending]
         note = ""
         if clamped != seconds:
             note = f" (requested {seconds}s, clamped to [{self._min_wait}, {self._max_wait}])"
+        watching = f"; watching {', '.join(watch)} ({mode})" if watch else ""
         # Context line first, sentinel last. The host replaces the sentinel in place
         # with "[waited Ns outside the kernel]", so emitting it first produced output
         # reading "waited 90s" above "waiting 90s" — past tense before future tense.
         self._emit(
             f"[waiting {clamped}s outside the kernel; nothing is held{note}. "
-            f"running jobs: {', '.join(pending) or 'none'}]"
+            f"running jobs: {', '.join(pending) or 'none'}{watching}]"
         )
         # Wake mode: the loop's broker resumes the conversation (the deadline, or a
-        # watched child finishing), so the turn ENDS here and nothing sleeps — not
-        # this kernel, and not the host tool wrapper either, so no sentinel.
+        # watched child finishing or messaging), so the turn ENDS here and nothing
+        # sleeps — not this kernel, and not the host tool wrapper either, so no
+        # sentinel. With no names the watch set is every running job, as it always was.
         if os.environ.get("HARNESS_WAIT_MODE") == "wake":
-            armed = [n for n in (p.arm_wake(clamped, [x.split(" ")[0] for x in pending]) for p in _EXTERNAL) if n]
+            target = watch if watch else live_names
+            armed = [n for n in (p.arm_wake(clamped, target, mode) for p in _EXTERNAL) if n]
             if armed:
                 for line in armed:
                     self._emit(line)
@@ -1495,9 +1573,11 @@ class JobStore:
             self._emit("[jobs] nothing here can resume you after a wait in this session; "
                        "check the job yourself in a later cell")
         # Scheduler mode (runtime/scheduler.py): the wake request goes on DISK,
-        # where a host that exits between turns can find it. {wake_at, watch}
-        # is the whole contract — deadline OR any watched job finishing, first
-        # one wins. Written atomically for the same reason job records are.
+        # where a host that exits between turns can find it. Named waits carry their
+        # mode and each named agent's mailbox, so a message can wake the session too;
+        # a wait with no names keeps the original contract — any running job
+        # finishing, or the deadline. Written atomically for the same reason job
+        # records are.
         wake_file = os.environ.get("HARNESS_WAKE_FILE")
         if wake_file:
             try:
@@ -1506,12 +1586,19 @@ class JobStore:
                 # against a 35-second build). Same pattern as _record's makedirs.
                 os.makedirs(os.path.dirname(wake_file) or ".", exist_ok=True)
                 tmp = f"{wake_file}.tmp"
+                request = {
+                    "wake_at": time.time() + clamped,
+                    "wake_after": clamped,
+                    "watch": watch if watch else live_names,
+                }
+                if watch:
+                    request.update({
+                        "mode": mode,
+                        "armed_at": time.time(),
+                        "mailboxes": self._mailboxes(watch),
+                    })
                 with open(tmp, "w") as fh:
-                    json.dump({
-                        "wake_at": time.time() + clamped,
-                        "wake_after": clamped,
-                        "watch": [p.split(" ")[0] for p in pending],
-                    }, fh)
+                    json.dump(request, fh)
                 os.replace(tmp, wake_file)
             except OSError as exc:
                 self._emit(f"[jobs] could not record the wake request ({exc}); "
@@ -1525,6 +1612,37 @@ class JobStore:
         # Sentinel first, then end the cell. Anything below the call is unreachable by
         # construction rather than by inspection — see WaitSignal.
         raise WaitSignal(clamped)
+
+    def _known_names(self) -> List[str]:
+        """Every job and agent a wait may name: this store's, and each provider's."""
+        names = [rec["name"] for rec in self._all() if rec.get("name")]
+        for provider in _EXTERNAL:
+            names.extend(r.get("name") for r in provider.records() if r.get("name"))
+        return sorted(set(names))
+
+    def _resolve_watch(self, items: Sequence[Any]) -> List[str]:
+        """The names a wait watches, checked against what exists, in the caller's order."""
+        wanted = _flatten_wait_names(items)
+        if not wanted:
+            return []
+        known = self._known_names()
+        unknown = [n for n in wanted if n not in known]
+        if unknown:
+            raise JobError(
+                f"jobs.wait: no job or agent named {', '.join(map(repr, unknown))}. "
+                f"You can wait on: {', '.join(known) or 'nothing — nothing has been started'}."
+            )
+        return [*dict.fromkeys(wanted)]
+
+    def _mailboxes(self, names: Sequence[str]) -> Dict[str, str]:
+        """Each named subagent's message directory, so the scheduler can see it speak."""
+        out = {}
+        for name in names:
+            rec = self._read(name) or {}
+            box = (rec.get("meta") or {}).get("child_dir")
+            if rec.get("kind") == "subagent" and box:
+                out[name] = box
+        return out
 
     def get(self, name: str) -> Optional[Job]:
         """
@@ -1853,8 +1971,8 @@ def submit(payload, name=None, **kw) -> Job:
     return _store().submit(payload, name, **kw)
 
 
-def wait(wake_after=None) -> None:
-    return _store().wait(wake_after)
+def wait(*names, wake_after=None, mode=None) -> None:
+    return _store().wait(*names, wake_after=wake_after, mode=mode)
 
 
 def get(name: str) -> Optional[Job]:

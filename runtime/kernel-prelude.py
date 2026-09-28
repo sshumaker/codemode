@@ -739,13 +739,32 @@ def _bind_subagents():
     agent that chose not to delegate, which is exactly the ambiguity that cost four
     TAC runs.
     """
+    import builtins
+
+    depth = int(os.environ.get("HARNESS_SUBAGENT_DEPTH", "0") or "0")
+    max_depth = int(os.environ.get("HARNESS_SUBAGENT_MAX_DEPTH", "1") or "1")
+    may_spawn = os.environ.get("HARNESS_SUBAGENTS") == "1" and depth < max_depth
+    if depth > 0 and not may_spawn:
+        # A child: no spawn, but a channel to its parent (agents.report / ask_parent)
+        # when whatever started it gave it one.
+        try:
+            import agents as _agents
+            child = _agents.for_this_kernel()
+        except Exception as exc:
+            _record("SUBAGENTS", f"child channel not available: {type(exc).__name__}: {exc}")
+            return
+        if child is None:
+            _record("SUBAGENTS", f"off at depth {depth} (no channel to the parent)")
+            return
+        _bind("agents", child)
+        _record("SUBAGENTS", f"child channel bound (depth={depth})")
+        return
     if os.environ.get("HARNESS_SUBAGENTS") != "1":
         _record("SUBAGENTS", "off (set HARNESS_SUBAGENTS=1 to enable)")
         return
-    import builtins
-
     try:
         import subagents
+        import agents as _agents
     except Exception as exc:
         _record("SUBAGENTS", f"not available: {type(exc).__name__}: {exc}")
         return
@@ -755,18 +774,26 @@ def _bind_subagents():
         # too, but a name that exists only to raise is guidance pointing nowhere.
         _record("SUBAGENTS", f"off at depth {spawner.depth()} (HARNESS_SUBAGENT_MAX_DEPTH={subagents.MAX_DEPTH})")
         return
-    builtins.spawn = subagents.spawn
-    builtins.Agent = subagents.Agent
-    builtins.gather_children = subagents.gather_children
+    api = _agents.Agents()
+    _bind("agents", api)
+    # The bare name benchmarks were written against: the same spawn, the same handle.
+    _bind("spawn", api.spawn)
+    _bind("Agent", subagents.Agent)
+    _bind("gather_children", subagents.gather_children)
+    _record("SUBAGENTS", f"agents bound (depth={spawner.depth()}, transport={spawner.transport()})")
+
+
+def _bind(name, value):
+    """A builtin that survives `%reset -f`, and the same name in the user namespace."""
+    import builtins
+
+    setattr(builtins, name, value)
     ip = _shell()
     if ip is not None:
         try:
-            ip.user_ns.setdefault("spawn", subagents.spawn)
-            ip.user_ns.setdefault("Agent", subagents.Agent)
-            ip.user_ns.setdefault("gather_children", subagents.gather_children)
+            ip.user_ns.setdefault(name, value)
         except Exception:
             pass  # builtins is enough
-    _record("SUBAGENTS", f"spawn bound (depth={spawner.depth()}, transport={spawner.transport()})")
 
 
 _bind_subagents()

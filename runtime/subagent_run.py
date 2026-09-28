@@ -3,13 +3,25 @@
 The subagent launcher: the process a spawned child actually runs as.
 
 `spawn()` writes a spec file and submits `python3 subagent_run.py <spec>` as an
-ordinary job. This is that command. It starts the real prime-agent CLI, reads its
-`--mode json` stream, and turns it into the two things a parent needs:
+ordinary job. This is that command. It starts the real prime-agent CLI in RPC mode,
+sends it the prompt, reads its event stream, and turns it into the two things a
+parent needs:
 
     <name>.result.txt   the child's final text — cheap to collect
     <name>.meta.json    turns, cost, tokens, tool calls, why it stopped
 
 plus `<name>.stream.jsonl`, the full trajectory, and `<name>.stderr.txt`.
+
+Why RPC mode and not `-p`
+-------------------------
+A one-shot print run cannot be spoken to once it starts. In RPC mode the prompt is
+the first command on stdin, and this launcher keeps the pipe open for the child's
+whole life: every message the parent `send`s lands in the child's mailbox
+(`runtime/agent_mailbox.py`), and the launcher hands it to prime as a `prompt` with
+`streamingBehavior` "steer" (interrupt the current turn) or "followUp" (queue after
+it). When the run ends with nothing left in the inbox, the launcher closes stdin and
+prime exits once idle; a message that arrives after the last turn but before that
+close starts one more turn instead of being lost.
 
 Why a launcher process rather than a shell one-liner
 ----------------------------------------------------
@@ -42,7 +54,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+
+from agent_mailbox import Mailbox
 
 # Exit codes the parent can read off `.exit_code`. 124 is `timeout(1)`'s, kept the
 # same so it means the same thing everywhere in this harness.
@@ -53,6 +68,144 @@ EXIT_LAUNCH_FAILED = 127
 
 def _emit(line: str) -> None:
     print(line, flush=True)
+
+
+INBOX_POLL_SECONDS = float(os.environ.get("HARNESS_SUBAGENT_INBOX_POLL", "0.3"))
+# After an agent_end with a message still untaken, how long to wait for prime's next run.
+LATE_RUN_GRACE_SECONDS = float(os.environ.get("HARNESS_SUBAGENT_LATE_RUN_GRACE", "10"))
+
+
+def wrap_message(msg: dict) -> str:
+    """What the child reads: who is speaking, and whether it interrupts."""
+    sender = msg.get("from") or "parent"
+    who = "the agent that started you" if sender == "parent" else f"your sibling agent {sender!r}"
+    how = "it interrupts what you were doing" if msg.get("mode") == "steer" else "a follow-up"
+    return f"[Message from {who} ({how})]\n{msg.get('text', '')}"
+
+
+class RpcChild:
+    """
+    One prime `--mode rpc` process and the parent's inbox, pumped into it.
+
+    The stdin pipe is the only writer's resource, so every write holds the lock; a
+    closed pipe means the run is over and later inbox lines are left for the
+    parent to see as undelivered rather than written into a dead process.
+    """
+
+    def __init__(self, proc: "subprocess.Popen", mailbox: Mailbox, name: str):
+        self.proc = proc
+        self.mailbox = mailbox
+        self.name = name
+        self.lock = threading.Lock()
+        self.closed = False
+        self.idle = False
+        # Messages handed to prime that it has not yet taken in as a user message.
+        # prime runs a queued follow-up as its own run AFTER agent_end, so an
+        # agent_end with any of these outstanding is not the end.
+        self.untaken = 0
+        self._prompt_seen = False
+        self._activity = 0
+        self._stop = threading.Event()
+        self._pump = threading.Thread(target=self._run, name=f"inbox-{name}", daemon=True)
+
+    def _write(self, command: dict) -> bool:
+        if self.closed or self.proc.stdin is None:
+            return False
+        try:
+            self.proc.stdin.write((json.dumps(command) + "\n").encode())
+            self.proc.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            self.closed = True
+            return False
+
+    def start(self, prompt: str) -> None:
+        with self.lock:
+            self._write({"type": "prompt", "message": prompt})
+        self._pump.start()
+
+    def _deliver_pending(self) -> int:
+        """Hand every undelivered inbox message to prime. Caller holds the lock."""
+        sent = 0
+        for msg in self.mailbox.pending():
+            if self.idle:
+                command = {"type": "prompt", "message": wrap_message(msg)}
+                self.idle = False
+            else:
+                behaviour = "steer" if msg.get("mode") == "steer" else "followUp"
+                command = {"type": "prompt", "message": wrap_message(msg), "streamingBehavior": behaviour}
+            if not self._write(command):
+                break
+            self.untaken += 1
+            self.mailbox.mark_delivered(int(msg.get("seq", 0)))
+            _emit(f"[{self.name}] <- {msg.get('from') or 'parent'} ({msg.get('mode')}): "
+                  f"{str(msg.get('text', '')).splitlines()[0][:120] if msg.get('text') else ''}")
+            sent += 1
+        return sent
+
+    def _run(self) -> None:
+        while not self._stop.wait(INBOX_POLL_SECONDS):
+            with self.lock:
+                if self.closed:
+                    return
+                self._deliver_pending()
+
+    def saw_event(self) -> None:
+        self._activity += 1
+
+    def took_message(self) -> None:
+        """prime took a user message into the conversation (the first is the task)."""
+        with self.lock:
+            if self._prompt_seen:
+                self.untaken = max(0, self.untaken - 1)
+            self._prompt_seen = True
+            self.idle = False
+
+    def agent_ended(self) -> bool:
+        """
+        The run went idle. True if it is over (stdin now closed), False if prime
+        still holds a message for another run or the inbox had more for it.
+        """
+        with self.lock:
+            self.idle = True
+            if self.untaken > 0:
+                self.idle = False
+                self._expect_another_run(self._activity)
+                return False
+            if self._deliver_pending():
+                return False
+            self.closed = True
+            self._stop.set()
+            try:
+                if self.proc.stdin is not None:
+                    self.proc.stdin.close()
+            except OSError:
+                pass
+            return True
+
+    def _expect_another_run(self, seen: int) -> None:
+        """If prime never starts the run it owes, end anyway rather than hang to the timeout."""
+        def check():
+            with self.lock:
+                if self.closed or self._activity != seen:
+                    return
+                self.untaken = 0
+            self.agent_ended()
+
+        timer = threading.Timer(LATE_RUN_GRACE_SECONDS, check)
+        timer.daemon = True
+        timer.start()
+
+    def close(self) -> None:
+        # No lock: this runs from the SIGALRM handler too, which may interrupt the
+        # main thread while it holds it. A write racing the close fails in _write.
+        self.closed = True
+        self._stop.set()
+        try:
+            if self.proc.stdin is not None:
+                self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
 
 
 class Collector:
@@ -157,6 +310,9 @@ def main(argv: list) -> int:
     _emit(f"[subagent {name}] transcript {spec['transcript']}")
 
     collector = Collector()
+    # Specs written before RPC children still carry the prompt as the last argv
+    # element; they run one-shot, as they were built to.
+    rpc = bool(spec.get("rpc"))
 
     def finish(code: int) -> int:
         meta = collector.as_dict()
@@ -169,7 +325,7 @@ def main(argv: list) -> int:
             "stopped": stopped,
             "transcript": spec["transcript"],
             "result": spec["result"],
-            "argv": spec["argv"][:-1] + ["<prompt>"],
+            "argv": spec["argv"] if rpc else spec["argv"][:-1] + ["<prompt>"],
         })
         # Result and meta are written even on a cap or a crash: a child stopped at
         # its turn limit has usually done most of the work, and throwing that away
@@ -191,6 +347,7 @@ def main(argv: list) -> int:
         errfile = open(spec["stderr"], "wb")
         child = subprocess.Popen(
             spec["argv"],
+            stdin=subprocess.PIPE if rpc else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=errfile,
             cwd=spec["cwd"] or None,
@@ -207,10 +364,16 @@ def main(argv: list) -> int:
         _emit(f"[subagent {name}] argv was: {spec['argv'][:2]}")
         return finish(EXIT_LAUNCH_FAILED)
 
+    driver = RpcChild(child, Mailbox(spec["child_dir"]), name) if rpc else None
+    if driver is not None:
+        driver.start(spec["prompt"])
+
     def kill_child(reason: str) -> None:
         nonlocal stopped
         if stopped is None:
             stopped = reason
+        if driver is not None:
+            driver.close()
         try:
             os.killpg(os.getpgid(child.pid), signal.SIGKILL)
         except OSError:
@@ -242,6 +405,17 @@ def main(argv: list) -> int:
             ev = json.loads(text)
         except json.JSONDecodeError:
             continue
+        if driver is not None:
+            driver.saw_event()
+        if driver is not None and ev.get("type") == "agent_end":
+            driver.agent_ended()
+            continue
+        if (driver is not None and ev.get("type") == "message_end"
+                and (ev.get("message") or {}).get("role") == "user"):
+            driver.took_message()
+        if driver is not None and ev.get("type") == "response" and ev.get("success") is False:
+            _emit(f"[subagent {name}] prime refused {ev.get('command')}: {ev.get('error')}")
+            continue
         if not collector.feed(ev):
             continue
         _emit(f"[{name} turn {collector.turns}] {collector.tool_calls} tool calls, "
@@ -254,6 +428,8 @@ def main(argv: list) -> int:
             break
 
     child.stdout.close()
+    if driver is not None:
+        driver.close()
     code = child.wait()
     try:
         signal.alarm(0)

@@ -42,6 +42,7 @@ import uuid
 from typing import Callable, List, Optional
 
 import jobs as J
+from agent_mailbox import Mailbox
 
 WAKE_FILE = "wake.json"
 SESSION_FILE = "session.json"
@@ -109,10 +110,12 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     """
     Why this session should wake NOW, or None.
 
-    A missing/unreadable wake.json is "not waiting" — never a wake. A watched
-    job that has left the live states wakes the session immediately (that is
-    what makes `wake_after` a deadline rather than a sleep); the deadline is
-    the backstop.
+    A missing/unreadable wake.json is "not waiting" — never a wake. A wait with no
+    names (the original contract) wakes when any running job it listed leaves the
+    live states. A named wait carries a mode: "all" wakes when every named job has
+    finished, "any" when the first one does; and a named subagent that wrote to its
+    parent since the wait was armed wakes it either way. The deadline is the
+    backstop for both.
     """
     try:
         with open(os.path.join(session_dir, WAKE_FILE)) as fh:
@@ -120,14 +123,39 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     except (OSError, ValueError):
         return None
     store = J.JobStore(_job_dir(session_dir), emit=lambda m: None)
-    for name in wake.get("watch") or []:
+    watch = wake.get("watch") or []
+    mode = wake.get("mode")
+    finished = {}
+    for name in watch:
         rec = store._refresh(store._read(name))
         if rec and rec.get("state") not in J.LIVE_STATES:
-            return f"job {name!r} finished: {rec.get('state')} — {rec.get('reason') or ''}".strip(" —")
+            finished[name] = f"{rec.get('state')} — {rec.get('reason') or ''}".strip(" —")
+    spoke = _messages_since(wake.get("mailboxes") or {}, wake.get("armed_at"))
+    if spoke:
+        return "; ".join(f"agent {n!r} sent you a message: {t}" for n, t in spoke.items())
+    if mode == "all":
+        if watch and len(finished) == len(watch):
+            return "all finished: " + ", ".join(f"{n} ({why})" for n, why in finished.items())
+    elif finished:
+        name, why = next(iter(finished.items()))
+        return f"job {name!r} finished: {why}"
     wake_at = wake.get("wake_at")
     if wake_at is not None and now() >= wake_at:
         return f"the requested wait of {wake.get('wake_after', '?')}s elapsed"
     return None
+
+
+def _messages_since(mailboxes: dict, armed_at: Optional[float]) -> dict:
+    """name -> the first line of the newest message each named agent sent since `armed_at`."""
+    out = {}
+    for name, box in mailboxes.items():
+        fresh = Mailbox(box).spoke_since(armed_at)
+        if fresh:
+            last = fresh[-1]
+            label = "asks" if last.get("kind") == "ask" else "reports"
+            text = str(last.get("text") or "").strip()
+            out[name] = f"{label}: {(text.splitlines() or [''])[0][:200]}"
+    return out
 
 
 def _job_dir(session_dir: str) -> str:
