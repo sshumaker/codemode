@@ -596,8 +596,8 @@ class Subagents:
         child = reply.get("child") or {}
         handle = HostSubagent(name, client, child)
         model = child.get("model") or cfg.model or "the parent's model"
-        print(f"spawned {name} on {model}; collect it with gather_children({name!r}) "
-              f"or jobs.get({name!r})")
+        print(f"spawned {name} on {model}; end the cell with jobs.wait(wake_after=...) and read "
+              f"jobs.get({name!r}).result when resumed")
         return handle
 
     # -- argv composition --------------------------------------------------------
@@ -987,17 +987,20 @@ async def gather_children(*names: Any, timeout: Any = None) -> "Gathered":
     """
     Wait for children to finish, for a bounded time, and return their answers.
 
-        spawn("research topic A ...", name="a")
-        spawn("research topic B ...", name="b")
-        results = await gather_children("a", "b", timeout=300)
-        print(results["a"], results["b"])          # each child's final text
+        spawn("list the files under tests/ that import auth", name="scout")
+        results = await gather_children("scout", timeout=60)
+        print(results["scout"])                     # the child's final text
         if results.pending:                         # still running at the deadline
             jobs.wait(wake_after=600)               # LAST statement: resumed when done
 
-    This holds the cell while it waits, which `spawn()` itself never does, so it is
-    bounded: at most `timeout` seconds (default 300, ceiling HARNESS_GATHER_MAX_SECONDS
-    and kept under the cell watchdog when one is set). At the deadline it RETURNS —
-    it does not raise — with whatever finished; `.pending` names the rest.
+    For SHORT waits only — children expected to finish within about a minute, like a
+    quick scout. Anything longer is `jobs.wait(wake_after=...)` as the cell's last
+    statement: it ends the turn and releases the kernel, and you are resumed when the
+    children finish. This holds the cell while it waits, which `spawn()` itself never
+    does, so it is bounded: at most `timeout` seconds (default 300, ceiling
+    HARNESS_GATHER_MAX_SECONDS and kept under the cell watchdog when one is set). At
+    the deadline it RETURNS — it does not raise — with whatever finished; `.pending`
+    names the rest.
 
     Args:
         names: child names or the handles spawn() returned; none means every child
@@ -1139,15 +1142,17 @@ def spawn(prompt: str, name: Optional[str] = None, **kw: Any) -> Job:
 
         spawn("read every file under tests/ and report the 5 that touch auth, "
               "with one line each on what they cover", name="scout")
-        results = await gather_children("scout", timeout=300)   # bounded wait
-        print(results["scout"])            # or, for a long child, instead:
-        jobs.wait(wake_after=180)          # LAST statement of the cell
-        # ...you are called again afterwards:
+        jobs.wait(wake_after=600)          # LAST statement of the cell: the turn ends
+        # ...you are called again when it finishes (or at the deadline):
         s = jobs.get("scout")
         if s.done and s.ok:
             print(s.result)                # the child's final text
         else:
             print(s.state, s.reason)
+
+    Wait with `jobs.wait`, not a loop of sleeps or polls. Only when every child
+    should finish within about a minute is `await gather_children(..., timeout=60)`
+    the better wait: it blocks this cell, bounded, and returns what finished.
 
     Args:
         prompt: the whole subtask, in words. Self-contained: name the files, the
@@ -1256,12 +1261,15 @@ A subagent IS a job
     .output      the job log: header, one line per turn, then the final text
     .done .ok .state .reason .exit_code            as for any job
 
-Collecting: a bounded wait, or a wake
-    results = await gather_children("a", "b", timeout=300)
-        # returns at the deadline even if some are still running:
+Collecting: a wake by default, a bounded wait for quick ones
+    jobs.wait(wake_after=600)          # LAST statement: the turn ends, you are called
+                                       # again when they finish or at the deadline;
+                                       # then jobs.get("a").result
+    results = await gather_children("a", "b", timeout=60)
+        # only when every child should finish within about a minute. Blocks the
+        # cell, returns at the deadline even if some are still running:
         # results["a"] is a's final text; results.pending, .failed, .models
-    jobs.wait(wake_after=600)          # instead: end the cell, be called again
-                                       # when they finish or at the deadline
+    Never wait in a loop of sleeps or polls.
 
 Reusable definitions
     scout = Agent(tools=["read", "grep", "ls"], max_turns=20, max_cost=0.25)

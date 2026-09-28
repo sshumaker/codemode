@@ -171,13 +171,15 @@ model allow-list and where the child's kernel runs. `spawn()` stays synchronous:
 answers host requests on the control channel, which ipykernel serves on its own thread
 while the cell blocks (pinned against a real kernel in `runtime/test_subagents_host.py`).
 
-Two waits, both bounded. `gather_children(...)` holds the cell for at most its timeout
-(default 300 s, under the cell watchdog when one is set) and returns what finished,
-with `.pending` naming the rest — it never holds the kernel for a child's whole life,
-which is why `spawn` is a job and not an await. `jobs.wait(wake_after=...)` under
+Two waits, both bounded, and the wake is the default. `jobs.wait(wake_after=...)` under
 `HARNESS_WAIT_MODE=wake` arms a broker-side wake instead of the host sleep: the turn
 ends, and the broker resumes the conversation when the watched children finish or the
-deadline passes.
+deadline passes. `gather_children(...)` is for short waits only, children expected
+to finish within about a minute: it holds the cell for at most its timeout (default
+300 s, under the cell watchdog when one is set) and returns what finished, with
+`.pending` naming the rest — it never holds the kernel for a child's whole life,
+which is why `spawn` is a job and not an await. The docstrings, `help(spawn)` and the
+`spawn()` receipt all teach the wake first.
 
 Gates: `HARNESS_SUBAGENTS=1` binds `spawn`/`gather_children` (the prelude binds nothing
 at or past `HARNESS_SUBAGENT_MAX_DEPTH`, default 1) and registers the loop handler;
