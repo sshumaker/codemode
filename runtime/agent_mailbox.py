@@ -12,6 +12,7 @@ filesystem. The host transport keeps the same conversation in the broker instead
       outbox.jsonl     child -> parent: {"seq", "kind": report|ask|ask_closed, "text", "id", "at"}
       answers.jsonl    parent -> a child's open question: {"id", "text", "at"}
       outbox.read      the last outbox seq the parent has read
+      inbox.closed     written by the launcher when the child's run is over: no more sends
 
 Every file has one kind of writer and is appended under an exclusive lock, so a
 line is never interleaved with another; readers tolerate a partial last line.
@@ -24,18 +25,21 @@ first: while the child is blocked in `agents.ask_parent`, the parent's next
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 INBOX = "inbox.jsonl"
 DELIVERED = "inbox.delivered"
 OUTBOX = "outbox.jsonl"
 ANSWERS = "answers.jsonl"
 READ = "outbox.read"
+CLOSED = "inbox.closed"
+LOCK = "mailbox.lock"
 
 # prime's own limits for agent messages (core/agent-messages.ts).
 MAX_CHARS = 16_384
@@ -75,6 +79,17 @@ class Mailbox:
         return os.path.join(self.dir, name)
 
     # -- low level -------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """One lock for decisions that read one file and write another (send vs a closing question)."""
+        os.makedirs(self.dir, exist_ok=True)
+        with open(self._path(LOCK), "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
     def _append(self, name: str, record: Dict[str, Any], seq: bool = True) -> Dict[str, Any]:
         os.makedirs(self.dir, exist_ok=True)
@@ -139,18 +154,36 @@ class Mailbox:
         """
         check_text(text)
         check_mode(mode)
-        question = self.open_question()
-        if question is not None and sender == "parent":
-            return self._append(ANSWERS, {"id": question["id"], "text": text, "at": time.time()}, seq=False) | {
-                "kind": "answer"
-            }
-        if len(self.pending()) >= MAX_PENDING:
-            raise MailboxError(
-                f"{MAX_PENDING} messages to this agent are still waiting to be delivered. "
-                "Wait for it to catch up before sending more."
-            )
-        rec = self._append(INBOX, {"mode": mode, "text": text, "from": sender, "at": time.time()})
-        return {**rec, "kind": mode}
+        with self._locked():
+            if os.path.exists(self._path(CLOSED)):
+                raise MailboxError("this agent has finished, so nothing can reach it. "
+                                   "Start a new agent if there is more to do.")
+            question = self.open_question()
+            if question is not None and sender == "parent":
+                rec = self._append(ANSWERS, {"id": question["id"], "text": text, "at": time.time()}, seq=False)
+                return {**rec, "kind": "answer"}
+            if len(self.pending()) >= MAX_PENDING:
+                raise MailboxError(
+                    f"{MAX_PENDING} messages to this agent are still waiting to be delivered. "
+                    "Wait for it to catch up before sending more."
+                )
+            rec = self._append(INBOX, {"mode": mode, "text": text, "from": sender, "at": time.time()})
+            return {**rec, "kind": mode}
+
+    def mark_closed(self) -> None:
+        """close_inbox without the lock, for a signal handler that must not block."""
+        try:
+            with open(self._path(CLOSED), "w") as fh:
+                fh.write(str(time.time()))
+        except OSError:
+            pass
+
+    def close_inbox(self) -> List[Dict[str, Any]]:
+        """The run is over: refuse later sends. Returns what arrived but was never delivered."""
+        with self._locked():
+            with open(self._path(CLOSED), "w") as fh:
+                fh.write(str(time.time()))
+            return self.pending()
 
     # -- child -> parent -------------------------------------------------------
 
@@ -170,8 +203,16 @@ class Mailbox:
                 return str(rec.get("text") or "")
         return None
 
-    def close_question(self, qid: str) -> None:
-        self._append(OUTBOX, {"kind": "ask_closed", "id": qid, "text": "", "at": time.time()})
+    def close_question(self, qid: str) -> Optional[str]:
+        """
+        Give up on a question. Returns an answer that landed just before the close,
+        so a race with the parent's send never loses the answer.
+        """
+        with self._locked():
+            answer = self.answer_for(qid)
+            if answer is None:
+                self._append(OUTBOX, {"kind": "ask_closed", "id": qid, "text": "", "at": time.time()})
+            return answer
 
     def open_question(self) -> Optional[Dict[str, Any]]:
         """The child's newest question that is neither answered nor given up on."""
@@ -224,6 +265,11 @@ class Mailbox:
         seqs = [r.get("seq", 0) for r in self._lines(OUTBOX)]
         if seqs:
             self._set_int(READ, max(seqs))
+
+    def unread_messages(self) -> List[Dict[str, Any]]:
+        seen = self._int(READ)
+        return [r for r in self._lines(OUTBOX)
+                if r.get("kind") in ("report", "ask") and r.get("seq", 0) > seen]
 
     def spoke_since(self, at: Optional[float]) -> List[Dict[str, Any]]:
         return [

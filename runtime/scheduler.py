@@ -146,16 +146,33 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
 
 
 def _messages_since(mailboxes: dict, armed_at: Optional[float]) -> dict:
-    """name -> the first line of the newest message each named agent sent since `armed_at`."""
+    """
+    name -> the newest message each named agent sent that the parent has not read.
+
+    Unread, not "since the wait was armed": a report or a question sent while the
+    parent was still in its turn would otherwise neither wake it nor ever be shown,
+    and a child blocked in ask_parent would wait out its whole timeout.
+    """
     out = {}
     for name, box in mailboxes.items():
-        fresh = Mailbox(box).spoke_since(armed_at)
+        fresh = Mailbox(box).unread_messages()
         if fresh:
             last = fresh[-1]
             label = "asks" if last.get("kind") == "ask" else "reports"
             text = str(last.get("text") or "").strip()
             out[name] = f"{label}: {(text.splitlines() or [''])[0][:200]}"
     return out
+
+
+def consume_messages(session_dir: str) -> None:
+    """The wake that carries a message marks it read, so waiting again does not re-fire on it."""
+    try:
+        with open(os.path.join(session_dir, WAKE_FILE)) as fh:
+            wake = json.load(fh)
+    except (OSError, ValueError):
+        return
+    for box in (wake.get("mailboxes") or {}).values():
+        Mailbox(box).mark_read()
 
 
 def _job_dir(session_dir: str) -> str:
@@ -225,6 +242,7 @@ def scan_once(sessions_root: str, *, now=time.time, runner=subprocess.run,
             if not reason:
                 continue
             log(f"[scheduler] waking {name}: {reason}")
+            consume_messages(session_dir)
             code = run_wake(session_dir, reason, runner=runner)
             log(f"[scheduler] {name} exited {code}")
             woken.append(name)

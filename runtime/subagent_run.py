@@ -150,8 +150,16 @@ class RpcChild:
                     return
                 self._deliver_pending()
 
-    def saw_event(self) -> None:
-        self._activity += 1
+    def saw_event(self, ev: dict) -> None:
+        # Only the start of a run counts as prime keeping its promise: a response to
+        # a command, or anything else, must not cancel the late-run check.
+        if ev.get("type") in ("agent_start", "message_start"):
+            self._activity += 1
+
+    def refused(self) -> None:
+        """prime refused a prompt we handed it: it will never take that one in."""
+        with self.lock:
+            self.untaken = max(0, self.untaken - 1)
 
     def took_message(self) -> None:
         """prime took a user message into the conversation (the first is the task)."""
@@ -173,6 +181,9 @@ class RpcChild:
                 self._expect_another_run(self._activity)
                 return False
             if self._deliver_pending():
+                return False
+            # Refuse sends from here on; anything that beat the close gets one more run.
+            if self.mailbox.close_inbox() and self._deliver_pending():
                 return False
             self.closed = True
             self._stop.set()
@@ -201,6 +212,7 @@ class RpcChild:
         # main thread while it holds it. A write racing the close fails in _write.
         self.closed = True
         self._stop.set()
+        self.mailbox.mark_closed()
         try:
             if self.proc.stdin is not None:
                 self.proc.stdin.close()
@@ -406,7 +418,7 @@ def main(argv: list) -> int:
         except json.JSONDecodeError:
             continue
         if driver is not None:
-            driver.saw_event()
+            driver.saw_event(ev)
         if driver is not None and ev.get("type") == "agent_end":
             driver.agent_ended()
             continue
@@ -415,6 +427,8 @@ def main(argv: list) -> int:
             driver.took_message()
         if driver is not None and ev.get("type") == "response" and ev.get("success") is False:
             _emit(f"[subagent {name}] prime refused {ev.get('command')}: {ev.get('error')}")
+            if ev.get("command") == "prompt":
+                driver.refused()
             continue
         if not collector.feed(ev):
             continue
