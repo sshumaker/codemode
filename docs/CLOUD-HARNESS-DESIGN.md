@@ -158,6 +158,32 @@ keep the direct path; a kernel that has had credentials scrubbed and no broker
 configured now refuses to spawn rather than producing a child that cannot reach
 the provider.
 
+### 3.5 The host-request transport (2026-09-28)
+
+The file-backed request above needs a broker that shares the kernel's filesystem. A
+remote kernel (Daytona, `runtime/daytona/`) does not, so `spawn()` has a second
+transport, `HARNESS_SUBAGENT_TRANSPORT=host`: the same request travels as a
+`harness.subagent` kernel host request — the channel prime already runs for every
+kernel, local or remote — and `scripts/patches/subagent-host.ts`, in the loop, forwards
+it to `HARNESS_SUBAGENT_BROKER_URL` with the loop's egress token and the loop's own
+model and thinking level. The broker (the assistant's gateway) owns defaults, caps, the
+model allow-list and where the child's kernel runs. `spawn()` stays synchronous: prime
+answers host requests on the control channel, which ipykernel serves on its own thread
+while the cell blocks (pinned against a real kernel in `runtime/test_subagents_host.py`).
+
+Two waits, both bounded. `gather_children(...)` holds the cell for at most its timeout
+(default 300 s, under the cell watchdog when one is set) and returns what finished,
+with `.pending` naming the rest — it never holds the kernel for a child's whole life,
+which is why `spawn` is a job and not an await. `jobs.wait(wake_after=...)` under
+`HARNESS_WAIT_MODE=wake` arms a broker-side wake instead of the host sleep: the turn
+ends, and the broker resumes the conversation when the watched children finish or the
+deadline passes.
+
+Gates: `HARNESS_SUBAGENTS=1` binds `spawn`/`gather_children` (the prelude binds nothing
+at or past `HARNESS_SUBAGENT_MAX_DEPTH`, default 1) and registers the loop handler;
+without it the host refuses the request type. The broker enforces depth again from the
+requesting agent's token.
+
 ## 4. What we take from prime, what we drop
 
 **Take:**
