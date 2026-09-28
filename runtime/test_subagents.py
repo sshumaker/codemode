@@ -989,5 +989,23 @@ class TestCli(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), S.PROMPT.strip())
 
 
+
+class TestWaitGuidance(unittest.TestCase):
+    """The wake is the taught wait; the blocking gather is for children that finish fast."""
+
+    def test_every_surface_teaches_the_wake_before_the_gather(self):
+        for label, text in [("PROMPT", S.PROMPT), ("HELP", S.HELP), ("spawn", S.spawn.__doc__)]:
+            wake = text.find("jobs.wait(wake_after=")
+            self.assertGreaterEqual(wake, 0, f"{label} does not teach jobs.wait")
+            gather = text.find("gather_children(")
+            if gather >= 0:
+                self.assertLess(wake, gather, f"{label} teaches gather_children first")
+
+    def test_the_gather_is_scoped_to_short_waits(self):
+        for label, text in [("HELP", S.HELP), ("spawn", S.spawn.__doc__), ("gather", S.gather_children.__doc__)]:
+            self.assertIn("within about a minute", text, label)
+            self.assertNotIn("timeout=300)", text, f"{label} still shows a five-minute gather")
+
+
 if __name__ == "__main__":
     unittest.main()
