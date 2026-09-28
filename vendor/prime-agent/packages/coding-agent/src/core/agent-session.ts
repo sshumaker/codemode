@@ -269,6 +269,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.js"
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
+import { harnessSubagentHostHandlers } from "./harness-subagents.js";
 import { addAssistantUsage, emptyUsage } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
@@ -4302,7 +4303,7 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
-			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
+			allowRecursion: this._rlmDepth < this._rlmMaxDepth && process.env.HARNESS_RLM === "1",
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
 			// Benchmark reproducibility: harness state persists across runs and
@@ -8782,6 +8783,15 @@ export class AgentSession {
 		if (this._mcpManager) {
 			Object.assign(handlers, this._mcpManager.hostHandlers());
 		}
+		// harness: rlm.run is not an agent-facing subagent path; spawn() is.
+		if (process.env.HARNESS_RLM !== "1") delete handlers["rlm.run"];
+		Object.assign(
+			handlers,
+			harnessSubagentHostHandlers(() => ({
+				model: this.model ? `${this.model.provider}/${this.model.id}` : undefined,
+				thinking: this.thinkingLevel,
+			})),
+		);
 		return handlers;
 	}
 

@@ -1021,6 +1021,124 @@ sub(
 	"?? harnessThinkingDisplay() ??",
 );
 
+// --- subagents: spawn() is the one real path; rlm.run is hidden --------------
+//
+// prime's own recursive call, `rlm.run`, starts a child on prime's default model
+// (not the parent's), invisible to the host, with no budget. Two jobs reached it by
+// introspection. So by default it refuses with a
+// pointer at spawn(), the host no longer serves its request, and nothing the model
+// is told mentions it. HARNESS_RLM=1 restores all three, for reproducing earlier
+// benchmark runs. The rest of `rlm` (host_request, harness state, find_models) is
+// infrastructure other skills use, and stays.
+//
+// spawn()'s host transport (runtime/subagents.py) sends `harness.subagent` host
+// requests; scripts/patches/subagent-host.ts forwards them to the loop-side broker,
+// stamped with the parent's model and thinking level.
+log("\nsubagents:");
+const RLM_RUNTIME = "../../../prime-agent-runtime/src/rlm/__init__.py";
+sub(
+	RLM_RUNTIME,
+	'async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:\n    """Spawn a recursive Prime Agent child and return once its task is admitted.\n\n    ``model`` selects a child with an exact ``provider/model`` selector.\n    """\n',
+	`${readFileSync(join(ROOT, "scripts/patches/rlm-run-gate.py"), "utf8").trimEnd()}\n`,
+	"rlm.run refuses unless HARNESS_RLM=1",
+	"def _harness_rlm_refusal()",
+);
+place("core/harness-subagents.ts", "subagent-host.ts", "spawn() host-request handler");
+sub(
+	"core/agent-session.ts",
+	'import { addAssistantUsage, emptyUsage } from "./usage.js";',
+	'import { harnessSubagentHostHandlers } from "./harness-subagents.js";\nimport { addAssistantUsage, emptyUsage } from "./usage.js";',
+	"agent-session imports the subagent host handler",
+	'from "./harness-subagents.js"',
+);
+sub(
+	"core/agent-session.ts",
+	"\t\tif (this._mcpManager) {\n\t\t\tObject.assign(handlers, this._mcpManager.hostHandlers());\n\t\t}\n\t\treturn handlers;",
+	"\t\tif (this._mcpManager) {\n\t\t\tObject.assign(handlers, this._mcpManager.hostHandlers());\n\t\t}\n" +
+		"\t\t// harness: rlm.run is not an agent-facing subagent path; spawn() is.\n" +
+		'\t\tif (process.env.HARNESS_RLM !== "1") delete handlers["rlm.run"];\n' +
+		"\t\tObject.assign(\n\t\t\thandlers,\n\t\t\tharnessSubagentHostHandlers(() => ({\n" +
+		"\t\t\t\tmodel: this.model ? `${this.model.provider}/${this.model.id}` : undefined,\n" +
+		"\t\t\t\tthinking: this.thinkingLevel,\n\t\t\t})),\n\t\t);\n\t\treturn handlers;",
+	"the host serves spawn() and not rlm.run",
+	"harnessSubagentHostHandlers(() => ({",
+);
+sub(
+	"core/agent-session.ts",
+	"\t\t\tallowRecursion: this._rlmDepth < this._rlmMaxDepth,\n",
+	'\t\t\tallowRecursion: this._rlmDepth < this._rlmMaxDepth && process.env.HARNESS_RLM === "1",\n',
+	"rlm recursion guidance only under HARNESS_RLM=1",
+	'this._rlmMaxDepth && process.env.HARNESS_RLM === "1"',
+);
+sub(
+	"core/prompts/rlm.ts",
+	'tool orchestration, and recursive subcalls. Use it to keep',
+	'tool orchestration${process.env.HARNESS_RLM === "1" ? ", and recursive subcalls" : ""}. Use it to keep',
+	"control prompt names recursive subcalls only under HARNESS_RLM=1",
+	'${process.env.HARNESS_RLM === "1" ? ", and recursive subcalls" : ""}',
+);
+sub(
+	"core/prompts/rlm.ts",
+	'\t"IPython is the agent\'s long-lived notebook:',
+	'\t`IPython is the agent\'s long-lived notebook:',
+	"control prompt first line is a template literal",
+	'\t`IPython is the agent\'s long-lived notebook:',
+);
+sub(
+	"core/prompts/rlm.ts",
+	'preserve useful state across turns or compaction.",',
+	"preserve useful state across turns or compaction.`,",
+	"control prompt first line closes as a template literal",
+	"preserve useful state across turns or compaction.`,",
+);
+sub(
+	"core/prompts/rlm.ts",
+	"`arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent",
+	"`arguments` contract. \" + (process.env.HARNESS_RLM === \"1\" ? \"Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. \" : \"\") + \"Do not invent",
+	"control prompt names rlm() delegation only under HARNESS_RLM=1",
+	'(process.env.HARNESS_RLM === "1" ? "Spawn a reusable delegation spec',
+);
+sub(
+	"core/prompts/rlm.ts",
+	"\t\t`Recursive agent depth: ${depth}`,\n",
+	'\t\t...(process.env.HARNESS_RLM === "1" ? [`Recursive agent depth: ${depth}`] : []),\n',
+	"recursion depth line only under HARNESS_RLM=1",
+	'[`Recursive agent depth: ${depth}`] : []',
+);
+sub(
+	"../skills/skill-creator/references/python-skills.md",
+	'A Python skill runs inside the agent\'s kernel, so it can itself spawn recursive sub-agents with `import rlm` and `await rlm.run("subtask")` — useful for skills that delegate open-ended work.',
+	"A Python skill runs inside the agent's kernel. It does not start child agents itself (`rlm.run` is disabled in this harness); delegation is the agent's decision, not a skill's.",
+	"skill-creator reference no longer teaches rlm.run",
+	"`rlm.run` is disabled in this harness); delegation",
+);
+
+// --- Claude Opus 5.5 ------------------------------------------------------------
+//
+// Not in the vendored catalogue yet, and a subagent allowed on it must resolve.
+// Thinking cannot be disabled on it (an explicit `thinking: disabled` is a 400), so
+// it joins the always-on adaptive set alongside Fable/Mythos.
+log("\nclaude opus 5.5:");
+const AI_MODELS = "../../ai/src/models.generated.ts";
+// The pristine replay extracts only the files it can reproduce, and the catalogue is
+// regenerated upstream (provenance.test.mjs asserts the entry in the built tree).
+if (!existsSync(join(PRIME, AI_MODELS))) log(`  skipped ${AI_MODELS} :: not in this tree`);
+else sub(
+	AI_MODELS,
+	'\t\t"claude-sonnet-4-5": {\n\t\t\tid: "claude-sonnet-4-5",\n\t\t\tname: "Claude Sonnet 4.5 (latest)",\n\t\t\tapi: "anthropic-messages",\n\t\t\tprovider: "anthropic",',
+	'\t\t"claude-opus-5-5": {\n\t\t\tid: "claude-opus-5-5",\n\t\t\tname: "Claude Opus 5.5",\n\t\t\tapi: "anthropic-messages",\n\t\t\tprovider: "anthropic",\n\t\t\tbaseUrl: "https://api.anthropic.com",\n\t\t\treasoning: true,\n\t\t\tthinkingLevelMap: {"xhigh":"xhigh","max":"max"},\n\t\t\tinput: ["text", "image"],\n\t\t\tcost: {\n\t\t\t\tinput: 4,\n\t\t\t\toutput: 20,\n\t\t\t\tcacheRead: 0.2,\n\t\t\t\tcacheWrite: 5,\n\t\t\t},\n\t\t\tcontextWindow: 1000000,\n\t\t\tmaxTokens: 128000,\n\t\t} satisfies Model<"anthropic-messages">,\n' +
+		'\t\t"claude-sonnet-4-5": {\n\t\t\tid: "claude-sonnet-4-5",\n\t\t\tname: "Claude Sonnet 4.5 (latest)",\n\t\t\tapi: "anthropic-messages",\n\t\t\tprovider: "anthropic",',
+	"anthropic/claude-opus-5-5 in the model catalogue",
+	'"claude-opus-5-5": {',
+);
+sub(
+	AI_ANTHROPIC,
+	'return modelId.includes("fable-5") || modelId.includes("mythos-5") || modelId.includes("mythos-preview");',
+	'return (\n\t\tmodelId.includes("fable-5") ||\n\t\tmodelId.includes("mythos-5") ||\n\t\tmodelId.includes("mythos-preview") ||\n\t\tmodelId.includes("opus-5-5")\n\t);',
+	"opus 5.5 never sends thinking: disabled",
+	'modelId.includes("opus-5-5")',
+);
+
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.
  *

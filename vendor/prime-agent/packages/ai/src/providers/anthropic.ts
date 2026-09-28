@@ -757,7 +757,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
  * `thinking: {type: "disabled"}` (and any sampling params) with a 400.
  */
 function isAlwaysOnAdaptiveThinkingModel(modelId: string): boolean {
-	return modelId.includes("fable-5") || modelId.includes("mythos-5") || modelId.includes("mythos-preview");
+	return (
+		modelId.includes("fable-5") ||
+		modelId.includes("mythos-5") ||
+		modelId.includes("mythos-preview") ||
+		modelId.includes("opus-5-5")
+	);
 }
 
 /**
