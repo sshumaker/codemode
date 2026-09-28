@@ -404,13 +404,20 @@ while time.time() < deadline:
     if t == "comm_open" and m["content"].get("target_name") == "host.request":
         data = dict(m["content"]["data"])
         rtype = data.pop("type")
-        reply = broker(data) if rtype == "harness.subagent" else {"ok": False, "error": "no"}
+        if rtype == "harness.subagent":
+            reply = broker(data)
+        elif rtype == "model.info":
+            reply = {"id": "fake", "provider": "anthropic", "input": ["text", "image"]}
+        else:
+            reply = {"ok": False, "error": "host request type " + rtype + " is not available"}
         if data.get("op") == "spawn" and reply.get("ok") is not False:
             broker.finish(data["name"], result="answer from " + data["name"])
         status = {"status": "ok", **reply} if reply.get("ok") is not False else {"status": "error", "error": reply["error"]}
         kc.control_channel.send(kc.session.msg("comm_msg", {"comm_id": m["content"]["comm_id"], "data": status}))
     elif t == "stream":
         out.append(m["content"]["text"])
+    elif t == "display_data":
+        out.append("DISPLAY " + ",".join(sorted(m["content"]["data"])) + "\n")
     elif t == "error":
         out.append("ERROR " + m["content"]["ename"] + ": " + m["content"]["evalue"])
     elif t == "status" and m["content"]["execution_state"] == "idle" and m["parent_header"].get("msg_id") == msg_id:
@@ -433,7 +440,7 @@ except Exception as e:
     print("REFUSED", type(e).__name__, e)
 """
 
-    def test_spawn_and_gather_through_a_real_kernel(self):
+    def run_cell(self, cell_code):
         import json
         import subprocess
 
@@ -444,14 +451,39 @@ except Exception as e:
             with open(driver, "w") as fh:
                 fh.write(self.DRIVER)
             with open(cell, "w") as fh:
-                fh.write("import os\n" + self.CELL)
+                fh.write("import os\n" + cell_code.replace("__TMP__", tmp))
             proc = subprocess.run(
                 [_kernel_python(), driver, RUNTIME_SRC, HERE, tmp, cell], capture_output=True, text=True, timeout=120
             )
             self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-            got = json.loads(proc.stdout.strip().splitlines()[-1])
+            return json.loads(proc.stdout.strip().splitlines()[-1])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_attach_image_still_works_with_rlm_run_hidden(self):
+        # attach_image reaches the host through rlm.host_request ("model.info"): the rlm
+        # module stays infrastructure even though rlm.run refuses.
+        skill = os.path.join(HERE, "..", "vendor/prime-agent/packages/coding-agent/skills/attach-image/src")
+        got = self.run_cell(
+            "import sys, base64, rlm\n"
+            f"sys.path.insert(0, {skill!r})\n"
+            "import attach_image\n"
+            'png = "__TMP__/dot.png"\n'
+            'open(png, "wb").write(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="))\n'
+            'print("RESULT", await attach_image.run(png))\n'
+            "try:\n"
+            '    await rlm.run("x")\n'
+            "except RuntimeError as e:\n"
+            '    print("RLM", e)\n'
+        )
+        out = got["out"]
+        self.assertIn("DISPLAY application/vnd.prime-agent.attachment+json,text/plain", out)
+        self.assertIn("RESULT Loaded 1 image(s) into context", out)
+        self.assertIn("RLM rlm.run is disabled in this harness", out)
+        self.assertNotIn("ERROR", out)
+
+    def test_spawn_and_gather_through_a_real_kernel(self):
+        got = self.run_cell(self.CELL)
         out = got["out"]
         self.assertIn("RESULTS {'a': 'answer from a', 'b': 'answer from b'} []", out)
         self.assertIn("'a': 'anthropic/claude-haiku-4-5'", out)
