@@ -198,16 +198,18 @@ class TestSchedulerWake(unittest.TestCase):
         self.assertIn("'fast' finished", SCH.wake_reason(self.session))
         self.store.kill("slow")
 
-    def test_a_named_agents_message_wakes_it(self):
+    def test_a_named_agents_unread_message_wakes_it_once(self):
         self.store.submit("sleep 30", name="eu", strict=False)
         box = os.path.join(self.session, "eu.d")
-        armed = time.time()
-        M.Mailbox(box).report("an old note")  # before the wait: not a wake
-        self.arm(watch=["eu"], mode="all", armed_at=armed + 0.5, mailboxes={"eu": box})
-        self.assertIsNone(SCH.wake_reason(self.session))
-        time.sleep(0.6)
+        # Sent before the wait was armed and never read: it still wakes the wait.
         M.Mailbox(box).ask("which date range?")
+        self.arm(watch=["eu"], mode="all", armed_at=time.time() + 5, mailboxes={"eu": box})
         self.assertIn("'eu' sent you a message: asks: which date range?", SCH.wake_reason(self.session))
+        # The wake that carried it marks it read, so waiting again does not re-fire.
+        SCH.consume_messages(self.session)
+        self.assertIsNone(SCH.wake_reason(self.session))
+        M.Mailbox(box).report("found it")
+        self.assertIn("reports: found it", SCH.wake_reason(self.session))
         self.store.kill("eu")
 
     def test_the_legacy_request_still_wakes_on_any_listed_job(self):
@@ -267,6 +269,18 @@ class TestMailbox(unittest.TestCase):
         self.box.close_question(qid)
         self.assertEqual(self.box.send("yes")["kind"], "follow_up")
         self.assertIsNone(self.box.answer_for(qid))
+
+    def test_a_closed_inbox_refuses_sends(self):
+        self.box.send("in time")
+        self.assertEqual([m["text"] for m in self.box.close_inbox()], ["in time"], "what beat the close is returned")
+        with self.assertRaises(M.MailboxError) as ctx:
+            self.box.send("too late")
+        self.assertIn("finished", str(ctx.exception))
+
+    def test_an_answer_that_races_the_close_is_returned_by_it(self):
+        qid = self.box.ask("which year?")
+        self.box.send("2025")
+        self.assertEqual(self.box.close_question(qid), "2025")
 
     def test_messages_both_ways_and_unread(self):
         self.box.report("found 3 sources")
@@ -412,6 +426,14 @@ class TestChildSide(unittest.TestCase):
             self.assertIsNone(self.child.ask_parent("anyone?", timeout=0.3))
         self.assertIsNone(self.parent_box.open_question())
         self.assertEqual(self.parent_box.send("late")["kind"], "follow_up", "a late send is a follow-up, not an answer")
+
+    def test_ask_parent_interrupted_still_closes_its_question(self):
+        with mock.patch.object(A, "ASK_POLL_SECONDS", 0.05), \
+                mock.patch.object(A._FileChannel, "answer", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.child.ask_parent("which year?", timeout=10)
+        self.assertIsNone(self.parent_box.open_question(), "the question did not stay open")
+        self.assertEqual(self.parent_box.send("2025")["kind"], "follow_up")
 
     def test_ask_parent_stays_under_the_cell_watchdog(self):
         with mock.patch.dict(os.environ, {"HARNESS_CELL_CEILING": "60", "HARNESS_CELL_CEILING_MARGIN": "15"}):

@@ -327,8 +327,8 @@ class _FileChannel:
     def answer(self, qid: str) -> Optional[str]:
         return self.box.answer_for(qid)
 
-    def close(self, qid: str) -> None:
-        self.box.close_question(qid)
+    def close(self, qid: str) -> Optional[str]:
+        return self.box.close_question(qid)
 
     def siblings(self) -> Any:
         if not self._parent_jobs:
@@ -352,11 +352,12 @@ class _HostChannel:
         reply = self._client.request({"op": "ask_poll", "id": qid})
         return str(reply.get("text") or "") if reply.get("answered") else None
 
-    def close(self, qid: str) -> None:
+    def close(self, qid: str) -> Optional[str]:
         try:
-            self._client.request({"op": "ask_close", "id": qid})
+            reply = self._client.request({"op": "ask_close", "id": qid})
         except JobError:
-            pass
+            return None
+        return str(reply.get("text") or "") if reply.get("answered") else None
 
     def siblings(self) -> Any:
         return _HostBackend(self._client)
@@ -394,15 +395,21 @@ class ChildAgents:
         budget = _ask_budget(timeout)
         qid = self._channel.ask(question)
         deadline = time.monotonic() + budget
-        while True:
-            answer = self._channel.answer(qid)
-            if answer is not None:
-                return answer
-            if time.monotonic() >= deadline:
-                self._channel.close(qid)
-                print(f"[no answer from your parent within {budget:.0f}s; carry on with your best judgment]")
-                return None
-            time.sleep(min(ASK_POLL_SECONDS, max(0.05, deadline - time.monotonic())))
+        answer = None
+        try:
+            while answer is None and time.monotonic() < deadline:
+                answer = self._channel.answer(qid)
+                if answer is None:
+                    time.sleep(min(ASK_POLL_SECONDS, max(0.05, deadline - time.monotonic())))
+        finally:
+            # Always close: an interrupt or a failed poll must not leave a question
+            # open, or the parent's next message would be taken as its answer. An
+            # answer that raced the close comes back from it.
+            if answer is None:
+                answer = self._channel.close(qid)
+        if answer is None:
+            print(f"[no answer from your parent within {budget:.0f}s; carry on with your best judgment]")
+        return answer
 
     def spawn(self, *_a: Any, **_k: Any) -> None:
         raise JobError(
