@@ -638,7 +638,7 @@ def _guard_shell_cells():
                 try:
                     import shell_jobs
 
-                    existing = {r.get("name") for r in jobs.list()}
+                    existing = {r.get("name") for r in jobs._store().list(external=False)}
                     rewritten, adopted = shell_jobs.rewrite_background(cell, taken=existing)
                 except Exception:
                     rewritten, adopted = cell, []
@@ -973,8 +973,11 @@ def _announce_existing_jobs():
     silently re-pointed across a kernel death can, and that is the failure it was
     supposedly preventing.
     """
+    # Local jobs only. Children a host broker runs are reached by a host request, and
+    # the host is not answering yet while the kernel is still starting up: asking it
+    # here held kernel_info_request past prime's 5s readiness check, every time.
     try:
-        rows = jobs.list()
+        rows = jobs._store().list(external=False)
     except Exception as exc:  # never let this break the kernel it is reporting on
         print(f"[jobs] could not read the job directory ({exc}); jobs.list() to retry")
         return
@@ -986,7 +989,7 @@ def _announce_existing_jobs():
     print(f"[{len(rows)} job(s) from a previous kernel, {len(live)} still running — "
           f"reach them with jobs.get('<name>'). Only in-memory variables were lost: "
           f"your files, the job logs and this working directory are intact on disk.]")
-    print(jobs.manifest())
+    print(jobs._store().manifest(external=False))
 
 
 _announce_existing_jobs()

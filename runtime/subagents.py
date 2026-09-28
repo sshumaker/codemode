@@ -740,7 +740,7 @@ class Subagents:
 # the host transport
 # ---------------------------------------------------------------------------------
 
-def host_request_sync(payload: Dict[str, Any], timeout: float = 60.0) -> Dict[str, Any]:
+def host_request_sync(payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
     """
     One `harness.subagent` host request, answered before this returns.
 

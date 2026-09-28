@@ -1552,10 +1552,11 @@ class JobStore:
             return existing
         return self._handle(name)
 
-    def list(self) -> List[dict]:
-        return [self._refresh(rec) for rec in self._all()] + [
-            rec for provider in _EXTERNAL for rec in provider.records()
-        ]
+    def list(self, external: bool = True) -> List[dict]:
+        rows = [self._refresh(rec) for rec in self._all()]
+        if external:
+            rows += [rec for provider in _EXTERNAL for rec in provider.records()]
+        return rows
 
     def kill(self, name: str) -> bool:
         rec = self._refresh(self._read(name))
@@ -1602,7 +1603,7 @@ class JobStore:
         return True
 
     # -- manifest (§8) ---------------------------------------------------------
-    def manifest(self) -> str:
+    def manifest(self, external: bool = True) -> str:
         """
         The listing the agent reads. Silence becomes a line here.
 
@@ -1612,7 +1613,7 @@ class JobStore:
         after it.
         """
         rows = [self._refresh(rec) for rec in self._all()]
-        external = [line for provider in _EXTERNAL for line in provider.manifest_lines()]
+        external = [line for provider in _EXTERNAL for line in provider.manifest_lines()] if external else []
         if not rows and external:
             return "\n".join(external)
         if not rows:

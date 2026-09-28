@@ -349,6 +349,15 @@ class TestPreludeBinding(unittest.TestCase):
         self.assertEqual(bound, {"spawn": True, "gather_children": True})
         self.assertIn("transport=host", status)
 
+    def test_startup_never_waits_on_the_host(self):
+        # The host does not answer while the kernel is still starting: a host request
+        # from the prelude held kernel_info_request past prime's readiness check.
+        calls = []
+        with mock.patch.object(S, "host_request_sync", lambda payload, timeout=30.0: calls.append(payload) or {}):
+            with mock.patch("builtins.print"):
+                self.bind({"HARNESS_SUBAGENTS": "1", "HARNESS_SUBAGENT_TRANSPORT": "host"})
+        self.assertEqual(calls, [])
+
     def test_a_child_gets_nothing_to_call(self):
         with mock.patch("builtins.print"):
             bound, status = self.bind({"HARNESS_SUBAGENTS": "1", "HARNESS_SUBAGENT_DEPTH": "1"})
