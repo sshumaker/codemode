@@ -638,7 +638,7 @@ def _guard_shell_cells():
                 try:
                     import shell_jobs
 
-                    existing = {r.get("name") for r in jobs.list()}
+                    existing = {r.get("name") for r in jobs._store().list(external=False)}
                     rewritten, adopted = shell_jobs.rewrite_background(cell, taken=existing)
                 except Exception:
                     rewritten, adopted = cell, []
@@ -749,16 +749,24 @@ def _bind_subagents():
     except Exception as exc:
         _record("SUBAGENTS", f"not available: {type(exc).__name__}: {exc}")
         return
+    spawner = subagents._spawner()
+    if spawner.depth() >= subagents.MAX_DEPTH:
+        # A child at the depth limit gets no `spawn` to call — the broker refuses it
+        # too, but a name that exists only to raise is guidance pointing nowhere.
+        _record("SUBAGENTS", f"off at depth {spawner.depth()} (HARNESS_SUBAGENT_MAX_DEPTH={subagents.MAX_DEPTH})")
+        return
     builtins.spawn = subagents.spawn
     builtins.Agent = subagents.Agent
+    builtins.gather_children = subagents.gather_children
     ip = _shell()
     if ip is not None:
         try:
             ip.user_ns.setdefault("spawn", subagents.spawn)
             ip.user_ns.setdefault("Agent", subagents.Agent)
+            ip.user_ns.setdefault("gather_children", subagents.gather_children)
         except Exception:
             pass  # builtins is enough
-    _record("SUBAGENTS", f"spawn bound (depth={subagents._spawner().depth()})")
+    _record("SUBAGENTS", f"spawn bound (depth={spawner.depth()}, transport={spawner.transport()})")
 
 
 _bind_subagents()
@@ -781,7 +789,15 @@ def _render_wait_signal_cleanly():
 
     def handler(shell, etype, value, tb, tb_offset=None):
         seconds = value.args[0] if value.args else "?"
-        if os.environ.get("HARNESS_WAIT_MODE") == "exit":
+        if os.environ.get("HARNESS_WAIT_MODE") == "wake":
+            # The harness resumes the conversation itself (a watched child finished,
+            # or the deadline passed); nothing sleeps, so the turn has to end.
+            print(
+                f"[cell ended here. End your turn now with a one-line note to the user; you "
+                f"will be resumed automatically when what you are waiting on finishes, or in "
+                f"{seconds}s. Anything written after jobs.wait() in this cell did NOT run.]"
+            )
+        elif os.environ.get("HARNESS_WAIT_MODE") == "exit":
             # Scheduler mode: the run itself ends at this wait. The sleep-mode
             # sentence ("the host waits Ns and then calls you again") actively
             # CONTRADICTED the host's stop notice — the model read "calls you
@@ -957,8 +973,11 @@ def _announce_existing_jobs():
     silently re-pointed across a kernel death can, and that is the failure it was
     supposedly preventing.
     """
+    # Local jobs only. Children a host broker runs are reached by a host request, and
+    # the host is not answering yet while the kernel is still starting up: asking it
+    # here held kernel_info_request past prime's 5s readiness check, every time.
     try:
-        rows = jobs.list()
+        rows = jobs._store().list(external=False)
     except Exception as exc:  # never let this break the kernel it is reporting on
         print(f"[jobs] could not read the job directory ({exc}); jobs.list() to retry")
         return
@@ -970,7 +989,7 @@ def _announce_existing_jobs():
     print(f"[{len(rows)} job(s) from a previous kernel, {len(live)} still running — "
           f"reach them with jobs.get('<name>'). Only in-memory variables were lost: "
           f"your files, the job logs and this working directory are intact on disk.]")
-    print(jobs.manifest())
+    print(jobs._store().manifest(external=False))
 
 
 _announce_existing_jobs()

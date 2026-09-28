@@ -215,12 +215,19 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 	const PKG_JSON = "vendor/prime-agent/packages/coding-agent/package.json";
 	// The thinking-display patch lives in the ai package's Anthropic provider.
 	const AI_ANTHROPIC = "vendor/prime-agent/packages/ai/src/providers/anthropic.ts";
+	// The subagent section patches outside src/ too: the kernel runtime's rlm module
+	// (rlm.run's refusal) and one skill reference. The Opus 5.5 catalogue entry is not
+	// replayed: models.generated.ts was regenerated upstream after BASE, so its
+	// presence is asserted directly below instead.
+	const RLM_RUNTIME = "vendor/prime-agent/prime-agent-runtime/src/rlm/__init__.py";
+	const SKILL_REF = "vendor/prime-agent/packages/coding-agent/skills/skill-creator/references/python-skills.md";
+	const EXTRA = [PKG_JSON, AI_ANTHROPIC, RLM_RUNTIME, SKILL_REF];
 
 	it("replaying the patch scripts on the base commit reproduces the vendored tree", () => {
 		const scratch = mkdtempSync(join(tmpdir(), "pristine-replay-"));
 		try {
 			mkdirSync(join(scratch, "vendor"), { recursive: true });
-			execSync(`git archive ${BASE} ${REL} ${PKG_JSON} ${AI_ANTHROPIC} | tar -x -C ${JSON.stringify(scratch)}`, {
+			execSync(`git archive ${BASE} ${REL} ${EXTRA.join(" ")} | tar -x -C ${JSON.stringify(scratch)}`, {
 				cwd: ROOT,
 				shell: "/bin/bash",
 				stdio: "pipe",
@@ -229,7 +236,7 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 			execSync(`node ${join(ROOT, "scripts/port-vanilla-tools.mjs")}`, { env, stdio: "pipe" });
 			execSync(`node ${join(ROOT, "scripts/neutralize-prime.mjs")}`, { env, stdio: "pipe" });
 			execSync(`node ${join(ROOT, "scripts/slim-prime.mjs")}`, { env, stdio: "pipe" });
-			for (const rel of [REL, PKG_JSON, AI_ANTHROPIC]) {
+			for (const rel of [REL, ...EXTRA]) {
 				try {
 					execSync(`diff -ru ${JSON.stringify(join(scratch, rel))} ${JSON.stringify(join(ROOT, rel))}`, {
 						stdio: "pipe",
@@ -258,5 +265,14 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 			"utf8",
 		);
 		assert.ok(models.includes('"claude-opus-5"'), "claude-opus-5 missing from models.generated.ts");
+	});
+
+	it("every model a subagent may be allowed to run resolves in the built catalogue", async () => {
+		// The assistant's default subagent allow-list names these; a child on an id the
+		// registry does not know fails at spawn with an error that looks like the model's.
+		const { getModel } = await import(join(ROOT, "vendor/prime-agent/packages/ai/dist/models.js"));
+		for (const id of ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5", "claude-opus-5-5"]) {
+			assert.ok(getModel("anthropic", id), `anthropic/${id} missing from the built model catalogue`);
+		}
 	});
 });

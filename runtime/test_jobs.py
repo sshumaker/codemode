@@ -737,6 +737,8 @@ class TestModuleSurface(Base):
             # TypeScript port of blocking_sleep, i.e. two implementations under one
             # name, and the first divergence between them would have been invisible.
             "check_blocking", "shell_job_redirect", "timeout_message",
+            # harness-facing: where subagents.py's host transport plugs its children in
+            "use_external",
         }
         public = {
             n for n in dir(J)

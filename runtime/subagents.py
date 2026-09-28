@@ -76,7 +76,7 @@ import os
 import re
 import shlex
 import sys
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 import jobs as _jobs
 from jobs import Job, JobError
@@ -113,6 +113,27 @@ LAUNCHER = "subagent_run.py"
 # bench/terminal/prime_agent.py) put the whole brain in there deliberately and
 # have no harness side to broker from. The runner that has the split turns it on.
 BROKER_VAR = "HARNESS_SUBAGENT_BROKER"
+
+# How spawn reaches whatever starts the child.
+#
+#   file  (default) the job directory: a direct fork, or with HARNESS_SUBAGENT_BROKER=1
+#         a request file for runtime/subagent_broker.py. Needs the starter to share
+#         this kernel's filesystem, which the benchmark runners have.
+#   host  a kernel host request (`harness.subagent`), the channel prime runs for every
+#         kernel, local or remote. The loop forwards it to its broker
+#         (scripts/patches/subagent-host.ts). A remote kernel's filesystem is not the
+#         loop's, so this is the only transport that works there.
+TRANSPORT_VAR = "HARNESS_SUBAGENT_TRANSPORT"
+ENABLED_VAR = "HARNESS_SUBAGENTS"
+HOST_REQUEST = "harness.subagent"
+
+# A blocking gather is bounded. Holding the kernel for a child's whole life is the
+# reason spawn() is a job and not an await; a bounded gather holds it for at most
+# this long and then hands back what finished, so the parent can move on or end the
+# cell with jobs.wait(). It is also kept clear of the cell watchdog when one is set.
+GATHER_DEFAULT = int(os.environ.get("HARNESS_GATHER_DEFAULT_SECONDS", "300"))
+GATHER_MAX = int(os.environ.get("HARNESS_GATHER_MAX_SECONDS", "900"))
+GATHER_POLL = float(os.environ.get("HARNESS_GATHER_POLL_SECONDS", "1.0"))
 
 # Environment the child's own kernel needs in order to get the SAME boundary the
 # parent's kernel has. Under the broker the child inherits the broker's
@@ -328,7 +349,9 @@ class Subagents:
         runtime_dir: Optional[str] = None,
         max_concurrent: int = MAX_CONCURRENT,
         max_depth: int = MAX_DEPTH,
+        host: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     ):
+        self._host = host
         self._store_override = store
         self._env = os.environ if env is None else env
         self._cli = cli
@@ -368,6 +391,17 @@ class Subagents:
             for rec in self.store.list()
             if rec and rec.get("kind") == "subagent" and rec.get("state") in _jobs.LIVE_STATES
         ]
+
+    def transport(self) -> str:
+        """`host` or `file` (the default). See TRANSPORT_VAR."""
+        value = str(self._env.get(TRANSPORT_VAR, "") or "file").strip().lower()
+        return "host" if value == "host" else "file"
+
+    def enabled(self) -> bool:
+        return str(self._env.get(ENABLED_VAR, "")).strip() == "1"
+
+    def host(self) -> "HostSubagents":
+        return HostSubagents(self._host or host_request_sync)
 
     def brokered(self) -> bool:
         """Whether this harness starts children out here, or in the kernel."""
@@ -465,6 +499,19 @@ class Subagents:
             )
         name = name.strip()
 
+        if self.transport() == "host":
+            if not self.enabled():
+                raise JobError(
+                    "subagents are not enabled in this session, so there is nothing to spawn. "
+                    "Do the work here, in this kernel."
+                )
+            self._check_depth()
+            cfg = Agent.coerce(agent).merge(
+                tools=tools, model=model, max_turns=max_turns, max_cost=max_cost,
+                timeout=timeout, system_prompt=system_prompt, cwd=cwd,
+            )
+            return self._spawn_via_host(name, prompt, cfg)
+
         self._check_depth()
         self._check_credentials()
         self._check_concurrency()
@@ -519,6 +566,39 @@ class Subagents:
                 "argv": spec["argv"][:-1] + ["<prompt>"],
             },
         )
+
+    def _spawn_via_host(self, name: str, prompt: str, cfg: "Agent") -> "HostSubagent":
+        """
+        The same child, started by the loop's broker instead of from here.
+
+        Every field travels, none is decided here: the broker owns the defaults
+        (the parent's model, its caps, its allow-list) because it is the one place
+        that sees every child of the conversation. The only local checks are the
+        ones that need no world — the name, the tool list's shape, the depth.
+        """
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ValueError(f"subagent name {name!r} must be alphanumeric plus _ . -")
+        tools = None if cfg.tools is None else _tool_list(cfg.tools).split(",")
+        payload = {
+            "op": "spawn",
+            "name": name,
+            "prompt": prompt,
+            "tools": tools,
+            "model": cfg.model,
+            "max_turns": int(cfg.max_turns) if cfg.max_turns else None,
+            "max_cost": float(cfg.max_cost) if cfg.max_cost else None,
+            "timeout": _jobs.parse_duration(cfg.timeout) if cfg.timeout is not None else None,
+            "system_prompt": cfg.system_prompt,
+            "cwd": cfg.cwd,
+        }
+        client = self.host()
+        reply = client.request(payload)
+        child = reply.get("child") or {}
+        handle = HostSubagent(name, client, child)
+        model = child.get("model") or cfg.model or "the parent's model"
+        print(f"spawned {name} on {model}; collect it with gather_children({name!r}) "
+              f"or jobs.get({name!r})")
+        return handle
 
     # -- argv composition --------------------------------------------------------
 
@@ -657,6 +737,375 @@ class Subagents:
 
 
 # ---------------------------------------------------------------------------------
+# the host transport
+# ---------------------------------------------------------------------------------
+
+def host_request_sync(payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+    """
+    One `harness.subagent` host request, answered before this returns.
+
+    Synchronous on purpose: `spawn()` returns a handle, not a coroutine, in every
+    transport. prime answers host requests on the CONTROL channel, which ipykernel
+    serves on its own thread, so a cell may block here while the reply arrives —
+    rlm's own async `host_request` relies on the same channel. The Comm is closed
+    either way so a timed-out request leaves nothing registered.
+    """
+    import threading
+    import warnings
+
+    try:
+        import rlm  # prime's kernel runtime: the comm target and its control-channel hook
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            from ipykernel.comm import Comm
+    except Exception as exc:  # noqa: BLE001 - reported as the reason spawn cannot work
+        raise JobError(f"this kernel cannot reach the harness host ({exc}), so no subagent can be started.")
+    rlm._install_control_comm_handlers()
+    done = threading.Event()
+    box: Dict[str, Any] = {}
+
+    def on_msg(msg: Dict[str, Any]) -> None:
+        content = msg.get("content") or {}
+        box["reply"] = content.get("data") or {}
+        done.set()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        comm = Comm(target_name=getattr(rlm, "HOST_COMM_TARGET", "host.request"), primary=False)
+    comm.on_msg(on_msg)
+    comm.open(data={**payload, "type": HOST_REQUEST})
+    try:
+        if not done.wait(timeout):
+            raise JobError(f"the harness host did not answer a subagent {payload.get('op')} within {timeout:.0f}s.")
+    finally:
+        try:
+            comm.close()
+        except Exception:  # noqa: BLE001 - closing is best effort
+            pass
+    reply = box.get("reply") or {}
+    if reply.get("status") == "ok":
+        return {k: v for k, v in reply.items() if k != "status"}
+    raise JobError(str(reply.get("error") or f"subagent {payload.get('op')} failed"))
+
+
+async def _host_request_async(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import rlm
+
+    try:
+        return await rlm.host_request(HOST_REQUEST, payload)
+    except RuntimeError as exc:
+        raise JobError(str(exc)) from exc
+
+
+class HostSubagents:
+    """
+    The kernel's client for children the loop's broker started.
+
+    One request shape per operation, `{op, ...}`, and one reply shape: a child
+    record `{name, state, done, ok, result, turns, cost, reason, model, tools}`.
+    A broker refusal (a model off the allow-list, the concurrency cap, a disabled
+    session) arrives as an error and is raised as JobError with the broker's words,
+    which name what to do instead.
+    """
+
+    def __init__(self, send: Callable[[Dict[str, Any]], Dict[str, Any]]):
+        self._send = send
+
+    def request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            reply = self._send(payload)
+        except JobError:
+            raise
+        except RuntimeError as exc:
+            raise JobError(str(exc)) from exc
+        if not isinstance(reply, dict) or reply.get("ok") is False:
+            raise JobError(str((reply or {}).get("error") or f"subagent {payload.get('op')} failed"))
+        return reply
+
+    def status(self, names: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        reply = self.request({"op": "status", "names": list(names)})
+        return {c.get("name"): c for c in reply.get("children") or [] if isinstance(c, dict)}
+
+    def one(self, name: str) -> Dict[str, Any]:
+        return self.status([name]).get(name) or {"name": name, "state": "missing"}
+
+    def children(self) -> List[Dict[str, Any]]:
+        reply = self.request({"op": "list"})
+        return [c for c in reply.get("children") or [] if isinstance(c, dict)]
+
+    def kill(self, name: str) -> bool:
+        return bool(self.request({"op": "kill", "name": name}).get("killed"))
+
+    def wait(self, seconds: int, watch: Sequence[str]) -> Dict[str, Any]:
+        return self.request({"op": "wait", "wake_after": seconds, "watch": list(watch)})
+
+
+_HOST_DONE = ("done", "failed", "killed", "deadline", "limit", "stopped", "died", "missing")
+
+
+class HostSubagent(Job):
+    """
+    A handle to a child the loop's broker runs. The same surface as a file-backed
+    Subagent — `.done .ok .state .reason .result .turns .cost .model` — each read
+    answered by the broker, so it is as fresh as the child.
+    """
+
+    __slots__ = ("_snapshot",)
+
+    def __init__(self, name: str, client: HostSubagents, snapshot: Optional[Dict[str, Any]] = None):
+        super().__init__(name, client)  # type: ignore[arg-type]
+        self._snapshot = snapshot or {}
+
+    def _rec(self) -> Dict[str, Any]:
+        try:
+            self._snapshot = self._store.one(self.name)  # type: ignore[attr-defined]
+        except JobError:
+            pass
+        return self._snapshot
+
+    def __repr__(self) -> str:
+        rec = self._rec()
+        extra = f" {rec['turns']} turns ${rec.get('cost') or 0:.4f}" if rec.get("turns") else ""
+        return f"<Subagent {self.name} {rec.get('state', 'missing')} on {rec.get('model', '?')}{extra}>"
+
+    @property
+    def state(self) -> str:
+        return self._rec().get("state", "missing")
+
+    @property
+    def done(self) -> bool:
+        return self.state in _HOST_DONE
+
+    @property
+    def ok(self) -> bool:
+        rec = self._rec()
+        return rec.get("state") == "done" and rec.get("ok") is not False
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        rec = self._rec()
+        if rec.get("state") not in _HOST_DONE:
+            return None
+        return 0 if rec.get("state") == "done" else 1
+
+    @property
+    def reason(self) -> Optional[str]:
+        return self._rec().get("reason")
+
+    @property
+    def output(self) -> str:
+        return self.result
+
+    @property
+    def result(self) -> str:
+        return self._rec().get("result") or ""
+
+    @property
+    def turns(self) -> Optional[int]:
+        return self._rec().get("turns")
+
+    @property
+    def cost(self) -> Optional[float]:
+        return self._rec().get("cost")
+
+    @property
+    def tool_calls(self) -> Optional[int]:
+        return self._rec().get("tool_calls")
+
+    @property
+    def model(self) -> str:
+        return self._rec().get("model", "")
+
+    @property
+    def tools(self) -> str:
+        tools = self._rec().get("tools")
+        return ",".join(tools) if isinstance(tools, list) else (tools or "")
+
+    @property
+    def prompt(self) -> str:
+        return self._rec().get("prompt", "")
+
+    @property
+    def transcript(self) -> str:
+        return ""
+
+
+class _HostJobs:
+    """What `jobs` needs to see host children: get(), the live set, the manifest, the wake."""
+
+    def _client(self) -> Optional[HostSubagents]:
+        s = _spawner()
+        return s.host() if s.transport() == "host" and s.enabled() else None
+
+    def get(self, name: str) -> Optional[Job]:
+        client = self._client()
+        if client is None:
+            return None
+        try:
+            rec = client.one(name)
+        except JobError:
+            return None
+        return None if rec.get("state") == "missing" else HostSubagent(name, client, rec)
+
+    def records(self) -> List[Dict[str, Any]]:
+        client = self._client()
+        if client is None:
+            return []
+        try:
+            return [dict(c, kind="subagent") for c in client.children()]
+        except JobError:
+            return []
+
+    def live(self) -> List[str]:
+        return [r["name"] for r in self.records() if r.get("state") not in _HOST_DONE]
+
+    def manifest_lines(self) -> List[str]:
+        lines = []
+        for rec in self.records():
+            task = (rec.get("prompt") or "").strip().replace("\n", " ")
+            bits = [f"{rec.get('name', '?'):<16}", f"{rec.get('state', '?'):<9}",
+                    f"subagent on {rec.get('model', '?')}: {task[:60]}" + ("…" if len(task) > 60 else "")]
+            if rec.get("reason"):
+                bits.append(f"— {rec['reason']}")
+            lines.append("  ".join(bits))
+        return lines
+
+    def arm_wake(self, seconds: int, watch: Sequence[str]) -> Optional[str]:
+        """Ask the loop to resume this conversation. Returns the note to print, or None."""
+        client = self._client()
+        if client is None:
+            return None
+        reply = client.wait(seconds, watch)
+        pending = reply.get("pending") or []
+        if pending:
+            return (f"[wake armed: you are resumed when {', '.join(pending)} "
+                    f"{'finishes' if len(pending) == 1 else 'finish'}, or in {seconds}s]")
+        return f"[wake armed: you are resumed in {seconds}s]"
+
+
+async def gather_children(*names: Any, timeout: Any = None) -> "Gathered":
+    """
+    Wait for children to finish, for a bounded time, and return their answers.
+
+        spawn("research topic A ...", name="a")
+        spawn("research topic B ...", name="b")
+        results = await gather_children("a", "b", timeout=300)
+        print(results["a"], results["b"])          # each child's final text
+        if results.pending:                         # still running at the deadline
+            jobs.wait(wake_after=600)               # LAST statement: resumed when done
+
+    This holds the cell while it waits, which `spawn()` itself never does, so it is
+    bounded: at most `timeout` seconds (default 300, ceiling HARNESS_GATHER_MAX_SECONDS
+    and kept under the cell watchdog when one is set). At the deadline it RETURNS —
+    it does not raise — with whatever finished; `.pending` names the rest.
+
+    Args:
+        names: child names or the handles spawn() returned; none means every child
+            this session has started that is still running.
+        timeout: seconds, or "5m" style.
+
+    Returns:
+        A dict of name -> the child's final text ("" if it produced none), plus
+        `.pending` (still running), `.failed` ({name: reason}) and `.models`
+        ({name: the model it ran on}).
+    """
+    spawner = _spawner()
+    wanted = _names(names)
+    budget = _gather_budget(timeout)
+    host = spawner.transport() == "host"
+    if host and not spawner.enabled():
+        raise JobError("subagents are not enabled in this session. Do the work here, in this kernel.")
+    import asyncio
+    import time
+
+    started = time.monotonic()
+    while True:
+        records = await (_host_records(wanted) if host else _file_records(wanted))
+        by_name = {r.get("name"): r for r in records}
+        if not wanted:
+            live = [n for n, r in by_name.items() if r.get("state") not in _HOST_DONE]
+            wanted = live or list(by_name)
+        running = [n for n in wanted if by_name.get(n, {}).get("state") not in _HOST_DONE]
+        if not running or time.monotonic() - started >= budget:
+            return Gathered(wanted, by_name, running, budget)
+        await asyncio.sleep(GATHER_POLL)
+
+
+def _names(names: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    for n in names:
+        if isinstance(n, (list, tuple, set)):
+            out.extend(_names(list(n)))
+        elif isinstance(n, Job):
+            out.append(n.name)
+        elif isinstance(n, str) and n.strip():
+            out.append(n.strip())
+        else:
+            raise TypeError(f"gather_children takes child names or the handles spawn() returned, got {n!r}")
+    return out
+
+
+def _gather_budget(timeout: Any) -> float:
+    seconds = float(GATHER_DEFAULT if timeout is None else _jobs.parse_duration(timeout))
+    cap = float(GATHER_MAX)
+    ceiling = int(os.environ.get("HARNESS_CELL_CEILING", "0") or "0")
+    if ceiling > 0:
+        margin = int(os.environ.get("HARNESS_CELL_CEILING_MARGIN", "15") or "15")
+        cap = min(cap, max(5.0, ceiling - margin - 5))
+    return max(0.0, min(seconds, cap))
+
+
+async def _host_records(names: List[str]) -> List[Dict[str, Any]]:
+    if names:
+        reply = await _host_request_async({"op": "status", "names": names})
+    else:
+        reply = await _host_request_async({"op": "list"})
+    return [c for c in reply.get("children") or [] if isinstance(c, dict)]
+
+
+async def _file_records(names: List[str]) -> List[Dict[str, Any]]:
+    out = []
+    targets = names or [r["name"] for r in list_subagents()]
+    for name in targets:
+        job = _jobs.get(name)
+        if job is None:
+            out.append({"name": name, "state": "missing", "reason": f"no subagent named {name!r}"})
+            continue
+        rec: Dict[str, Any] = {"name": name, "state": job.state, "reason": job.reason}
+        if job.done:
+            rec["state"] = "done" if job.ok else ("failed" if job.state == "done" else job.state)
+        if isinstance(job, _jobs.Subagent):
+            rec.update(result=job.result, model=job.model, turns=job.turns, cost=job.cost)
+        out.append(rec)
+    return out
+
+
+class Gathered(dict):
+    """name -> final text, with `.pending`, `.failed` and `.models` beside it."""
+
+    def __init__(self, names: List[str], records: Dict[str, Dict[str, Any]], running: List[str], budget: float):
+        super().__init__({n: (records.get(n) or {}).get("result") or "" for n in names})
+        self.pending = list(running)
+        self.failed = {
+            n: (records.get(n) or {}).get("reason") or (records.get(n) or {}).get("state", "missing")
+            for n in names
+            if n not in running and (records.get(n) or {}).get("state") != "done"
+        }
+        self.models = {n: (records.get(n) or {}).get("model", "") for n in names}
+        self._budget = budget
+
+    def __repr__(self) -> str:
+        done = [n for n in self if n not in self.pending and n not in self.failed]
+        parts = [f"{len(done)} done"]
+        if self.failed:
+            parts.append("failed: " + ", ".join(f"{n} ({r})" for n, r in self.failed.items()))
+        if self.pending:
+            parts.append(f"still running after {self._budget:.0f}s: {', '.join(self.pending)} "
+                         f"— end the cell with jobs.wait(wake_after=...) to be resumed when they finish")
+        return f"<gathered {'; '.join(parts)}>"
+
+
+# ---------------------------------------------------------------------------------
 # module-level surface
 # ---------------------------------------------------------------------------------
 
@@ -690,6 +1139,8 @@ def spawn(prompt: str, name: Optional[str] = None, **kw: Any) -> Job:
 
         spawn("read every file under tests/ and report the 5 that touch auth, "
               "with one line each on what they cover", name="scout")
+        results = await gather_children("scout", timeout=300)   # bounded wait
+        print(results["scout"])            # or, for a long child, instead:
         jobs.wait(wake_after=180)          # LAST statement of the cell
         # ...you are called again afterwards:
         s = jobs.get("scout")
@@ -709,8 +1160,11 @@ def spawn(prompt: str, name: Optional[str] = None, **kw: Any) -> Job:
         tools: which tools the child may use, e.g. `["read", "grep", "ls"]` for a
             read-only scout or `["ipython"]` (the default) for one that computes.
             This is the child's entire permission model.
-        model: provider/model id. Defaults to the harness's HARNESS_SUBAGENT_MODEL
-            so parent and child are comparable; raises if neither is set.
+        model: provider/model id. Defaults to YOUR model (the harness sets
+            HARNESS_SUBAGENT_MODEL, and a hosted broker uses the parent's), so leave
+            it out unless the subtask wants a different trade-off: e.g.
+            "anthropic/claude-haiku-4-5" for cheap scouts and bulk reading. A harness
+            may allow only some models; a refused one raises and lists the allowed.
         max_turns: assistant-turn cap. The child is stopped there and its partial
             work is still collectable.
         max_cost: dollar cap, applied as the child's usage streams in.
@@ -736,6 +1190,9 @@ def spawn(prompt: str, name: Optional[str] = None, **kw: Any) -> Job:
         far: none of that reaches the child.
     """
     return _spawner().spawn(prompt, name, **kw)
+
+
+_jobs.use_external(_HostJobs())
 
 
 def list_subagents() -> List[dict]:
@@ -799,6 +1256,13 @@ A subagent IS a job
     .output      the job log: header, one line per turn, then the final text
     .done .ok .state .reason .exit_code            as for any job
 
+Collecting: a bounded wait, or a wake
+    results = await gather_children("a", "b", timeout=300)
+        # returns at the deadline even if some are still running:
+        # results["a"] is a's final text; results.pending, .failed, .models
+    jobs.wait(wake_after=600)          # instead: end the cell, be called again
+                                       # when they finish or at the deadline
+
 Reusable definitions
     scout = Agent(tools=["read", "grep", "ls"], max_turns=20, max_cost=0.25)
     spawn("find the auth tests",    name="a", agent=scout)
@@ -808,7 +1272,8 @@ Reusable definitions
 
     tools        which tools the child may use — its whole permission model.
                  Default "ipython". A child given ["read","grep"] cannot write.
-    model        defaults to the parent's model via HARNESS_SUBAGENT_MODEL
+    model        defaults to the parent's model; name another only for a reason,
+                 e.g. a cheap model for scouts (the harness may restrict the list)
     max_turns    turn cap; the child is stopped and its partial work kept
     max_cost     dollar cap, applied as usage streams in
     timeout      wall clock, default 30m ("10m", "1h", 600 all work)

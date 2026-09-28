@@ -5,6 +5,7 @@
  * silently corrupted results. They are cheap to check and expensive to miss.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -593,18 +594,21 @@ describe("subagents are symmetric across the arms, or absent from both", () => {
 	const NEUTRALIZE = join(ROOT, "scripts/neutralize-prime.mjs");
 	const haveNeutralize = existsSync(NEUTRALIZE);
 
-	it("prime's native rlm.run is neutralised, per DESIGN.md's \"replaces\"",
-		{ todo: "posture undecided — see the FOUND note above" },
-		() => {
-			// Keys on the MECHANISM, not on a mention. An earlier version asserted
-			// neutralize-prime.mjs matched /\brlm\b/, which a comment reading "we
-			// deliberately do not neutralise rlm" would satisfy — a proxy, and exactly
-			// what CLAUDE.md forbids ("assert on the observable effect"). The prelude's
-			// _GUARDS table is how os.posix_spawn and pty.spawn are shadowed; an entry
-			// there is what actually makes rlm.run unreachable from a cell.
-			const prelude = readFileSync(join(ROOT, "runtime/kernel-prelude.py"), "utf8");
-			assert.match(prelude, /\(\s*"rlm"\s*,\s*"run"/, "no _GUARDS entry for rlm.run");
-		});
+	it("prime's native rlm.run is neutralised, per DESIGN.md's \"replaces\"", () => {
+		// Keys on the MECHANISM, not on a mention: run the vendored rlm module and
+		// watch rlm.run refuse (runtime/test_rlm_gate.py covers the opt-in and the
+		// message). The host side must also stop serving the request, or a cell that
+		// called host_request("rlm.run", ...) directly would still start a child.
+		const src = join(ROOT, "vendor/prime-agent/prime-agent-runtime/src");
+		const out = execFileSync("python3", ["-c", [
+			"import asyncio, rlm",
+			"try:\n    asyncio.run(rlm.run('x'))\nexcept RuntimeError as e:\n    print('REFUSED', e)",
+		].join("\n")], { cwd: src, env: { PATH: process.env.PATH }, encoding: "utf8" });
+		assert.match(out, /^REFUSED rlm\.run is disabled/m, "rlm.run did not refuse with HARNESS_RLM unset");
+		const session = readFileSync(join(ROOT, "vendor/prime-agent/packages/coding-agent/src/core/agent-session.ts"), "utf8");
+		assert.match(session, /if \(process\.env\.HARNESS_RLM !== "1"\) delete handlers\["rlm\.run"\]/,
+			"the host still serves rlm.run requests by default");
+	});
 
 	it("the vanilla arm has a matched subagent surface",
 		{ todo: "vanilla task() not built — see the FOUND note above" },
