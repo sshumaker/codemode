@@ -1471,6 +1471,8 @@ class JobStore:
             if fresh and fresh.get("state") in LIVE_STATES:
                 mark = " ⚠ never fired" if fresh.get("silent") else ""
                 pending.append(f"{fresh['name']}{mark}")
+        for provider in _EXTERNAL:
+            pending.extend(provider.live())
         note = ""
         if clamped != seconds:
             note = f" (requested {seconds}s, clamped to [{self._min_wait}, {self._max_wait}])"
@@ -1481,6 +1483,17 @@ class JobStore:
             f"[waiting {clamped}s outside the kernel; nothing is held{note}. "
             f"running jobs: {', '.join(pending) or 'none'}]"
         )
+        # Wake mode: the loop's broker resumes the conversation (the deadline, or a
+        # watched child finishing), so the turn ENDS here and nothing sleeps — not
+        # this kernel, and not the host tool wrapper either, so no sentinel.
+        if os.environ.get("HARNESS_WAIT_MODE") == "wake":
+            armed = [n for n in (p.arm_wake(clamped, [x.split(" ")[0] for x in pending]) for p in _EXTERNAL) if n]
+            if armed:
+                for line in armed:
+                    self._emit(line)
+                raise WaitSignal(clamped)
+            self._emit("[jobs] nothing here can resume you after a wait in this session; "
+                       "check the job yourself in a later cell")
         # Scheduler mode (runtime/scheduler.py): the wake request goes on DISK,
         # where a host that exits between turns can find it. {wake_at, watch}
         # is the whole contract — deadline OR any watched job finishing, first
@@ -1523,6 +1536,12 @@ class JobStore:
         """
         rec = self._read(name)
         if rec is None:
+            # Work this kernel did not start and cannot see on disk: a child the
+            # loop's broker runs (subagents.py, host transport).
+            for provider in _EXTERNAL:
+                found = provider.get(name)
+                if found is not None:
+                    return found
             return None
         fresh = self._refresh(rec) or rec
         if fresh.get("state") == "pruned":
@@ -1534,7 +1553,9 @@ class JobStore:
         return self._handle(name)
 
     def list(self) -> List[dict]:
-        return [self._refresh(rec) for rec in self._all()]
+        return [self._refresh(rec) for rec in self._all()] + [
+            rec for provider in _EXTERNAL for rec in provider.records()
+        ]
 
     def kill(self, name: str) -> bool:
         rec = self._refresh(self._read(name))
@@ -1590,7 +1611,10 @@ class JobStore:
         silent failure of this API into something visible before the deadline, not
         after it.
         """
-        rows = self.list()
+        rows = [self._refresh(rec) for rec in self._all()]
+        external = [line for provider in _EXTERNAL for line in provider.manifest_lines()]
+        if not rows and external:
+            return "\n".join(external)
         if not rows:
             # An empty state is the agent's likely FIRST contact with this API, so it
             # is the worst possible place to say nothing useful.
@@ -1626,7 +1650,7 @@ class JobStore:
             if rec.get("reason"):
                 bits.append(f"— {rec['reason']}")
             out.append("  ".join(bits))
-        return "\n".join(out)
+        return "\n".join(out + external)
 
 
 # --------------------------------------------------------------------------------
@@ -1798,6 +1822,17 @@ def help() -> str:  # noqa: A001 - deliberately shadows builtins inside the kern
 # --------------------------------------------------------------------------------
 
 _default: Optional[JobStore] = None
+
+
+# Sources of jobs this kernel did not start and cannot read from its own job
+# directory — children the loop's broker runs (subagents.py registers one). Each
+# provides get(name), records(), live(), manifest_lines() and arm_wake(seconds, watch).
+_EXTERNAL: List[Any] = []
+
+
+def use_external(provider: Any) -> None:
+    """Register a provider (idempotent by type, so a module reload does not stack them)."""
+    _EXTERNAL[:] = [p for p in _EXTERNAL if type(p).__name__ != type(provider).__name__] + [provider]
 
 
 def _store() -> JobStore:
