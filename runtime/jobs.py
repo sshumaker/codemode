@@ -251,6 +251,28 @@ def _wait_name(item: Any) -> str:
     )
 
 
+def _wait_name_aliases(named: Dict[str, Any]) -> tuple:
+    """
+    `jobs.wait(name="build")` and `jobs.wait(names=["a", "b"])`: the keyword spelling
+    of the positional names. Models write it (a Haiku run passed `name=` and got a
+    TypeError), and it is unambiguous, so it is accepted rather than taught away.
+    """
+    unknown = sorted(set(named) - {"name", "names"})
+    if unknown:
+        raise TypeError(
+            f"jobs.wait() got unexpected keyword argument(s) {', '.join(unknown)}; "
+            "it takes names (positionally, or as name=/names=), wake_after= and mode="
+        )
+    out: Tuple[Any, ...] = ()
+    for key in ("name", "names"):
+        value = named.get(key)
+        if value is None:
+            continue
+        # `list` is this module's jobs.list(), so the sequence check names no builtin.
+        out += tuple(value) if isinstance(value, (tuple, set, type([]))) else (value,)
+    return out
+
+
 def _legacy_positional_wait(names: Sequence[Any], wake_after: Any, known: Callable[[], List[str]]):
     """
     `jobs.wait(60)` and `jobs.wait("5m")` meant the deadline before waits took names.
@@ -1533,7 +1555,7 @@ class JobStore:
             self._handles[name] = handle
         return handle
 
-    def wait(self, *names: Any, wake_after: Any = None, mode: Optional[str] = None) -> None:
+    def wait(self, *names: Any, wake_after: Any = None, mode: Optional[str] = None, **named: Any) -> None:
         """
         Put a deadline on the agent's attention. **Must be the last statement in the
         cell**, and it does not block: the cell ends, your turn ends with it, the
@@ -1549,6 +1571,7 @@ class JobStore:
         whichever comes first. This is also how you poll — check first, then wait,
         in one cell.
         """
+        names = names + _wait_name_aliases(named)
         names, wake_after = _legacy_positional_wait(names, wake_after, self._known_names)
         if wake_after is None:
             raise TypeError(
@@ -1889,6 +1912,7 @@ status over matching output — it has two outcomes instead of several silent on
 
     jobs.submit("until curl -sf localhost:5000/health; do sleep 2; done",
                 name="ready", expect="once", max_runtime="10m")
+    jobs.wait("ready", wake_after="10m")   # woken the moment it exits
 
 Use expect="stream" instead for something that keeps running and keeps emitting.
 submit() rejects commands that cannot do what expect= declares, and says why.
@@ -1908,7 +1932,7 @@ HELP = """\
 jobs — work that outlives a cell and the kernel
 
   jobs.submit(command, name=..., max_runtime=None, expect="once") -> Job
-  jobs.wait(wake_after=...)      # last statement of a cell; does not block
+  jobs.wait(*names, wake_after=..., mode="all"|"any")  # last statement; does not block
   jobs.get(name) -> Job | None   # the recovery mechanism, in any kernel
   jobs.list() -> [record]        # every job, as data
   jobs.manifest() -> str         # the same thing, printed
@@ -1924,7 +1948,7 @@ A background command
 Waiting for something to become true
     jobs.submit("until curl -sf localhost:5000/health; do sleep 2; done",
                 name="ready", expect="once", max_runtime="10m")
-    jobs.wait(wake_after=60)
+    jobs.wait("ready", wake_after="10m")   # or name="ready"; wakes when it exits
 
   expect="once"   the command exits when the thing happens   (default)
   expect="stream" the command keeps running and keeps emitting
@@ -2034,8 +2058,8 @@ def submit(payload, name=None, **kw) -> Job:
     return _store().submit(payload, name, **kw)
 
 
-def wait(*names, wake_after=None, mode=None) -> None:
-    return _store().wait(*names, wake_after=wake_after, mode=mode)
+def wait(*names, wake_after=None, mode=None, **named) -> None:
+    return _store().wait(*names, wake_after=wake_after, mode=mode, **named)
 
 
 def get(name: str) -> Optional[Job]:

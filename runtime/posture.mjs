@@ -26,6 +26,7 @@ import {
 	createWriteStream,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readFileSync,
 	readdirSync,
 	readlinkSync,
@@ -35,7 +36,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Blocking sleep without a subprocess; this module's startup polling is sync. */
@@ -103,15 +104,93 @@ export function pythonPrefixes(python) {
 }
 
 /**
+ * The system paths every sandboxed process may read: the interpreter's loader, libc,
+ * the shell `%%bash` cells run, the fonts matplotlib draws with, timezone data.
+ *
+ * Nothing here holds user data or another run's files. On macOS `/tmp`, `/var` and
+ * `/etc` are SYMLINKS into `/private`, and seatbelt checks the link node itself while
+ * resolving a path, so the three nodes are listed (the link, not what it points at):
+ * without them every `/tmp/...` spelling fails at the first component, even for a
+ * directory that is allowed. What they point to is governed by the `/private/...`
+ * rules, which is why `/private/tmp` and `/private/var/folders` stay denied.
+ */
+export const SYSTEM_READABLE = {
+	darwin: [
+		"/usr", "/bin", "/sbin", "/System",
+		"/Library/Fonts", "/Library/Frameworks", "/Library/Developer/CommandLineTools", "/Library/Preferences",
+		"/private/etc", "/private/var/db/timezone", "/private/var/select",
+		"/dev", "/tmp", "/var", "/etc",
+	],
+	linux: ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/dev", "/proc", "/sys"],
+};
+
+/**
+ * Every spelling a path is reachable by: as given, and resolved.
+ *
+ * srt resolves an entry to its realpath except where the link crosses what it calls a
+ * boundary (`/tmp` -> `/private/tmp` is one), and seatbelt matches the resolved path,
+ * so an entry spelled `/tmp/x` alone can fail to cover the file it names.
+ */
+export function spellings(p) {
+	const given = resolve(p);
+	// A path not created yet still has a resolved spelling: its deepest existing
+	// ancestor's realpath plus the rest. `/tmp/run/x` before mkdir is `/private/tmp/run/x`.
+	let base = given;
+	let rest = "";
+	while (!existsSync(base) && dirname(base) !== base) {
+		rest = rest ? join(basename(base), rest) : basename(base);
+		base = dirname(base);
+	}
+	let real = given;
+	try {
+		real = rest ? join(realpathSync(base), rest) : realpathSync(base);
+	} catch {
+		// unreadable ancestor; the caller's spelling is all there is
+	}
+	return real === given ? [given] : [given, real];
+}
+
+/**
+ * The regions no allow-list entry may cover, because they hold other runs' files or
+ * the user's credentials: the root, the home directory, and the shared temp
+ * directories. An entry EQUAL to one, or an ANCESTOR of one, re-opens it; an entry
+ * strictly inside one (a run's own dir under /tmp) is the point of the allow-list.
+ */
+function sharedRegions(home) {
+	const regions = ["/", home, "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders", tmpdir()];
+	return [...new Set(regions.filter(Boolean).flatMap(spellings))];
+}
+
+function assertNotShared(entries, home, what) {
+	const regions = sharedRegions(home);
+	for (const entry of entries) {
+		for (const spelled of spellings(entry)) {
+			const hit = regions.find((r) => spelled === r || r.startsWith(spelled === "/" ? "/" : `${spelled}/`));
+			if (hit !== undefined) {
+				throw new Error(
+					`srtSettings: ${what} entry ${JSON.stringify(entry)} covers the shared region ${JSON.stringify(hit)}. ` +
+						"Name the run's own directories instead (give the process a per-run TMPDIR): a shared temp " +
+						"directory holds every other run's files, and home holds the credentials.",
+				);
+			}
+		}
+	}
+}
+
+/**
  * The srt settings the kernel runs under.
  *
- * Reads are an allow-list expressed the only way srt (0.0.71) offers: reads are
- * permitted everywhere by default and the sole shape is deny-then-allow, so
- * `denyRead` takes the region holding every credential (the whole home
- * directory: ~/.ssh, ~/.aws, ~/.claude, and the loop's own env file) and
- * `allowRead` names back what the kernel needs. System directories stay
- * readable because python's interpreter and dyld need them and no credential of
- * ours is there.
+ * Reads are an allow-list. srt (0.0.71) permits reads by default and offers only
+ * deny-then-allow, so `denyRead` takes the root and `allowRead` names back the
+ * system paths above plus what the caller says this run needs. It used to deny only
+ * the home directory and leave the rest of the disk readable, and callers allowed all
+ * of `/tmp` for ipykernel's connection file: a cell ran `find / -name _types.py` and
+ * listed other conversations' workspaces under /private/tmp. So:
+ *
+ *   - everything not named is denied, including /tmp, /private/tmp and /var/folders;
+ *   - `readable` and `writable` may not name a shared region (see sharedRegions), so a
+ *     caller cannot quietly re-open one; it gives the process a per-run TMPDIR;
+ *   - every entry is added in both spellings (see spellings).
  *
  * `allowLocalBinding` is doing more work than its name suggests, ON MACOS.
  * ipykernel speaks ZMQ over loopback so it cannot be false, and measured under
@@ -135,20 +214,25 @@ export function pythonPrefixes(python) {
  * loopback still dead, api.anthropic.com still refused). The older
  * domain-alias form — alias the proxy in /etc/hosts, name it in `allowedDomains`
  * — also works and is the fallback; it costs a domain entry, which is a second
- * route out of the sandbox.
+ * route out of the sandbox. With reads denied from the root, the socket's
+ * directory must be in `readable` for bwrap to mount it.
  *
  * So this block is portable, and the transport is what changes per platform: the
  * network section stays closed either way.
  */
-export function srtSettings({ runDir, home, readable, writable = [] }) {
+export function srtSettings({ runDir, home, readable, writable = [], platform = process.platform }) {
+	assertNotShared([runDir, ...readable], home, "readable");
+	assertNotShared(writable, home, "writable");
+	const system = SYSTEM_READABLE[platform] ?? SYSTEM_READABLE.linux;
+	const allowRead = [...new Set([...system, ...[runDir, ...readable].flatMap(spellings)])];
 	return {
 		filesystem: {
 			// Allow-only: an empty list means no write access, so the default
 			// direction is the safe one.
-			allowWrite: [runDir, ...writable],
+			allowWrite: [...new Set([runDir, ...writable].flatMap(spellings))],
 			denyWrite: [],
-			denyRead: [home],
-			allowRead: readable,
+			denyRead: ["/"],
+			allowRead,
 		},
 		network: {
 			// The kernel needs nothing off-box. Anything it reaches for is either
@@ -160,6 +244,16 @@ export function srtSettings({ runDir, home, readable, writable = [] }) {
 			allowAllUnixSockets: true,
 		},
 	};
+}
+
+/**
+ * A scratch directory of this run's own, for the process's TMPDIR: ipykernel's
+ * connection file and the font and matplotlib caches land there. srtSettings refuses
+ * the shared temp directory itself, so a runner gives the kernel one of these and
+ * lists it in both `readable` and `writable`. Short, so sockets under it fit sun_path.
+ */
+export function runScratchDir(prefix = "hk-") {
+	return mkdtempSync(join(tmpdir(), prefix));
 }
 
 // ---- the egress proxy -------------------------------------------------------
@@ -220,9 +314,10 @@ const UNIX_PATH_MAX = 104;
  *
  * Run directories are named after task, variant and run id and nest several levels
  * deep, so the ceiling is reachable in ordinary use rather than only in a
- * pathological case. The fallback is a short name under TMPDIR — which the sandbox
- * can also reach, since srtSettings already allows /tmp and TMPDIR for ipykernel's
- * connection file — at the cost of not sitting with the run's other artefacts.
+ * pathological case. The fallback is a short name under TMPDIR, at the cost of not
+ * sitting with the run's other artefacts. srtSettings no longer allows TMPDIR as a
+ * whole, so a caller that gets the fallback lists the socket FILE in `readable`
+ * (bwrap must mount it; a file entry exposes nothing else in the directory).
  */
 export function egressSocketPath(runDir, session = "run") {
 	const inRun = join(runDir, "egress.sock");

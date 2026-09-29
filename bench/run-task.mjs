@@ -20,7 +20,7 @@ import { mkdirSync, writeFileSync, createWriteStream, readFileSync, existsSync }
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { KERNEL_ENV_ALLOW, pythonPrefixes, srtSettings, startEgress } from "../runtime/posture.mjs";
+import { KERNEL_ENV_ALLOW, pythonPrefixes, runScratchDir, srtSettings, startEgress } from "../runtime/posture.mjs";
 import { loadCatalogue, loadGenerated } from "./catalogue.mjs";
 import { generate, renderFullDocs } from "./generate.mjs";
 import { buildPreamble as buildCodemodePreamble, buildVanillaPreamble } from "./prompts.mjs";
@@ -254,6 +254,7 @@ meta.posture = posture ? "boundary" : "off";
 
 let egress;
 let srtSettingsPath;
+let scratch;
 if (posture) {
 	// One route out for MCP. The upstream is the MCP proxy this runner already
 	// talks to, so the servers, the logging and the grounding check are all
@@ -285,6 +286,7 @@ if (posture) {
 
 	const kernelPython = process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
 	srtSettingsPath = join(runDir, "srt-settings.json");
+	scratch = runScratchDir();
 	writeFileSync(
 		srtSettingsPath,
 		`${JSON.stringify(
@@ -293,8 +295,8 @@ if (posture) {
 				home: homedir(),
 				// The generated api/ tree lives under runDir, so the codemode kernel's
 				// own surface is already covered by it.
-				readable: [runDir, join(ROOT, "bench"), dirname(CLI), ...pythonPrefixes(kernelPython), "/tmp", tmpdir()],
-				writable: ["/tmp", tmpdir()],
+				readable: [runDir, join(ROOT, "bench"), dirname(CLI), ...pythonPrefixes(kernelPython), scratch],
+				writable: [scratch],
 			}),
 			null,
 			2,
@@ -358,6 +360,7 @@ const child = spawn(
 						HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettingsPath,
 						HARNESS_KERNEL_SANDBOX_BIN: join(ROOT, "node_modules/.bin/srt"),
 						HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW,
+						TMPDIR: scratch,
 					}
 				// The kernel fails closed; posture=off is a measured condition and
 				// must be SAID (and it already lands in meta.posture above).

@@ -120,6 +120,39 @@ class TestTheRequest(Base):
         self.assertNotIn("mode", req)
 
 
+class TestNameKeywordAliases(Base):
+    """`jobs.wait(name=...)` / `names=[...]`: a Haiku run wrote `name=` and got a TypeError."""
+
+    def signal(self, **kw):
+        with self.assertRaises(J.WaitSignal) as ctx:
+            self.store.wait(wake_after=60, **kw)
+        return ctx.exception.request
+
+    def test_name_is_the_positional_name(self):
+        self.store.submit("sleep 30", name="build", strict=False)
+        self.assertEqual(self.signal(name="build")["targets"], ["build"])
+
+    def test_names_takes_a_list_and_joins_the_positionals(self):
+        self.store.submit("sleep 30", name="a", strict=False)
+        self.store.submit("sleep 30", name="b", strict=False)
+        self.assertEqual(self.signal(names=["a", "b"], mode="any")["targets"], ["a", "b"])
+        with self.assertRaises(J.WaitSignal) as ctx:
+            self.store.wait("a", names="b", wake_after=60)
+        self.assertEqual(ctx.exception.request["targets"], ["a", "b"])
+
+    def test_the_module_function_takes_them_too(self):
+        with mock.patch.object(J, "_store", return_value=self.store):
+            self.store.submit("sleep 30", name="build", strict=False)
+            with self.assertRaises(J.WaitSignal) as ctx:
+                J.wait(name="build", wake_after=60)
+        self.assertEqual(ctx.exception.request["targets"], ["build"])
+
+    def test_any_other_keyword_is_still_a_type_error_that_names_the_surface(self):
+        with self.assertRaises(TypeError) as ctx:
+            self.store.wait(job="build", wake_after=60)
+        self.assertIn("name=/names=", str(ctx.exception))
+
+
 class TestConditionJobsExiting(Base):
     """A monitor is a condition job: `until <cond>; do sleep N; done`, expect='once'."""
 
