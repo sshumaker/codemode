@@ -124,7 +124,12 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     return reason_for(wake, _job_dir(session_dir, wake), now)
 
 
-def reason_for(wake: dict, job_dir: Optional[str] = None, now: Callable[[], float] = time.time) -> Optional[str]:
+def reason_for(
+    wake: dict,
+    job_dir: Optional[str] = None,
+    now: Callable[[], float] = time.time,
+    agents: Optional[dict] = None,
+) -> Optional[str]:
     """
     Why a wait request (wake.json, or the `request` on an RPC `agent_end`) is due NOW.
 
@@ -136,33 +141,83 @@ def reason_for(wake: dict, job_dir: Optional[str] = None, now: Callable[[], floa
         condition firing, and says whether it succeeded, failed or timed out;
       - the wake_after deadline, the backstop for all of them.
     A wait with no names watches every job live when it waited, as it always did.
+
+    `agents` is for a host that owns the subagents itself (the gateway's broker):
+    `{name: {"state", "reason", "unread": [{"kind", "text"}]}}`. The host supplies the
+    facts only it has; the ordering and the words stay here, so every host wakes the
+    same way.
     """
-    store = J.JobStore(job_dir or wake.get("job_dir"), emit=lambda m: None)
+    return decide(wake, job_dir, now, agents)[1]
+
+
+def decide(
+    wake: dict,
+    job_dir: Optional[str] = None,
+    now: Callable[[], float] = time.time,
+    agents: Optional[dict] = None,
+) -> tuple:
+    """`reason_for`, with which source fired: (source, reason), both None while nothing is due.
+
+    Sources: "message" (a named agent wrote), "stream" (a stream job printed),
+    "finished" (the watched jobs or agents finished), "deadline".
+    """
+    agents = agents or {}
+    root = job_dir or wake.get("job_dir")
+    # A host evaluating only its own facts (a remote kernel's jobs live elsewhere) passes
+    # a job dir that is not here; constructing a store would create it.
+    store = J.JobStore(root, emit=lambda m: None) if root and os.path.isdir(root) else None
     watch = wake.get("watch") or []
     mode = wake.get("mode")
     finished = {}
     for name in watch:
-        rec = store._refresh(store._read(name))
+        if name in agents:
+            fact = agents[name] or {}
+            if fact.get("state") not in (None, "running"):
+                finished[name] = describe_agent_finish(fact)
+            continue
+        rec = store._refresh(store._read(name)) if store else None
         if rec and rec.get("state") not in J.LIVE_STATES:
             finished[name] = describe_finish(rec)
     spoke = _messages_since(wake.get("mailboxes") or {}, wake.get("armed_at"))
+    spoke.update(_agent_messages({n: agents[n] for n in watch if n in agents}))
     if spoke:
-        return "; ".join(f"agent {n!r} sent you a message: {t}" for n, t in spoke.items())
+        return "message", "; ".join(f"agent {n!r} sent you a message: {t}" for n, t in spoke.items())
     streamed = _new_output(wake.get("streams") or {})
     if mode == "all" and len(watch) > 1:
         if all(n in finished or n in streamed for n in watch):
             parts = [f"{n} ({finished[n]})" if n in finished else f"{n} (new output)" for n in watch]
-            return "all finished: " + ", ".join(parts) + _stream_tail(streamed)
+            return "finished", "all finished: " + ", ".join(parts) + _stream_tail(streamed)
     elif streamed:
         name, text = next(iter(streamed.items()))
-        return f"job {name!r} printed new output since you waited:{_indent(text)}"
+        return "stream", f"job {name!r} printed new output since you waited:{_indent(text)}"
     elif finished:
         name, why = next(iter(finished.items()))
-        return f"job {name!r} finished: {why}"
+        kind = "agent" if name in agents else "job"
+        return "finished", f"{kind} {name!r} finished: {why}"
     wake_at = wake.get("wake_at")
     if wake_at is not None and now() >= wake_at:
-        return f"the requested wait of {wake.get('wake_after', '?')}s elapsed"
-    return None
+        return "deadline", f"the requested wait of {wake.get('wake_after', '?')}s elapsed"
+    return None, None
+
+
+def describe_agent_finish(fact: dict) -> str:
+    """How a host-owned subagent ended: its state, and the host's reason when it has one."""
+    state, reason = str(fact.get("state") or "done"), str(fact.get("reason") or "")
+    word = {"done": "completed"}.get(state, state)
+    return f"{word} — {reason}".strip(" —")
+
+
+def _agent_messages(agents: dict) -> dict:
+    """name -> the newest unread message each host-owned agent sent, as _messages_since words it."""
+    out = {}
+    for name, fact in agents.items():
+        unread = (fact or {}).get("unread") or []
+        if unread:
+            last = unread[-1]
+            label = "asks" if last.get("kind") == "ask" else "reports"
+            text = str(last.get("text") or "").strip()
+            out[name] = f"{label}: {(text.splitlines() or [''])[0][:200]}"
+    return out
 
 
 def describe_finish(rec: dict) -> str:
@@ -439,20 +494,39 @@ def serve(sessions_root: str, *, interval: float = 5.0, now=time.time,
 def _reason_for_request_cli(consume: bool) -> None:
     """
     `scheduler.py --reason-for-request [--consume]`: a wait request (JSON) on stdin,
-    `{"reason", "message"}` on stdout — reason null while nothing is due.
+    `{"reason", "message", "source"}` on stdout — reason null while nothing is due.
 
     For hosts that are not this scheduler but share the kernel's filesystem: print
     mode's own wake, and RPC hosts, which receive the request on `agent_end`.
+    stdin is the request itself, or `{"request": ..., "agents": {...}}` from a host
+    that owns its subagents (see reason_for).
     --consume marks a waking message read, as the scheduler's wake does.
     """
     import sys
 
-    wake = json.load(sys.stdin)
-    reason = reason_for(wake, wake.get("job_dir"))
+    payload = json.load(sys.stdin)
+    envelope = isinstance(payload.get("request"), dict)
+    wake = payload["request"] if envelope else payload
+    agents = payload.get("agents") if envelope else None
+    source, reason = decide(wake, wake.get("job_dir"), agents=agents)
     if reason and consume:
         for box in (wake.get("mailboxes") or {}).values():
             Mailbox(box).mark_read()
-    print(json.dumps({"reason": reason, "message": wake_message(reason) if reason else None}))
+    print(json.dumps({"reason": reason, "message": wake_message(reason) if reason else None, "source": source}))
+
+
+def _user_wake_cli() -> None:
+    """
+    `scheduler.py --user-wake`: `{"messages": [{"from", "text"}], "cancelled_wait": bool}`
+    on stdin, `{"reason", "message"}` on stdout — the opening of a turn a user message
+    started, in the words the scheduler's own inbox wake uses.
+    """
+    import sys
+
+    payload = json.load(sys.stdin)
+    messages = [m for m in payload.get("messages") or [] if isinstance(m, dict)]
+    reason = _user_reason(messages)
+    print(json.dumps({"reason": reason, "message": wake_message(reason, messages, bool(payload.get("cancelled_wait")))}))
 
 
 if __name__ == "__main__":
@@ -461,6 +535,9 @@ if __name__ == "__main__":
 
     if "--reason-for-request" in _sys.argv:
         _reason_for_request_cli("--consume" in _sys.argv)
+        raise SystemExit(0)
+    if "--user-wake" in _sys.argv:
+        _user_wake_cli()
         raise SystemExit(0)
 
     ap = argparse.ArgumentParser(description="wake scheduler over a sessions root")

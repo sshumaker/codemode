@@ -294,7 +294,7 @@ class TestReasonForRequestCli(Base):
         flag = os.path.join(self.root, "ready")
         self.store.submit(f"until test -f {flag}; do sleep 0.1; done", name="ready", expect="once")
         req = self.wait("ready").request
-        self.assertEqual(self.ask(req), {"reason": None, "message": None})
+        self.assertEqual(self.ask(req), {"reason": None, "message": None, "source": None})
         open(flag, "w").close()
         self.assertTrue(wait_until(lambda: self.ask(req)["reason"] is not None))
         got = self.ask(req)
@@ -302,6 +302,7 @@ class TestReasonForRequestCli(Base):
         self.assertEqual(
             got["message"], "[woken: job 'ready' finished: succeeded (exit 0)] Check your jobs and continue the task."
         )
+        self.assertEqual(got["source"], "finished")
 
     def test_consume_marks_a_waking_message_read(self):
         box = os.path.join(self.root, "child.d")
@@ -318,6 +319,98 @@ class TestReasonForRequestCli(Base):
         self.assertIsNotNone(self.ask(req)["reason"])
         self.assertIsNotNone(self.ask(req, "--consume")["reason"])
         self.assertIsNone(self.ask(req)["reason"], "consumed: the same message does not wake it twice")
+
+
+class TestHostOwnedAgents(Base):
+    """
+    A host that owns its subagents (the gateway's broker) passes their state in the
+    envelope; the scheduler decides and words the wake, so no host re-implements it.
+    """
+
+    def ask(self, payload, *flags):
+        out = subprocess.run(
+            [sys.executable, os.path.join(HERE, "scheduler.py"), "--reason-for-request", *flags],
+            input=json.dumps(payload), capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def request(self, watch, mode="all", wake_after=600, job_dir=None):
+        now = time.time()
+        return {"watch": watch, "targets": watch, "mode": mode, "wake_after": wake_after,
+                "wake_at": now + wake_after, "armed_at": now, "job_dir": job_dir or self.jobs_dir}
+
+    def test_an_agent_that_finished_wakes_it(self):
+        got = self.ask({"request": self.request(["a"]), "agents": {"a": {"state": "done"}}})
+        self.assertEqual((got["source"], got["reason"]), ("finished", "agent 'a' finished: completed"))
+        self.assertTrue(got["message"].startswith("[woken: agent 'a' finished: completed]"))
+
+    def test_a_running_agent_does_not(self):
+        got = self.ask({"request": self.request(["a"]), "agents": {"a": {"state": "running"}}})
+        self.assertEqual(got, {"reason": None, "message": None, "source": None})
+
+    def test_all_mode_needs_every_agent_and_any_mode_the_first(self):
+        agents = {"a": {"state": "done"}, "b": {"state": "running"}}
+        self.assertIsNone(self.ask({"request": self.request(["a", "b"]), "agents": agents})["reason"])
+        got = self.ask({"request": self.request(["a", "b"], mode="any"), "agents": agents})
+        self.assertEqual(got["reason"], "agent 'a' finished: completed")
+        agents["b"] = {"state": "failed", "reason": "the model call failed"}
+        got = self.ask({"request": self.request(["a", "b"]), "agents": agents})
+        self.assertEqual(got["reason"], "all finished: a (completed), b (failed — the model call failed)")
+
+    def test_an_agent_and_a_job_together(self):
+        self.store.submit("true", name="build", strict=False)
+        self.assertTrue(wait_until(lambda: self.store.get("build").done))
+        agents = {"a": {"state": "running"}}
+        self.assertIsNone(self.ask({"request": self.request(["a", "build"]), "agents": agents})["reason"])
+        agents["a"] = {"state": "stopped", "reason": "stopped by the user"}
+        got = self.ask({"request": self.request(["a", "build"]), "agents": agents})
+        self.assertEqual(got["reason"], "all finished: a (stopped — stopped by the user), build (succeeded (exit 0))")
+
+    def test_an_unread_message_wakes_it_first_and_says_what(self):
+        agents = {"a": {"state": "done"}, "b": {"state": "running", "unread": [{"kind": "ask", "text": "which region?\nmore"}]}}
+        got = self.ask({"request": self.request(["a", "b"]), "agents": agents})
+        self.assertEqual((got["source"], got["reason"]), ("message", "agent 'b' sent you a message: asks: which region?"))
+
+    def test_the_deadline(self):
+        req = self.request(["a"], wake_after=1)
+        req["wake_at"] = time.time() - 1
+        got = self.ask({"request": req, "agents": {"a": {"state": "running"}}})
+        self.assertEqual((got["source"], got["reason"]), ("deadline", "the requested wait of 1s elapsed"))
+
+    def test_a_job_dir_that_is_not_here_is_not_created(self):
+        missing = os.path.join(self.root, "elsewhere", "jobs")
+        got = self.ask({"request": self.request(["a"], job_dir=missing), "agents": {"a": {"state": "done"}}})
+        self.assertEqual(got["reason"], "agent 'a' finished: completed")
+        self.assertFalse(os.path.exists(missing))
+
+    def test_the_raw_request_still_works(self):
+        self.store.submit("true", name="build", strict=False)
+        self.assertTrue(wait_until(lambda: self.store.get("build").done))
+        self.assertEqual(self.ask(self.request(["build"]))["reason"], "job 'build' finished: succeeded (exit 0)")
+
+
+class TestUserWakeCli(unittest.TestCase):
+    def ask(self, payload):
+        out = subprocess.run(
+            [sys.executable, os.path.join(HERE, "scheduler.py"), "--user-wake"],
+            input=json.dumps(payload), capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_a_user_message_that_cancels_a_wait_says_so_and_carries_the_text(self):
+        got = self.ask({"messages": [{"from": "user", "text": "stop, use 2025"}], "cancelled_wait": True})
+        self.assertEqual(got["reason"], "1 new message from user")
+        self.assertEqual(
+            got["message"],
+            "[woken: 1 new message from user]\n"
+            "[your pending jobs.wait was cancelled by this; wait again if you still need to]\n\nstop, use 2025",
+        )
+
+    def test_several_are_delivered_in_order(self):
+        got = self.ask({"messages": [{"text": "one"}, {"text": "two"}]})
+        self.assertEqual(got["message"], "[woken: 2 new messages from user]\n\none\n\ntwo")
 
 
 class TestSchedulerKilledMidWait(Base):

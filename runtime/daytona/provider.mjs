@@ -576,6 +576,27 @@ export class DaytonaKernelProvider {
 		return { sb, workDir: `${home}/work` };
 	}
 
+	/**
+	 * Run the kernel's own interpreter in the conversation's sandbox, with `stdin` on its
+	 * standard input, and return stdout. For host-side logic that has to read what only
+	 * the sandbox has: the wake scheduler judging a wait on the sandbox's jobs
+	 * (`scheduler.py --reason-for-request`). The input travels base64 in the command,
+	 * because a sandbox command has no stdin.
+	 */
+	async runKernelPython(conversationId, args, stdin = "", timeoutSec = 60) {
+		const { sb, workDir } = await this.started(conversationId);
+		const home = posix.dirname(workDir);
+		const pick = [IMAGE_RUNTIME_ROOT, `${home}/.harness-runtime`]
+			.map((r) => `[ -x ${sh(`${r}/kernel-venv/bin/python`)} ] && exec_py=${sh(`${r}/kernel-venv/bin/python`)}`)
+			.join(" || ");
+		const input = Buffer.from(stdin).toString("base64");
+		const command =
+			`cd ${sh(workDir)} && { ${pick}; } && printf %s ${sh(input)} | base64 -d | "$exec_py" ${args.map(sh).join(" ")}`;
+		const r = await retryTransient(() => sb.process.executeCommand(`sh -c ${sh(command)}`, undefined, undefined, timeoutSec));
+		if (r.exitCode !== 0) throw new Error(`sandbox python failed (${r.exitCode}): ${r.result.slice(-500)}`);
+		return r.result;
+	}
+
 	/** Put a file into the conversation's work dir (e.g. `inputs/report.pdf`). Returns its sandbox path. */
 	async uploadFile(conversationId, path, data) {
 		const { sb, workDir } = await this.started(conversationId);
