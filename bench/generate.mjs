@@ -2558,6 +2558,10 @@ export function generate(
 		// JSON Schema `format` strings that mark an asset / shape / job reference in
 		// an outputSchema. Only an asset ref makes a result coercible back to an id.
 		refFormats = DEFAULT_REF_FORMATS,
+		// A kind annotation on ref strings, read in preference to `format`:
+		// { key: "x-...-kinds", kinds: { <kind word>: "asset" | "shape" | "job" | null } }.
+		// null reads formats only.
+		refKinds = null,
 		// Types module docstring example: lines of Python, or null for the neutral one.
 		typesExample = null,
 		// The wait surface (see renderWaitSurface): "auto" renders it when some tool
@@ -2649,7 +2653,7 @@ export function generate(
 				"or pass allowUntyped: true for a catalogue whose schemas you do not control.",
 		);
 	}
-	const returnShapes = typedReturns ? collectOutputTypes(allTools, { refFormats }) : null;
+	const returnShapes = typedReturns ? collectOutputTypes(allTools, { refFormats, refKinds }) : null;
 	const launching = allTools.filter((t) => t.launches).map((t) => t.name);
 	if (waitSurface === "auto") waitSurface = launching.length > 0 || allTools.some((t) => t.awaitsInputs);
 	// A launch wrapper returns `_launch(...)`, which only the wait surface defines.
