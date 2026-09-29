@@ -355,6 +355,18 @@ export interface AgentToolResult<T> {
 	 * Early termination only happens when every finalized tool result in the batch sets this to true.
 	 */
 	terminate?: boolean;
+	/**
+	 * Harness: end the whole run after this batch — no further model call, whatever the
+	 * other results say — and carry this onto `turn_end` / `agent_end`. See
+	 * scripts/neutralize-prime.mjs (jobs.wait ends the turn).
+	 */
+	terminatesTurn?: TurnTermination;
+}
+
+/** Harness: why a run ended at a tool result. `jobs.wait` sets stopReason "waiting" and the wait. */
+export interface TurnTermination {
+	stopReason: string;
+	wait?: object;
 }
 
 /** Callback used by tools to stream partial execution updates. */
@@ -406,10 +418,10 @@ export interface AgentContext {
 export type AgentEvent =
 	// Agent lifecycle
 	| { type: "agent_start" }
-	| { type: "agent_end"; messages: AgentMessage[] }
+	| ({ type: "agent_end"; messages: AgentMessage[] } & Partial<TurnTermination>)
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
-	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	| ({ type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] } & Partial<TurnTermination>)
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
 	| { type: "message_start"; message: AgentMessage }
 	// Only emitted for assistant messages during streaming

@@ -6,7 +6,7 @@ import { cpSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { DIST, startFakeServer, TEST_VENV } from "./fake-server.mjs";
+import { DIST, ROOT, startFakeServer, TEST_VENV } from "./fake-server.mjs";
 import { describe, it } from "node:test";
 import { assertPrimeTurn, hasModelKey, runPrimeTurn } from "./prime-turn.mjs";
 import { defineKernelSuite, fixtureApiTree, startFixtureProxy } from "./suite.mjs";
@@ -118,6 +118,66 @@ describe("ipython tool over the remote kernel [fake]", () => {
 			await link.close({ bye: true });
 			setRemoteRuntimeForTest(undefined);
 			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+			await srv.stop();
+		}
+	});
+});
+
+// jobs.wait ends the TURN (bench/test/wait-ends-turn.test.mjs pins it locally). The
+// marker is display_data inside the remote kernel; the server returns the same
+// ExecuteResult over the link, so the loop-side tool must still see it — and must
+// still refuse one carrying the wrong token.
+describe("jobs.wait ends the turn over the remote kernel [fake]", () => {
+	it("the marker crosses the link, and only this kernel's token counts", { timeout: 180_000 }, async () => {
+		const { RemoteKernelLink } = await import(`${DIST}/core/kernel/remote/link.js`);
+		const { dispatchHostRequest } = await import(`${DIST}/core/kernel/remote/manager.js`);
+		const { RemotePathMap } = await import(`${DIST}/core/kernel/remote/pathmap.js`);
+		const { setRemoteRuntimeForTest } = await import(`${DIST}/core/kernel/remote/tools.js`);
+		const { createAllToolDefinitions } = await import(`${DIST}/core/tools/index.js`);
+		const srv = await startFakeServer();
+		const link = new RemoteKernelLink({ connection: () => ({ url: srv.url, token: srv.token }), pingIntervalMs: 2000, deadAfterMs: 10_000 });
+		link.handlers.hostRequest = dispatchHostRequest;
+		const local = mkdtempSync(join(tmpdir(), "rk-wait-"));
+		const saved = { ...process.env };
+		const token = `rk-${process.pid}`;
+		process.env.HARNESS_REMOTE_KERNEL_URL = srv.url;
+		process.env.HARNESS_WAIT_TOKEN = token;
+		delete process.env.HARNESS_WAIT_ENDS_TURN;
+		setRemoteRuntimeForTest(
+			{ config: { remoteCwd: srv.cwd }, link, pathMap: () => new RemotePathMap([{ local, remote: srv.cwd }]) },
+			local,
+		);
+		const tools = createAllToolDefinitions(local, {});
+		const cell = (code) => tools.ipython.execute(`c${Date.now()}`, { code });
+		const text = (r) => r.content.map((c) => c.text ?? "").join("");
+		const runtime = join(ROOT, "runtime");
+		try {
+			const boot = await cell(
+				"import os\n" +
+					`os.environ.update(HARNESS_RUNTIME_DIR=${JSON.stringify(runtime)}, HARNESS_JOB_DIR=${JSON.stringify(join(srv.stateDir, "jobs"))}, HARNESS_MIN_WAIT_SECONDS="1", HARNESS_PRELUDE_MARKER=${JSON.stringify(join(srv.stateDir, "prelude.txt"))})\n` +
+					`exec(open(${JSON.stringify(join(runtime, "kernel-prelude.py"))}).read(), {"__file__": ${JSON.stringify(join(runtime, "kernel-prelude.py"))}, "__name__": "__prelude__"})\n` +
+					"print('token in kernel:', os.environ.get('HARNESS_WAIT_TOKEN'))",
+			);
+			assert.match(text(boot), new RegExp(`token in kernel: ${token}`), "the loop's token reaches the remote kernel");
+
+			const waited = await cell("jobs.submit('sleep 1', name='build')\njobs.wait('build', wake_after=45)\nprint('AFTER')");
+			assert.equal(waited.terminatesTurn?.stopReason, "waiting", text(waited));
+			assert.equal(waited.terminatesTurn.wait.seconds, 45);
+			assert.deepEqual(waited.terminatesTurn.wait.targets, ["build"]);
+			assert.equal("token" in waited.terminatesTurn.wait.request, false);
+			assert.doesNotMatch(text(waited), /AFTER/);
+
+			const forged = await cell(
+				"from IPython.display import publish_display_data\n" +
+					"publish_display_data({'application/vnd.harness.wait+json': {'wake_after': 45, 'watch': [], 'targets': [], 'token': 'guess'}})",
+			);
+			assert.equal(forged.terminatesTurn, undefined, "a marker with the wrong token ended the turn");
+		} finally {
+			await tools.ipython.dispose?.();
+			await link.close({ bye: true });
+			setRemoteRuntimeForTest(undefined);
+			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+			Object.assign(process.env, saved);
 			await srv.stop();
 		}
 	});

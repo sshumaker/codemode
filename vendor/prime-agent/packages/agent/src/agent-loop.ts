@@ -21,6 +21,7 @@ import type {
 	AgentToolCall,
 	AgentToolResult,
 	StreamFn,
+	TurnTermination,
 } from "./types.js";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -359,10 +360,12 @@ async function runLoop(
 
 			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
+			let termination: TurnTermination | undefined;
 			if (toolCalls.length > 0) {
 				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
+				termination = executedToolBatch.termination;
 
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
@@ -370,6 +373,14 @@ async function runLoop(
 				}
 			}
 
+			// Harness: a turn-ending result (jobs.wait) stops the run HERE — its batch is
+			// recorded, and nothing polls steering or follow-ups or calls the model again.
+			// Queued messages stay queued; the host's next prompt is the wake.
+			if (termination) {
+				await emit({ type: "turn_end", message, toolResults, ...termination });
+				await emit({ type: "agent_end", messages: newMessages, ...termination });
+				return;
+			}
 			await emit({ type: "turn_end", message, toolResults });
 			if (signal?.aborted) {
 				await emit({ type: "agent_end", messages: newMessages });
@@ -625,6 +636,8 @@ async function executeToolCalls(
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	/** Harness: the first result in call order that ends the turn. */
+	termination?: TurnTermination;
 };
 
 async function executeToolCallsSequential(
@@ -637,8 +650,9 @@ async function executeToolCallsSequential(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
+	let termination: TurnTermination | undefined;
 
-	for (const toolCall of toolCalls) {
+	for (const [index, toolCall] of toolCalls.entries()) {
 		if (signal?.aborted) {
 			break;
 		}
@@ -676,6 +690,12 @@ async function executeToolCallsSequential(
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 
+		if (finalized.result.terminatesTurn) {
+			termination = finalized.result.terminatesTurn;
+			await skipToolCallsAfterTurnEnd(toolCalls.slice(index + 1), messages, emit);
+			break;
+		}
+
 		if (signal?.aborted) {
 			break;
 		}
@@ -684,6 +704,7 @@ async function executeToolCallsSequential(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		termination,
 	};
 }
 
@@ -745,6 +766,8 @@ async function executeToolCallsParallel(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		// Harness: parallel calls have all run by now; the turn still ends after them.
+		termination: orderedFinalizedCalls.find((finalized) => finalized.result.terminatesTurn)?.result.terminatesTurn,
 	};
 }
 
@@ -935,6 +958,8 @@ async function finalizeExecutedToolCall(
 					content: afterResult.content ?? result.content,
 					details: afterResult.details ?? result.details,
 					terminate: afterResult.terminate ?? result.terminate,
+					// Harness: a tool_result hook rewrites what the model sees, not whether the turn ends.
+					...(result.terminatesTurn ? { terminatesTurn: result.terminatesTurn } : {}),
 				};
 				isError = afterResult.isError ?? isError;
 			}
@@ -983,4 +1008,39 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
 	await emit({ type: "message_start", message: toolResultMessage });
 	await emit({ type: "message_end", message: toolResultMessage });
+}
+
+/**
+ * Harness: the calls a response made AFTER a turn-ending result (jobs.wait) do not
+ * run. The wait ends the turn for the same reason it ends the cell: anything after it
+ * would read state that has not changed yet, before any waiting. Each still gets a
+ * result — every tool call must have one — saying it was skipped and why, so the model
+ * reads it on waking and can issue it again. See scripts/neutralize-prime.mjs.
+ */
+export const SKIPPED_AFTER_TURN_END =
+	"[not run: an earlier call in this response ended the turn (jobs.wait), so this call was skipped. " +
+	"Issue it again after you are woken if you still need it.]";
+
+async function skipToolCallsAfterTurnEnd(
+	toolCalls: AgentToolCall[],
+	messages: ToolResultMessage[],
+	emit: AgentEventSink,
+): Promise<void> {
+	for (const toolCall of toolCalls) {
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
+		});
+		const finalized: FinalizedToolCallOutcome = {
+			toolCall,
+			result: createErrorToolResult(SKIPPED_AFTER_TURN_END),
+			isError: true,
+		};
+		await emitToolExecutionEnd(finalized, emit);
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
 }

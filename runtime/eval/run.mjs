@@ -548,6 +548,9 @@ child.stdout.on("data", (chunk) => {
 			for (const m of text.matchAll(/\[waited (\d+)s outside the kernel\]/g)) {
 				summary.waits.push(Number(m[1]));
 			}
+			// jobs.wait now ends the turn and the host wakes it (HARNESS_WAIT_ENDS_TURN,
+			// default on): the wait is the result's structural flag, not a sentence.
+			if (e.result?.terminatesTurn?.stopReason === "waiting") summary.waits.push(e.result.terminatesTurn.wait?.seconds);
 			// Durability: which of the two channels actually reached the model.
 			//
 			// The restart notice is host-side text prepended to a cell result, so it

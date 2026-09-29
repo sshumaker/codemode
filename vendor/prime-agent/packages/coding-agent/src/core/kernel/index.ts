@@ -161,6 +161,19 @@ export const ATTACHMENT_DISPLAY_MIME = "application/vnd.prime-agent.attachment+j
 export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json";
 
 /**
+ * Harness end-of-turn marker: runtime/kernel-prelude.py publishes a `jobs.wait` request
+ * as display_data under this MIME when the cell ends on WaitSignal. Lifted onto
+ * ExecuteResult.wait here; validated and acted on by the ipython tool
+ * (scripts/patches/wait-ends-turn.ts). See scripts/neutralize-prime.mjs.
+ */
+export const HARNESS_WAIT_MARKER_MIME = "application/vnd.harness.wait+json";
+
+function parseHarnessWaitMarker(data: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+	const raw = data?.[HARNESS_WAIT_MARKER_MIME];
+	return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : undefined;
+}
+
+/**
  * Hard ceiling on a single attachment's base64 payload, a defensive guard
  * against a runaway direct `display_data` emit. The `attach-image` skill caps
  * its own images well under this (see `_MAX_IMAGE_BYTES`), so a skill-produced
@@ -209,6 +222,8 @@ export interface ExecuteResult {
 	attachments?: KernelAttachment[];
 	/** Agent messages sent from this cell, in order. */
 	sentAgentMessages?: KernelSentAgentMessage[];
+	/** Harness: the wait request this cell ended on (HARNESS_WAIT_MARKER_MIME). Unvalidated. */
+	wait?: Record<string, unknown>;
 	status: "ok" | "error" | "aborted";
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
@@ -384,6 +399,7 @@ interface ActiveExecution {
 	diffs: KernelDiffDisplay[];
 	attachments: KernelAttachment[];
 	sentAgentMessages: KernelSentAgentMessage[];
+	wait?: Record<string, unknown>;
 	error?: ExecuteResult["error"];
 	status: ExecuteResult["status"];
 	settled: boolean;
@@ -1142,6 +1158,8 @@ export class KernelManager {
 			}
 			const sentAgentMessage = parseSentAgentMessage(c.data?.[AGENT_MESSAGE_DISPLAY_MIME]);
 			if (sentAgentMessage) execution.sentAgentMessages.push(sentAgentMessage);
+			// The first marker wins: one cell ends on one wait.
+			execution.wait ??= parseHarnessWaitMarker(c.data);
 		} else if (t === "error") {
 			const c = incoming.content as { ename: string; evalue: string; traceback: string[] };
 			execution.error = c;
@@ -1191,6 +1209,7 @@ export class KernelManager {
 				diffs: execution.diffs.length > 0 ? execution.diffs : undefined,
 				attachments: execution.attachments.length > 0 ? execution.attachments : undefined,
 				sentAgentMessages: execution.sentAgentMessages.length > 0 ? execution.sentAgentMessages : undefined,
+				wait: execution.wait,
 				error: execution.error,
 				status,
 				durationMs: Date.now() - execution.started,

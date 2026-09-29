@@ -73,6 +73,34 @@ def _emit(line: str) -> None:
 INBOX_POLL_SECONDS = float(os.environ.get("HARNESS_SUBAGENT_INBOX_POLL", "0.3"))
 # After an agent_end with a message still untaken, how long to wait for prime's next run.
 LATE_RUN_GRACE_SECONDS = float(os.environ.get("HARNESS_SUBAGENT_LATE_RUN_GRACE", "10"))
+# How often a child that ended its turn in jobs.wait is checked for being due.
+WAKE_POLL_SECONDS = float(os.environ.get("HARNESS_SUBAGENT_WAKE_POLL", "1.0"))
+
+
+def _wake_reason(request: dict) -> "str | None":
+    """scheduler.reason_for when the scheduler is staged beside this file; else the deadline."""
+    try:
+        import scheduler
+    except ImportError:
+        wake_at = request.get("wake_at")
+        if wake_at is not None and time.time() >= wake_at:
+            return f"the requested wait of {request.get('wake_after', '?')}s elapsed"
+        return None
+    reason = scheduler.reason_for(request, request.get("job_dir"))
+    if reason and request.get("mailboxes"):
+        from agent_mailbox import Mailbox as _Box
+
+        for box in request["mailboxes"].values():
+            _Box(box).mark_read()
+    return reason
+
+
+def _wake_message(reason: str) -> str:
+    try:
+        import scheduler
+    except ImportError:
+        return f"[woken: {reason}] Check your jobs and continue the task."
+    return scheduler.wake_message(reason)
 
 
 def wrap_message(msg: dict) -> str:
@@ -105,6 +133,9 @@ class RpcChild:
         self.untaken = 0
         self._prompt_seen = False
         self._activity = 0
+        # The wait request of a run that ended in jobs.wait, until something wakes it.
+        self.waiting: "dict | None" = None
+        self._next_wake_check = 0.0
         self._stop = threading.Event()
         self._pump = threading.Thread(target=self._run, name=f"inbox-{name}", daemon=True)
 
@@ -128,6 +159,8 @@ class RpcChild:
         """Hand every undelivered inbox message to prime. Caller holds the lock."""
         sent = 0
         for msg in self.mailbox.pending():
+            # A message wakes a waiting child: its turn opens with the message.
+            self.waiting = None
             if self.idle:
                 command = {"type": "prompt", "message": wrap_message(msg)}
                 self.idle = False
@@ -149,6 +182,25 @@ class RpcChild:
                 if self.closed:
                     return
                 self._deliver_pending()
+                self._wake_if_due()
+
+    def _wake_if_due(self) -> None:
+        """
+        A run that ended in jobs.wait is this launcher's to wake: it is the child's
+        RPC host. Same decision and same opening message as the scheduler's. Caller
+        holds the lock.
+        """
+        if self.waiting is None or not self.idle or time.monotonic() < self._next_wake_check:
+            return
+        self._next_wake_check = time.monotonic() + WAKE_POLL_SECONDS
+        reason = _wake_reason(self.waiting)
+        if not reason:
+            return
+        if self._write({"type": "prompt", "message": _wake_message(reason)}):
+            _emit(f"[{self.name}] woken: {reason.splitlines()[0][:160]}")
+            self.waiting = None
+            self.idle = False
+            self.untaken += 1
 
     def saw_event(self, ev: dict) -> None:
         # Only the start of a run counts as prime keeping its promise: a response to
@@ -169,13 +221,21 @@ class RpcChild:
             self._prompt_seen = True
             self.idle = False
 
-    def agent_ended(self) -> bool:
+    def agent_ended(self, event: "dict | None" = None) -> bool:
         """
         The run went idle. True if it is over (stdin now closed), False if prime
-        still holds a message for another run or the inbox had more for it.
+        still holds a message for another run, the inbox had more for it, or the
+        run ended waiting (`stopReason: "waiting"`) — then it is woken, not closed.
         """
         with self.lock:
             self.idle = True
+            wait = (event or {}).get("wait") or {}
+            if (event or {}).get("stopReason") == "waiting" and isinstance(wait.get("request"), dict):
+                self.waiting = wait["request"]
+                self._next_wake_check = 0.0
+                _emit(f"[{self.name}] waiting: {', '.join(wait.get('targets') or []) or 'deadline'} "
+                      f"(up to {wait.get('seconds')}s)")
+                return False
             if self.untaken > 0:
                 self.idle = False
                 self._expect_another_run(self._activity)
@@ -420,7 +480,7 @@ def main(argv: list) -> int:
         if driver is not None:
             driver.saw_event(ev)
         if driver is not None and ev.get("type") == "agent_end":
-            driver.agent_ended()
+            driver.agent_ended(ev)
             continue
         if (driver is not None and ev.get("type") == "message_end"
                 and (ev.get("message") or {}).get("role") == "user"):

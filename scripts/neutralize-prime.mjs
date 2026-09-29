@@ -603,6 +603,254 @@ sub(
 	"__HARNESS_WAIT_SECONDS__",
 );
 
+// --- jobs.wait ends the turn, not just the cell ---------------------------------
+//
+// WaitSignal ends the cell and the kernel is released, but upstream's loop then hands
+// the tool result straight back to the model, which keeps calling tools in the same
+// turn — measured: haiku polled `agents.get(...)` in a fresh cell right after waiting,
+// and the gateway had to end the turn at the next tool call to stop it. The turn has
+// to end by mechanism, the lesson of the scheduler's exit mode.
+//
+// The chain, all structural (nothing greps stdout): the prelude's WaitSignal handler
+// publishes the wait request as display_data under a vendor MIME, carrying
+// HARNESS_WAIT_TOKEN; the kernel manager lifts it onto ExecuteResult.wait — the remote
+// kernel server returns that same ExecuteResult, so it survives the link — the ipython
+// tool checks the token and sets `terminatesTurn`; the agent loop ends the run after
+// that batch with `stopReason: "waiting"` and the wait on `turn_end` and `agent_end`.
+// Calls after the wait in the same response are skipped with a result saying so
+// (scripts/patches/turn-termination.ts). HARNESS_WAIT_ENDS_TURN=0 restores the old
+// host-side sleep, for a benchmark that needs it.
+log("\nwait ends the turn:");
+const AGENT_TYPES = "../../agent/src/types.ts";
+const AGENT_LOOP = "../../agent/src/agent-loop.ts";
+
+sub(
+	AGENT_TYPES,
+	"\tdetails: T;\n\t/**\n\t * Hint that the agent should stop after the current tool batch.\n\t * Early termination only happens when every finalized tool result in the batch sets this to true.\n\t */\n\tterminate?: boolean;\n}\n",
+	"\tdetails: T;\n\t/**\n\t * Hint that the agent should stop after the current tool batch.\n\t * Early termination only happens when every finalized tool result in the batch sets this to true.\n\t */\n\tterminate?: boolean;\n" +
+		"\t/**\n" +
+		"\t * Harness: end the whole run after this batch — no further model call, whatever the\n" +
+		"\t * other results say — and carry this onto `turn_end` / `agent_end`. See\n" +
+		"\t * scripts/neutralize-prime.mjs (jobs.wait ends the turn).\n" +
+		"\t */\n" +
+		"\tterminatesTurn?: TurnTermination;\n}\n\n" +
+		"/** Harness: why a run ended at a tool result. `jobs.wait` sets stopReason \"waiting\" and the wait. */\n" +
+		"export interface TurnTermination {\n\tstopReason: string;\n\twait?: object;\n}\n",
+	"tool results can end the turn",
+	"terminatesTurn?: TurnTermination;",
+);
+sub(
+	AGENT_TYPES,
+	'\t| { type: "agent_end"; messages: AgentMessage[] }\n',
+	'\t| ({ type: "agent_end"; messages: AgentMessage[] } & Partial<TurnTermination>)\n',
+	"agent_end carries the stop reason",
+);
+sub(
+	AGENT_TYPES,
+	'\t| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }\n',
+	'\t| ({ type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] } & Partial<TurnTermination>)\n',
+	"turn_end carries the stop reason",
+);
+sub(AGENT_LOOP, "\tStreamFn,\n} from \"./types.js\";", "\tStreamFn,\n\tTurnTermination,\n} from \"./types.js\";", "import TurnTermination");
+sub(
+	AGENT_LOOP,
+	"\t\t\tconst toolResults: ToolResultMessage[] = [];\n\t\t\thasMoreToolCalls = false;\n\t\t\tif (toolCalls.length > 0) {\n" +
+		"\t\t\t\tconst executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);\n" +
+		"\t\t\t\ttoolResults.push(...executedToolBatch.messages);\n\t\t\t\thasMoreToolCalls = !executedToolBatch.terminate;\n",
+	"\t\t\tconst toolResults: ToolResultMessage[] = [];\n\t\t\thasMoreToolCalls = false;\n\t\t\tlet termination: TurnTermination | undefined;\n\t\t\tif (toolCalls.length > 0) {\n" +
+		"\t\t\t\tconst executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);\n" +
+		"\t\t\t\ttoolResults.push(...executedToolBatch.messages);\n\t\t\t\thasMoreToolCalls = !executedToolBatch.terminate;\n" +
+		"\t\t\t\ttermination = executedToolBatch.termination;\n",
+	"the batch reports a turn-ending result",
+	"termination = executedToolBatch.termination;",
+);
+sub(
+	AGENT_LOOP,
+	"\t\t\tawait emit({ type: \"turn_end\", message, toolResults });\n\t\t\tif (signal?.aborted) {",
+	"\t\t\t// Harness: a turn-ending result (jobs.wait) stops the run HERE — its batch is\n" +
+		"\t\t\t// recorded, and nothing polls steering or follow-ups or calls the model again.\n" +
+		"\t\t\t// Queued messages stay queued; the host's next prompt is the wake.\n" +
+		"\t\t\tif (termination) {\n" +
+		"\t\t\t\tawait emit({ type: \"turn_end\", message, toolResults, ...termination });\n" +
+		"\t\t\t\tawait emit({ type: \"agent_end\", messages: newMessages, ...termination });\n" +
+		"\t\t\t\treturn;\n\t\t\t}\n" +
+		"\t\t\tawait emit({ type: \"turn_end\", message, toolResults });\n\t\t\tif (signal?.aborted) {",
+	"the loop stops after a turn-ending batch",
+	"if (termination) {",
+);
+sub(
+	AGENT_LOOP,
+	"type ExecutedToolCallBatch = {\n\tmessages: ToolResultMessage[];\n\tterminate: boolean;\n};",
+	"type ExecutedToolCallBatch = {\n\tmessages: ToolResultMessage[];\n\tterminate: boolean;\n\t/** Harness: the first result in call order that ends the turn. */\n\ttermination?: TurnTermination;\n};",
+	"batch type carries the termination",
+);
+sub(
+	AGENT_LOOP,
+	"\tconst finalizedCalls: FinalizedToolCallOutcome[] = [];\n\tconst messages: ToolResultMessage[] = [];\n\n\tfor (const toolCall of toolCalls) {\n",
+	"\tconst finalizedCalls: FinalizedToolCallOutcome[] = [];\n\tconst messages: ToolResultMessage[] = [];\n\tlet termination: TurnTermination | undefined;\n\n\tfor (const [index, toolCall] of toolCalls.entries()) {\n",
+	"sequential batch tracks its position",
+	"for (const [index, toolCall] of toolCalls.entries()) {",
+);
+sub(
+	AGENT_LOOP,
+	"\t\tfinalizedCalls.push(finalized);\n\t\tmessages.push(toolResultMessage);\n\n\t\tif (signal?.aborted) {\n\t\t\tbreak;\n\t\t}\n\t}\n\n\treturn {\n\t\tmessages,\n\t\tterminate: shouldTerminateToolBatch(finalizedCalls),\n\t};",
+	"\t\tfinalizedCalls.push(finalized);\n\t\tmessages.push(toolResultMessage);\n\n" +
+		"\t\tif (finalized.result.terminatesTurn) {\n" +
+		"\t\t\ttermination = finalized.result.terminatesTurn;\n" +
+		"\t\t\tawait skipToolCallsAfterTurnEnd(toolCalls.slice(index + 1), messages, emit);\n" +
+		"\t\t\tbreak;\n\t\t}\n\n" +
+		"\t\tif (signal?.aborted) {\n\t\t\tbreak;\n\t\t}\n\t}\n\n\treturn {\n\t\tmessages,\n\t\tterminate: shouldTerminateToolBatch(finalizedCalls),\n\t\ttermination,\n\t};",
+	"sequential batch stops at a turn-ending result",
+	"skipToolCallsAfterTurnEnd(toolCalls.slice(index + 1)",
+);
+sub(
+	AGENT_LOOP,
+	"\t\tterminate: shouldTerminateToolBatch(orderedFinalizedCalls),\n\t};",
+	"\t\tterminate: shouldTerminateToolBatch(orderedFinalizedCalls),\n" +
+		"\t\t// Harness: parallel calls have all run by now; the turn still ends after them.\n" +
+		"\t\ttermination: orderedFinalizedCalls.find((finalized) => finalized.result.terminatesTurn)?.result.terminatesTurn,\n\t};",
+	"parallel batch reports a turn-ending result",
+	"termination: orderedFinalizedCalls.find(",
+);
+sub(
+	AGENT_LOOP,
+	"\t\t\t\t\tterminate: afterResult.terminate ?? result.terminate,\n\t\t\t\t};",
+	"\t\t\t\t\tterminate: afterResult.terminate ?? result.terminate,\n" +
+		"\t\t\t\t\t// Harness: a tool_result hook rewrites what the model sees, not whether the turn ends.\n" +
+		"\t\t\t\t\t...(result.terminatesTurn ? { terminatesTurn: result.terminatesTurn } : {}),\n\t\t\t\t};",
+	"afterToolCall keeps the termination",
+	"...(result.terminatesTurn ? { terminatesTurn: result.terminatesTurn } : {}),",
+);
+sub(
+	AGENT_LOOP,
+	"async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {\n\tawait emit({ type: \"message_start\", message: toolResultMessage });\n\tawait emit({ type: \"message_end\", message: toolResultMessage });\n}\n",
+	"async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {\n\tawait emit({ type: \"message_start\", message: toolResultMessage });\n\tawait emit({ type: \"message_end\", message: toolResultMessage });\n}\n\n" +
+		`${patch("turn-termination.ts")}\n`,
+	"skipped results for calls after the wait",
+	"async function skipToolCallsAfterTurnEnd(",
+);
+
+// Kernel manager: lift the marker onto the execute result.
+sub(
+	"core/kernel/index.ts",
+	'export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json";\n',
+	`export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json";\n\n${patch("wait-marker.ts")}\n`,
+	"wait marker MIME + parser",
+	"function parseHarnessWaitMarker(",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t/** Agent messages sent from this cell, in order. */\n\tsentAgentMessages?: KernelSentAgentMessage[];\n\tstatus: \"ok\" | \"error\" | \"aborted\";\n",
+	"\t/** Agent messages sent from this cell, in order. */\n\tsentAgentMessages?: KernelSentAgentMessage[];\n" +
+		"\t/** Harness: the wait request this cell ended on (HARNESS_WAIT_MARKER_MIME). Unvalidated. */\n\twait?: Record<string, unknown>;\n" +
+		"\tstatus: \"ok\" | \"error\" | \"aborted\";\n",
+	"ExecuteResult.wait",
+	"\twait?: Record<string, unknown>;\n\tstatus:",
+);
+sub(
+	"core/kernel/index.ts",
+	"\tsentAgentMessages: KernelSentAgentMessage[];\n\terror?: ExecuteResult[\"error\"];\n",
+	"\tsentAgentMessages: KernelSentAgentMessage[];\n\twait?: Record<string, unknown>;\n\terror?: ExecuteResult[\"error\"];\n",
+	"ActiveExecution.wait",
+	"\twait?: Record<string, unknown>;\n\terror?:",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\t\tif (sentAgentMessage) execution.sentAgentMessages.push(sentAgentMessage);\n",
+	"\t\t\tif (sentAgentMessage) execution.sentAgentMessages.push(sentAgentMessage);\n" +
+		"\t\t\t// The first marker wins: one cell ends on one wait.\n" +
+		"\t\t\texecution.wait ??= parseHarnessWaitMarker(c.data);\n",
+	"the display pump captures the marker",
+	"execution.wait ??= parseHarnessWaitMarker(c.data);",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\t\t\tsentAgentMessages: execution.sentAgentMessages.length > 0 ? execution.sentAgentMessages : undefined,\n",
+	"\t\t\t\tsentAgentMessages: execution.sentAgentMessages.length > 0 ? execution.sentAgentMessages : undefined,\n" +
+		"\t\t\t\twait: execution.wait,\n",
+	"the execute result carries the marker",
+	"\t\t\t\twait: execution.wait,\n",
+);
+
+// The ipython tool: marker -> terminatesTurn, and the sleep path stands down.
+sub(
+	"core/tools/ipython.ts",
+	"export function createIpythonToolDefinition(\n",
+	`${patch("wait-ends-turn.ts")}\n\nexport function createIpythonToolDefinition(\n`,
+	"wait-ends-turn helpers",
+	"export function harnessWaitFromMarker(",
+);
+sub(
+	"core/tools/ipython.ts",
+	"\t/** True when this result came after killing and restarting a busy kernel. */\n\tkernelRestarted?: boolean;\n",
+	"\t/** True when this result came after killing and restarting a busy kernel. */\n\tkernelRestarted?: boolean;\n" +
+		"\t/** Harness: the wait this cell ended the turn on. */\n\twait?: HarnessWait;\n",
+	"IpythonToolDetails.wait",
+	"\twait?: HarnessWait;\n",
+);
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\tconst waitMatch = waitRe.exec(text);\n",
+	"\t\t\t\t// A valid marker ends the turn instead: no host sleep, no exit timer — the\n" +
+		"\t\t\t\t// host that owns the session wakes it. See wait-ends-turn above.\n" +
+		"\t\t\t\tconst turnWait = harnessWaitFromMarker(r.wait, toolCallId);\n" +
+		"\t\t\t\tif (turnWait) text = stripWaitSentinel(text);\n" +
+		"\t\t\t\tconst waitMatch = turnWait ? null : waitRe.exec(text);\n",
+	"a valid marker replaces the sleep",
+	"const turnWait = harnessWaitFromMarker(r.wait, toolCallId);",
+);
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\t\t\tkernelRestarted,\n\t\t\t\t\t\terror: r.error,\n\t\t\t\t\t},\n\t\t\t\t\tisError: r.status === \"error\" || r.status === \"aborted\",\n\t\t\t\t};",
+	"\t\t\t\t\t\tkernelRestarted,\n\t\t\t\t\t\terror: r.error,\n\t\t\t\t\t\t...(turnWait ? { wait: turnWait } : {}),\n\t\t\t\t\t},\n" +
+		"\t\t\t\t\tisError: r.status === \"error\" || r.status === \"aborted\",\n" +
+		"\t\t\t\t\t...(turnWait ? { terminatesTurn: { stopReason: \"waiting\", wait: turnWait } } : {}),\n\t\t\t\t};",
+	"the result ends the turn",
+	"terminatesTurn: { stopReason: \"waiting\", wait: turnWait }",
+);
+
+// Print mode: with no scheduler and no RPC host, the run wakes itself.
+sub(
+	"modes/print-mode.ts",
+	'import type { ImageContent } from "@earendil-works/pi-ai";\n',
+	'import { spawn as spawnChild } from "node:child_process";\nimport { join as joinPath } from "node:path";\nimport type { ImageContent } from "@earendil-works/pi-ai";\n',
+	"self-wake imports",
+	'import { spawn as spawnChild } from "node:child_process";',
+);
+sub(
+	"modes/print-mode.ts",
+	"/**\n * Run in print (single-shot) mode.\n",
+	`${patch("print-self-wake.ts")}\n\n/**\n * Run in print (single-shot) mode.\n`,
+	"self-wake helpers",
+	"async function harnessPrintSelfWake(",
+);
+sub(
+	"modes/print-mode.ts",
+	"\t\tunsubscribe = connection.subscribe((event) => {\n",
+	"\t\tunsubscribe = connection.subscribe((event) => {\n" +
+		"\t\t\tif (event.type === \"session_event\" && event.event.type === \"agent_end\") {\n" +
+		"\t\t\t\tlastAgentEnd = event.event as HarnessAgentEnd;\n\t\t\t}\n",
+	"remember how the last run ended",
+	"lastAgentEnd = event.event as HarnessAgentEnd;",
+);
+sub(
+	"modes/print-mode.ts",
+	"\tlet unsubscribe: (() => void) | undefined;\n",
+	"\tlet unsubscribe: (() => void) | undefined;\n\tlet lastAgentEnd: HarnessAgentEnd | undefined;\n",
+	"last agent_end slot",
+	"\tlet lastAgentEnd: HarnessAgentEnd | undefined;\n",
+);
+sub(
+	"modes/print-mode.ts",
+	"\t\tfor (const message of messages) {\n\t\t\tawait connection.promptAndWait(message);\n\t\t}\n",
+	"\t\tfor (const message of messages) {\n\t\t\tawait connection.promptAndWait(message);\n\t\t}\n" +
+		"\t\tawait harnessPrintSelfWake(connection, () => {\n" +
+		"\t\t\tconst end = lastAgentEnd;\n\t\t\tlastAgentEnd = undefined;\n" +
+		"\t\t\treturn end?.stopReason === \"waiting\" ? end : undefined;\n\t\t});\n",
+	"wake a waiting run",
+	"await harnessPrintSelfWake(connection,",
+);
+
 // --- surviving the death of the kernel ---------------------------------------
 //
 // The hosted runtime's central claim is that work outlives the kernel. Testing it
@@ -1189,7 +1437,8 @@ function assertPatchesInSync() {
 function walkPrime() {
 	const out = [];
 	// The ai package too: the thinking-display patch lives in its anthropic provider.
-	const stack = [join(PRIME), join(PRIME, "../../ai/src")];
+	// And the agent package: the turn-termination patch lives in its loop.
+	const stack = [join(PRIME), join(PRIME, "../../ai/src"), join(PRIME, "../../agent/src")];
 	while (stack.length) {
 		for (const e of readdirSync(stack.pop(), { withFileTypes: true })) {
 			const full = join(e.parentPath ?? e.path, e.name);

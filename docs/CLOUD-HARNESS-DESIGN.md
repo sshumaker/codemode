@@ -205,6 +205,76 @@ at or past `HARNESS_SUBAGENT_MAX_DEPTH`, default 1) and registers the loop handl
 without it the host refuses the request type. The broker enforces depth again from the
 requesting agent's token.
 
+### 3.6 `jobs.wait` ends the turn (2026-09-28)
+
+WaitSignal ended the cell, but prime's loop handed the result straight back to the
+model, which kept calling tools in the same turn — haiku polled `agents.get(...)` in a
+new cell right after waiting, and the gateway had to end the turn at the next tool
+call. Now the turn ends by mechanism, default on; `HARNESS_WAIT_ENDS_TURN=0` restores
+the old host-side sleep for a benchmark that needs it.
+
+The chain is structural end to end; nothing parses stdout. The prelude's WaitSignal
+handler publishes the wait request as `display_data` under
+`application/vnd.harness.wait+json`, carrying `HARNESS_WAIT_TOKEN`. prime's kernel
+manager lifts it onto `ExecuteResult.wait` (the remote kernel server returns the same
+`ExecuteResult`, so it crosses the link). The ipython tool accepts it only with this
+kernel's token, which is the forgery resistance the stdout sentinel already had, and
+sets `terminatesTurn`. The agent loop then ends the run after that batch with no
+further model call, and puts the reason on `turn_end` and `agent_end`:
+
+```json
+{"type": "agent_end", "messages": [...], "stopReason": "waiting",
+ "wait": {"seconds": 120, "requestedSeconds": 120, "wakeAtMs": 1790647017778,
+          "armedAtMs": 1790646897778, "targets": ["build"], "mode": "all",
+          "watch": ["build"], "jobDir": "...", "toolCallId": "toolu_...",
+          "request": {"wake_at": 1790647017.78, "wake_after": 120, "watch": ["build"],
+                      "targets": ["build"], "mode": "all", "mailboxes": {},
+                      "streams": {}, "armed_at": 1790646897.78, "requested": 120,
+                      "job_dir": "..."}}}
+```
+
+`request` is exactly what jobs.py writes to `wake.json`. A host does not interpret
+it. It asks `scheduler.reason_for(request)`, in-process or via
+`python3 runtime/scheduler.py --reason-for-request [--consume]`, which reads JSON on
+stdin and prints `{"reason", "message"}`. When the reason is non-null, the host starts
+a new turn whose opening message is `message`, for example
+`[woken: job 'build' finished: succeeded (exit 0)] Check your jobs and continue the task.`
+
+The wake sources, first match wins:
+- a named agent wrote to its parent;
+- a named `expect="stream"` job printed output after the wait was armed (the new lines are in the message);
+- the named targets finished: all of them, or any one with `mode="any"`. A condition job
+  (`until <cond>; do sleep N; done`, `expect="once"`) finishing is its condition
+  firing, and the message says succeeded, failed or timed out;
+- the `wake_after` deadline.
+
+A user message wakes the session whether or not it is waiting. Under the scheduler it
+is a file in `<session>/inbox/` (`scheduler.post_user_message`), delivered after the
+`[woken: N new message(s) from …]` line, and it cancels the pending wait. An RPC host
+simply sends the prompt; prime's queued steering and follow-ups are left queued by a
+waiting turn, never consumed by it.
+
+The hosts:
+- **RPC host** (the gateway): read `agent_end.wait`, and wake with a `prompt`.
+- **`runtime/subagent_run.py`** is its children's RPC host. A child whose run ends
+  waiting is woken, not closed.
+- **Print mode under the scheduler** (`HARNESS_WAKE_FILE`, `HARNESS_WAIT_MODE=exit`):
+  the run ends, the process exits, and `scheduler.py` re-invokes `prime -c` with the
+  wake message.
+- **Print mode with neither** wakes itself (`HARNESS_PRINT_SELF_WAKE=0` turns that
+  off). It polls `scheduler.py --reason-for-request` when `HARNESS_RUNTIME_DIR` names
+  the runtime, and otherwise wakes at the deadline only, which is what the old sleep did.
+
+**Several calls in one response.** Ipython calls run sequentially. Calls after the
+turn-ending one do **not** run: each gets an error result, `[not run: an earlier call
+in this response ended the turn (jobs.wait), so this call was skipped. …]`, for the
+same reason code after `jobs.wait` in a cell does not run. Only calls issued before
+the wait have taken effect. A fully parallel batch (no sequential tool) has already
+run every call; the turn still ends after it. Pinned in
+`bench/test/wait-ends-turn.test.mjs`, the wake sources in
+`runtime/test_wake_sources.py`, and the whole thing against haiku in
+`bench/test/wait-ends-turn-live.test.mjs` (`HARNESS_LIVE_WAIT=1`).
+
 ## 4. What we take from prime, what we drop
 
 **Take:**

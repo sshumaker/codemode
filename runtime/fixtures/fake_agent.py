@@ -19,6 +19,9 @@ Behaviour is driven by the environment so one fixture covers every case:
     FAKE_HANG=20    after the turns, sleep this long (to be killed by a cap)
     FAKE_EXIT=2     exit with this code
     FAKE_DELAY=0.5  seconds between turns
+    FAKE_WAIT=2     end the FIRST run the way a cell ending in jobs.wait does:
+                    agent_end with stopReason "waiting" and a deadline-only wait
+                    request of this many seconds
     FAKE_WRITE=path write the received prompt here (proves delivery and cwd)
     FAKE_REPORT_ENV=VAR  also record this variable's value from the child's own
                     environment. Which environment a child inherits is the whole
@@ -118,6 +121,7 @@ def rpc_mode():
     turns = int(os.environ.get("FAKE_TURNS", "1"))
     delay = float(os.environ.get("FAKE_DELAY", "0"))
     queue = first[1:]
+    waited = False
     n = 0
     for _ in range(turns):
         if delay:
@@ -133,7 +137,16 @@ def rpc_mode():
             n += 1
             turn(n, f"turn {n}: handled {msg.splitlines()[-1][:60]}")
             queue += stdin.commands(0)
-        emit({"type": "agent_end", "messages": []})
+        wait_s = os.environ.get("FAKE_WAIT")
+        if wait_s and not waited:
+            waited = True
+            seconds = float(wait_s)
+            request = {"wake_at": time.time() + seconds, "wake_after": seconds, "armed_at": time.time(),
+                       "watch": [], "targets": [], "job_dir": os.getcwd()}
+            emit({"type": "agent_end", "messages": [], "stopReason": "waiting",
+                  "wait": {"seconds": seconds, "targets": [], "watch": [], "request": request}})
+        else:
+            emit({"type": "agent_end", "messages": []})
         hang = float(os.environ.get("FAKE_HANG", "0"))
         if hang:
             time.sleep(hang)
