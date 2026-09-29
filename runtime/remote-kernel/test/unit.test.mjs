@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { before, describe, it } from "node:test";
 import { DIST } from "./fake-server.mjs";
 
 const R = `${DIST}/core/kernel/remote`;
@@ -275,6 +275,88 @@ describe("daytona provider find", () => {
 		sandboxes.get("sb-1").labels = { app: "assistant-workspace", conversation: "someone-else" };
 		searchable = true;
 		assert.equal(await p.find("conv-1"), undefined, "a binding is dropped once the sandbox is no longer the conversation's");
+	});
+});
+
+describe("provider: sandboxes deleted under it", () => {
+	let DaytonaKernelProvider;
+	before(async () => {
+		({ DaytonaKernelProvider } = await import("../../daytona/provider.mjs"));
+	});
+	const deletedLister = (entries, getBehaviour) => ({
+		async *list() {
+			for (const sb of entries) yield sb;
+		},
+		async get(id) {
+			return getBehaviour(id);
+		},
+	});
+
+	it("find() skips a sandbox the search still lists after it was deleted, and one listed as destroyed", async () => {
+		const gone = Object.assign(new Error("Sandbox with ID or name sb-old not found"), { name: "DaytonaNotFoundError" });
+		const daytona = deletedLister(
+			[
+				{ id: "sb-dead", state: "destroyed", labels: { app: "assistant-workspace", conversation: "conv-1" } },
+				{ id: "sb-old", state: "stopped", labels: { app: "assistant-workspace", conversation: "conv-1" } },
+			],
+			(id) => {
+				if (id === "sb-old") throw gone;
+				return { id, state: "destroyed" };
+			},
+		);
+		const p = new DaytonaKernelProvider({ daytona });
+		assert.equal(await p.find("conv-1"), undefined, "no live sandbox: ensure() will create one");
+	});
+
+	it("find() returns a listed sandbox once get() confirms it is alive", async () => {
+		const daytona = deletedLister([{ id: "sb-1", state: "stopped", labels: { conversation: "conv-1" } }], (id) => ({
+			id,
+			state: "stopped",
+			labels: { conversation: "conv-1" },
+		}));
+		const p = new DaytonaKernelProvider({ daytona });
+		assert.equal((await p.find("conv-1"))?.id, "sb-1");
+	});
+
+	it("find() does not swallow errors other than not-found", async () => {
+		const daytona = deletedLister([{ id: "sb-1", state: "stopped", labels: {} }], () => {
+			throw new Error("503 upstream");
+		});
+		const p = new DaytonaKernelProvider({ daytona });
+		await assert.rejects(p.find("conv-1"), /503 upstream/);
+	});
+
+	it("ensure() recovers once from a sandbox that vanished mid-ensure, and forgets it", async () => {
+		const p = new DaytonaKernelProvider({ daytona: {} });
+		p.bind("conv-1", "sb-old");
+		let calls = 0;
+		p.ensureUnlocked = async () => {
+			calls++;
+			if (calls === 1) throw Object.assign(new Error("Sandbox with ID or name sb-old not found"), { name: "DaytonaNotFoundError" });
+			return { sandboxId: "sb-new", created: true };
+		};
+		const info = await p.ensure("conv-1");
+		assert.equal(info.sandboxId, "sb-new");
+		assert.equal(calls, 2);
+		assert.equal(p.bound.get("conv-1"), undefined, "the dead binding was dropped before the retry");
+	});
+
+	it("ensure() retries only once, and never for other errors", async () => {
+		const p = new DaytonaKernelProvider({ daytona: {} });
+		let calls = 0;
+		p.ensureUnlocked = async () => {
+			calls++;
+			throw Object.assign(new Error("not found"), { name: "DaytonaNotFoundError" });
+		};
+		await assert.rejects(p.ensure("conv-1"), /not found/);
+		assert.equal(calls, 2);
+		calls = 0;
+		p.ensureUnlocked = async () => {
+			calls++;
+			throw new Error("quota exceeded");
+		};
+		await assert.rejects(p.ensure("conv-2"), /quota exceeded/);
+		assert.equal(calls, 1);
 	});
 });
 

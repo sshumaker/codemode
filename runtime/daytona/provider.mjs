@@ -25,7 +25,15 @@ import { Daytona } from "@daytonaio/sdk";
 import { buildKernelServerBundle, ZEROMQ_VERSION } from "./bundle.mjs";
 import { IMAGE_RUNTIME_ROOT, listKernelSnapshots, runtimeEnv, snapshotName } from "./snapshot.mjs";
 
-export const APP_LABEL = "assistant-workspace";
+export /** Sandbox states that will never serve a kernel again. */
+const DEAD_STATES = new Set(["destroyed", "destroying"]);
+
+/** Daytona's "no such sandbox" error, from the SDK's class or its message. */
+export function isNotFound(err) {
+	return err?.name === "DaytonaNotFoundError" || err?.statusCode === 404 || /\bnot found\b/i.test(String(err?.message ?? ""));
+}
+
+const APP_LABEL = "assistant-workspace";
 export const KERNEL_PORT = 8765;
 const SERVER_LOG = "kernel-server.log";
 
@@ -167,8 +175,20 @@ export class DaytonaKernelProvider {
 			this.bound.delete(id);
 		}
 		for await (const sb of this.daytona.list({ labels: { ...this.labels, conversation: id } })) {
-			this.bound.set(id, sb.id);
-			return sb;
+			// The search can still list a sandbox that was just deleted (it lags the delete
+			// as it lags a relabel). Confirm it by id before handing it back, or ensure()
+			// would try to start a sandbox that no longer exists.
+			if (DEAD_STATES.has(sb.state)) continue;
+			let live = sb;
+			try {
+				live = (await this.daytona.get(sb.id)) ?? sb;
+			} catch (err) {
+				if (isNotFound(err)) continue;
+				throw err;
+			}
+			if (DEAD_STATES.has(live.state)) continue;
+			this.bound.set(id, live.id);
+			return live;
 		}
 		return undefined;
 	}
@@ -185,7 +205,18 @@ export class DaytonaKernelProvider {
 	 * @returns {Promise<import("./provider.d.ts").KernelConnectionInfo>}
 	 */
 	ensure(conversationId, opts = {}) {
-		return this.withLock(conversationId, () => this.ensureUnlocked(conversationId, opts));
+		return this.withLock(conversationId, async () => {
+			try {
+				return await this.ensureUnlocked(conversationId, opts);
+			} catch (err) {
+				// Deleted between being found and being used (a sweep, Daytona's auto-delete):
+				// forget it and bring up a fresh one, once.
+				if (!isNotFound(err)) throw err;
+				this.bound.delete(String(conversationId));
+				this.log(`sandbox for ${conversationId} vanished mid-ensure; creating a fresh one`);
+				return await this.ensureUnlocked(conversationId, opts);
+			}
+		});
 	}
 
 	async ensureUnlocked(conversationId, opts) {
