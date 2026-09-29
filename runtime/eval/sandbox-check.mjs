@@ -76,7 +76,9 @@ const probes = [
   // it checks that srt enforces exactly what the settings declare, and a
   // declaration that is not enforced is the whole thing being tested for.
   ["read the runtime dir", readProbe(`${process.cwd()}/runtime/jobs.py`), declaresRead(`${process.cwd()}/runtime`)],
-  ["read the kernel venv", readProbe(`${process.env.HOME}/.prime/agent/kernel-venv/pyvenv.cfg`), true],
+  ["read the kernel venv", readProbe(join(dirname(dirname(PY)), "pyvenv.cfg")), true],
+  // Another run's file in the shared temp dir: the reads a trace's `find /` made.
+  ["read another tmp dir", readProbe(join(dir, "other-run.txt")), false],
   ["network egress", `import urllib.request;urllib.request.urlopen("https://example.com",timeout=8).read(1)`, false],
   ["spawn a child", `import subprocess;subprocess.run(["echo","hi"],check=True)`, true],
   // The door, and the lock on it. Both probes POST a deliberately malformed
@@ -135,10 +137,10 @@ function spawnProbe(url, token, wantStatus) {
   ].join("\n");
 }
 let bad = 0;
-for (const [i, [label, code, shouldWork, words = ["allowed", "blocked"]]] of probes.entries()) {
-  const f = join(dir, `p${i}.py`);
-  writeFileSync(f, code);
-  const r = spawnSync(SRT, ["--settings", settings, PY, f], { encoding: "utf8", timeout: 30000 });
+writeFileSync(join(dir, "other-run.txt"), "another run\n");
+for (const [label, code, shouldWork, words = ["allowed", "blocked"]] of probes) {
+  // Inline, not a file under `dir`: the shared temp dir is outside the sandbox now.
+  const r = spawnSync(SRT, ["--settings", settings, PY, "-c", code], { encoding: "utf8", timeout: 30000 });
   const worked = r.status === 0;
   const ok = worked === shouldWork;
   if (!ok) bad++;

@@ -98,6 +98,8 @@ export declare class DaytonaKernelProvider {
 	uploadFile(conversationId: string, path: string, data: Buffer | string): Promise<string>;
 	listFiles(conversationId: string, dir?: string): Promise<SandboxFile[]>;
 	readFile(conversationId: string, path: string): Promise<Buffer>;
+	/** Run the kernel venv's python in the sandbox with `stdin`; resolves to stdout, rejects on a non-zero exit. */
+	runKernelPython(conversationId: string, args: string[], stdin?: string, timeoutSec?: number): Promise<string>;
 	serverLog(sandbox: unknown, lines?: number): Promise<string>;
 }
 

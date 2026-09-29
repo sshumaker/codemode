@@ -8,10 +8,11 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { KERNEL_ENV_ALLOW, defaultEgressListen, egressSocketPath, srtSettings } from "../../runtime/posture.mjs";
+import { KERNEL_ENV_ALLOW, SYSTEM_READABLE, defaultEgressListen, egressSocketPath, srtSettings } from "../../runtime/posture.mjs";
 import { renderClient } from "../generate.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -93,22 +94,45 @@ describe("the container runners refuse a posture the volume cannot honour", () =
 	});
 });
 
-describe("srt settings deny the region that holds the credentials", () => {
-	const s = srtSettings({ runDir: "/run/x", home: "/home/u", readable: ["/run/x", "/usr"], writable: ["/tmp"] });
+describe("srt settings are an allow-list from the root", () => {
+	const s = srtSettings({ runDir: "/run/x", home: "/home/u", readable: ["/run/x", "/opt/venv"], writable: ["/run/scratch"], platform: "linux" });
 
-	it("denies the whole home directory and re-allows only named paths", () => {
-		assert.deepEqual(s.filesystem.denyRead, ["/home/u"]);
-		assert.deepEqual(s.filesystem.allowRead, ["/run/x", "/usr"]);
+	it("denies the root and re-allows only the system paths and the named ones", () => {
+		assert.deepEqual(s.filesystem.denyRead, ["/"]);
+		assert.deepEqual(s.filesystem.allowRead, [...SYSTEM_READABLE.linux, "/run/x", "/opt/venv"]);
 	});
 
 	it("writes nowhere but the run directory and the named scratch", () => {
-		assert.deepEqual(s.filesystem.allowWrite, ["/run/x", "/tmp"]);
+		assert.deepEqual(s.filesystem.allowWrite, ["/run/x", "/run/scratch"]);
 	});
 
 	it("allows no domain at all", () => {
 		// The kernel reaches the egress proxy over loopback (macOS) rather than
 		// through this list. An entry here would be a second route out.
 		assert.deepEqual(s.network.allowedDomains, []);
+	});
+
+	it("refuses an entry that re-opens a shared region, in either list", () => {
+		const home = homedir();
+		for (const bad of ["/", "/tmp", "/private/tmp", tmpdir(), home, dirname(home), "/var", "/private"]) {
+			assert.throws(() => srtSettings({ runDir: "/run/x", home, readable: [bad] }), /covers the shared region/, bad);
+			assert.throws(() => srtSettings({ runDir: "/run/x", home, readable: [], writable: [bad] }), /covers the shared region/, bad);
+		}
+	});
+
+	it("accepts a run's own directory under the shared temp dir, in both spellings", () => {
+		const own = mkdtempSync(join("/tmp", "posture-own-"));
+		try {
+			const t = srtSettings({ runDir: own, home: homedir(), readable: [], writable: [join(own, "later")] });
+			assert.ok(t.filesystem.allowRead.includes(own));
+			if (process.platform === "darwin") {
+				assert.ok(t.filesystem.allowRead.includes(realpathSync(own)), "the resolved spelling seatbelt matches");
+				// Not created yet, and still resolved through its existing ancestor.
+				assert.ok(t.filesystem.allowWrite.includes(join(realpathSync(own), "later")));
+			}
+		} finally {
+			rmSync(own, { recursive: true, force: true });
+		}
 	});
 });
 

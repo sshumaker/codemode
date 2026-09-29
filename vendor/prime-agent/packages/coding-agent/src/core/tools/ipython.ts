@@ -537,7 +537,12 @@ except Exception:
 
 try:
     import rlm as _prime_agent_rlm_module
-    rlm = _prime_agent_rlm_module.rlm
+    # harness: the name is bound only under HARNESS_RLM=1 (scripts/neutralize-prime.mjs).
+    if _prime_agent_os.environ.get("HARNESS_RLM") == "1":
+        rlm = _prime_agent_rlm_module.rlm
+    else:
+        globals().pop("rlm", None)
+    del _prime_agent_rlm_module
 except Exception as _prime_agent_rlm_error:
     _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
 
@@ -565,7 +570,8 @@ except Exception as _prime_agent_rlm_error:
         async def __call__(self, prompt, **kwargs):
             return await self.run(prompt, **kwargs)
 
-    rlm = _PrimeAgentMissingRlm()
+    if _prime_agent_os.environ.get("HARNESS_RLM") == "1":
+        rlm = _PrimeAgentMissingRlm()
 `.trim();
 
 export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {

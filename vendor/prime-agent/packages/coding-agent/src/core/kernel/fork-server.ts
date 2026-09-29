@@ -43,6 +43,8 @@ export class ForkServerUnavailable extends Error {
 // PRIME_AGENT_KERNEL_FORKSERVER=0 opts out.
 export function isForkServerEnabled(): boolean {
 	if (process.platform !== "linux") return false;
+	// harness: a forked kernel would escape srt (scripts/neutralize-prime.mjs).
+	if (process.env.HARNESS_KERNEL_SANDBOX_SETTINGS) return false;
 	return process.env.PRIME_AGENT_KERNEL_FORKSERVER !== "0";
 }
 

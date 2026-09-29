@@ -274,6 +274,20 @@ sub(
 	'errorEname: "FilesystemGuard"',
 );
 
+// The Linux forkserver forks kernels from a template process that was never started
+// under srt, so a forked kernel would run with no sandbox at all while the settings
+// file says otherwise. The sandboxed spawn is the only launch under a posture.
+sub(
+	"core/kernel/fork-server.ts",
+	'\tif (process.platform !== "linux") return false;\n\treturn process.env.PRIME_AGENT_KERNEL_FORKSERVER !== "0";',
+	'\tif (process.platform !== "linux") return false;\n' +
+		"\t// harness: a forked kernel would escape srt (scripts/neutralize-prime.mjs).\n" +
+		"\tif (process.env.HARNESS_KERNEL_SANDBOX_SETTINGS) return false;\n" +
+		'\treturn process.env.PRIME_AGENT_KERNEL_FORKSERVER !== "0";',
+	"no forkserver under a kernel sandbox",
+	"if (process.env.HARNESS_KERNEL_SANDBOX_SETTINGS) return false;",
+);
+
 // --- Symlink-blind find/grep --------------------------------------------------
 // The arm links the compiled api package into the working directory as a
 // SYMLINK (work/api -> bundle/api). fd and rg do not follow symlinks by default,
@@ -1359,6 +1373,48 @@ sub(
 	"A Python skill runs inside the agent's kernel. It does not start child agents itself (`rlm.run` is disabled in this harness); delegation is the agent's decision, not a skill's.",
 	"skill-creator reference no longer teaches rlm.run",
 	"`rlm.run` is disabled in this harness); delegation",
+);
+// The refusal alone left the NAME in the user namespace: a Sonnet 5 trace's `%whos`
+// listed `rlm  _RLMCallable`, a handle the model can see, introspect and try. So by
+// default the bootstrap does not bind it at all. Skills that need the host bridge
+// import it themselves (`from rlm import host_request`, as attach_image does), and
+// `sys.modules["rlm"]` still holds the module, so nothing they use goes away.
+// HARNESS_RLM=1 binds it again.
+sub(
+	"core/tools/ipython.ts",
+	"try:\n    import rlm as _prime_agent_rlm_module\n    rlm = _prime_agent_rlm_module.rlm\nexcept Exception as _prime_agent_rlm_error:",
+	"try:\n    import rlm as _prime_agent_rlm_module\n" +
+		"    # harness: the name is bound only under HARNESS_RLM=1 (scripts/neutralize-prime.mjs).\n" +
+		"    if _prime_agent_os.environ.get(\"HARNESS_RLM\") == \"1\":\n" +
+		"        rlm = _prime_agent_rlm_module.rlm\n" +
+		"    else:\n" +
+		"        globals().pop(\"rlm\", None)\n" +
+		"    del _prime_agent_rlm_module\n" +
+		"except Exception as _prime_agent_rlm_error:",
+	"the user namespace binds rlm only under HARNESS_RLM=1",
+	'globals().pop("rlm", None)',
+);
+sub(
+	"core/tools/ipython.ts",
+	"    rlm = _PrimeAgentMissingRlm()\n",
+	"    if _prime_agent_os.environ.get(\"HARNESS_RLM\") == \"1\":\n        rlm = _PrimeAgentMissingRlm()\n",
+	"the missing-runtime stand-in is bound only under HARNESS_RLM=1",
+	"        rlm = _PrimeAgentMissingRlm()\n",
+);
+// The prompt's `rlm.harness` line names the handle that is no longer bound.
+sub(
+	"core/prompts/rlm.ts",
+	'\t"Continual harness state is available as `rlm.harness`',
+	'\t...(process.env.HARNESS_RLM !== "1" ? [] : ["Continual harness state is available as `rlm.harness`',
+	"control prompt names rlm.harness only under HARNESS_RLM=1",
+	'(process.env.HARNESS_RLM !== "1" ? [] : ["Continual harness state',
+);
+sub(
+	"core/prompts/rlm.ts",
+	'so literal `global=True` is invalid syntax.",\n\t"",\n',
+	'so literal `global=True` is invalid syntax.", ""]),\n',
+	"close the rlm.harness line and its spacer",
+	'is invalid syntax.", ""]),',
 );
 
 // --- Claude Opus 5.5 ------------------------------------------------------------

@@ -38,7 +38,9 @@ import { seedPrimeSettings } from "../../bench/prime-settings.mjs";
 import {
 	KERNEL_ENV_ALLOW,
 	defaultEgressListen,
+	egressSocketPath,
 	pythonPrefixes,
+	runScratchDir,
 	srtSettings as buildSrtSettings,
 	startEgress,
 } from "../posture.mjs";
@@ -185,19 +187,20 @@ const srtSettings = join(runDir, "srt-settings.json");
  *   RUNTIME     the prelude and jobs.py, loaded into the kernel at boot
  *   CLI's dir   subagents.py stats HARNESS_SUBAGENT_CLI from inside the kernel
  *   venv/base   the kernel interpreter, and the install its symlinks resolve to
- *   tmp         ipykernel's connection file, and font/matplotlib caches
- *
- * os.tmpdir() as well as "/tmp": on macOS TMPDIR is a per-user /var/folders/...
- * path and that is where ipykernel's connection file lives, so allowing only
- * /tmp left the kernel unable to reach it.
+ *   scratch     this run's own TMPDIR: ipykernel's connection file, font and
+ *               matplotlib caches. Not /tmp: posture.mjs refuses the shared temp
+ *               directory, which holds every other run's files.
+ *   the socket  the egress proxy's unix socket, when it falls back to TMPDIR
  */
 const kernelPython = process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
-const kernelReadable = [runDir, RUNTIME, dirname(CLI), ...pythonPrefixes(kernelPython), "/tmp", tmpdir()];
+const scratch = sandboxed ? runScratchDir() : undefined;
+const egressSocket = argv.includes("--no-egress") ? [] : [egressSocketPath(runDir, runId)];
+const kernelReadable = [runDir, RUNTIME, dirname(CLI), ...pythonPrefixes(kernelPython), ...(scratch ? [scratch] : []), ...egressSocket];
 if (sandboxed) {
 	writeFileSync(
 		srtSettings,
 		`${JSON.stringify(
-			buildSrtSettings({ runDir, home: homedir(), readable: kernelReadable, writable: ["/tmp", tmpdir()] }),
+			buildSrtSettings({ runDir, home: homedir(), readable: kernelReadable, writable: [scratch] }),
 			null,
 			2,
 		)}\n`,
@@ -308,7 +311,7 @@ const runEnv = {
 			// Read by the patched kernel spawn; absent means no sandbox.
 			// The kernel fails closed; bare must be said, never implied by absence.
 			...(sandboxed
-				? { HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettings, HARNESS_KERNEL_SANDBOX_BIN: srtBin }
+				? { HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettings, HARNESS_KERNEL_SANDBOX_BIN: srtBin, TMPDIR: scratch }
 				: { HARNESS_KERNEL_SANDBOX: "off" }),
 			// Also read by the patched kernel spawn (scripts/patches/kernel-env.ts).
 			...(envInherit ? {} : { HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW }),

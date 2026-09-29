@@ -51,7 +51,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { KERNEL_ENV_ALLOW, pythonPrefixes, srtSettings, startEgress } from "../../runtime/posture.mjs";
+import { KERNEL_ENV_ALLOW, pythonPrefixes, runScratchDir, srtSettings, startEgress } from "../../runtime/posture.mjs";
 import { apiLayout, docsGateMode, generate, renderFullDocs, renderTocLines } from "../generate.mjs";
 import { loadRequiredDefaults } from "../required-defaults.mjs";
 import { BASE_PROMPTS, buildBase, buildPreamble, buildVanillaPreamble } from "./prompts.mjs";
@@ -794,6 +794,7 @@ async function main() {
 	 */
 	let egress;
 	let srtSettingsPath;
+	let scratch;
 	if (posture) {
 		// TCP explicitly, and a refusal on Linux — same reason as bench/run-task.mjs:
 		// the MCP clients on both arms speak HTTP over TCP, and a bwrap sandbox cannot
@@ -811,6 +812,7 @@ async function main() {
 		const kernelPython =
 			process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime/agent/kernel-venv/bin/python");
 		srtSettingsPath = join(runDir, "srt-settings.json");
+		scratch = runScratchDir();
 		writeFileSync(
 			srtSettingsPath,
 			`${JSON.stringify(
@@ -820,8 +822,8 @@ async function main() {
 					// runDir holds the generated api/ tree and both ledgers; runtime/ is
 					// needed only when the bash tool is on, because its guard imports
 					// jobs.py from inside the kernel.
-					readable: [runDir, join(ROOT, "runtime"), dirname(CLI), ...pythonPrefixes(kernelPython), "/tmp", tmpdir()],
-					writable: ["/tmp", tmpdir()],
+					readable: [runDir, join(ROOT, "runtime"), dirname(CLI), ...pythonPrefixes(kernelPython), scratch],
+					writable: [scratch],
 				}),
 				null,
 				2,
@@ -845,6 +847,7 @@ async function main() {
 						HARNESS_KERNEL_SANDBOX_SETTINGS: srtSettingsPath,
 						HARNESS_KERNEL_SANDBOX_BIN: join(ROOT, "node_modules/.bin/srt"),
 						HARNESS_KERNEL_ENV_ALLOW: KERNEL_ENV_ALLOW,
+						TMPDIR: scratch,
 					}
 				// The kernel fails closed; posture=off must be said, not implied.
 				: { HARNESS_KERNEL_SANDBOX: "off" }),
