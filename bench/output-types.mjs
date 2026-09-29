@@ -44,6 +44,10 @@
  * the neutral defaults. A field's `ref` is recorded as the KIND ("asset" |
  * "shape" | "job"), never as the format string, so nothing downstream depends on
  * which product's spelling the catalogue used.
+ *
+ * A catalogue that names kinds in an annotation instead (`{format: "product-ref",
+ * "x-ref-kinds": ["artifact"]}`) passes `refKinds: { key, kinds }`, mapping each
+ * kind word to a category; a node carrying the key is read by its kinds, not its format.
  */
 export const DEFAULT_REF_FORMATS = Object.freeze({ asset: "asset-ref", shape: "shape-ref", job: "job-ref" });
 
