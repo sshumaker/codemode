@@ -221,7 +221,10 @@ describe("pristine replay: the patch scripts ARE the committed tree", () => {
 	// presence is asserted directly below instead.
 	const RLM_RUNTIME = "vendor/prime-agent/prime-agent-runtime/src/rlm/__init__.py";
 	const SKILL_REF = "vendor/prime-agent/packages/coding-agent/skills/skill-creator/references/python-skills.md";
-	const EXTRA = [PKG_JSON, AI_ANTHROPIC, RLM_RUNTIME, SKILL_REF];
+	// jobs.wait ends the turn: the loop that stops, and the types that carry why.
+	const AGENT_LOOP = "vendor/prime-agent/packages/agent/src/agent-loop.ts";
+	const AGENT_TYPES = "vendor/prime-agent/packages/agent/src/types.ts";
+	const EXTRA = [PKG_JSON, AI_ANTHROPIC, RLM_RUNTIME, SKILL_REF, AGENT_LOOP, AGENT_TYPES];
 
 	it("replaying the patch scripts on the base commit reproduces the vendored tree", () => {
 		const scratch = mkdtempSync(join(tmpdir(), "pristine-replay-"));

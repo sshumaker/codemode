@@ -799,6 +799,30 @@ def _bind(name, value):
 _bind_subagents()
 
 
+def _publish_wait_marker(signal_value, seconds):
+    """
+    The end-of-turn marker: the wait request as display_data under WAIT_MARKER_MIME.
+
+    Carries HARNESS_WAIT_TOKEN, which the host checks — the same forgery resistance
+    the stdout sentinel has: a display bundle replayed from somewhere else (a saved
+    notebook, a printed transcript) does not carry this kernel's token. Published
+    from inside the custom-exception handler, so it is parented to the executing
+    cell like any other output.
+    """
+    request = dict(getattr(signal_value, "request", None) or {})
+    if not request:
+        request = {"wake_after": seconds if isinstance(seconds, int) else None, "watch": [], "targets": []}
+    token = os.environ.get("HARNESS_WAIT_TOKEN")
+    if token:
+        request["token"] = token
+    try:
+        from IPython.display import publish_display_data
+
+        publish_display_data({jobs.WAIT_MARKER_MIME: request, "text/plain": "[jobs.wait: turn ends]"})
+    except Exception as exc:
+        print(f"[jobs] could not publish the end-of-turn marker ({exc}); the host will not stop the turn")
+
+
 def _render_wait_signal_cleanly():
     """
     Present the end-of-cell signal as control flow, not as a crash.
@@ -816,7 +840,18 @@ def _render_wait_signal_cleanly():
 
     def handler(shell, etype, value, tb, tb_offset=None):
         seconds = value.args[0] if value.args else "?"
-        if os.environ.get("HARNESS_WAIT_MODE") == "wake":
+        if jobs._wait_ends_turn():
+            # The turn ends HERE, by mechanism: the marker below is what prime's
+            # ipython tool reads to stop the loop after this result, so no sentence
+            # has to talk the model into stopping (it did not, twice — see the exit
+            # branch). The line is for the transcript the model reads on waking.
+            _publish_wait_marker(value, seconds)
+            print(
+                f"[cell ended here, and so did your turn. You will be woken with a message "
+                f"saying why — what you are waiting on finished or wrote to you, or {seconds}s "
+                f"passed. Anything written after jobs.wait() in this cell did NOT run.]"
+            )
+        elif os.environ.get("HARNESS_WAIT_MODE") == "wake":
             # The harness resumes the conversation itself (a watched child finished,
             # or the deadline passed); nothing sleeps, so the turn has to end.
             print(

@@ -717,7 +717,7 @@ class TestRealChild(unittest.TestCase):
             python=sys.executable,
         )
         self._saved = {k: os.environ.get(k) for k in
-                       ("FAKE_TURNS", "FAKE_HANG", "FAKE_EXIT", "FAKE_DELAY", "FAKE_WRITE")}
+                       ("FAKE_TURNS", "FAKE_HANG", "FAKE_EXIT", "FAKE_DELAY", "FAKE_WRITE", "FAKE_WAIT")}
 
     def tearDown(self):
         for rec in self.store._all():
@@ -765,6 +765,20 @@ class TestRealChild(unittest.TestCase):
         self.assertIn("[subagent scout]", s.output)
         self.assertIn("[scout turn 1]", s.output)
         self.assertIn("final response", s.output)
+
+    def test_a_child_whose_turn_ends_in_jobs_wait_is_woken_not_closed(self):
+        # jobs.wait ends the turn (stopReason "waiting"); the launcher is the child's
+        # RPC host, so it must arm the wake rather than read agent_end as the end.
+        os.environ["FAKE_TURNS"] = "1"
+        os.environ["FAKE_WAIT"] = "1"
+        job = self.spawner.spawn("build it, then report", name="scout")
+        self.assertTrue(wait_until(lambda: job.done, timeout=30), f"child never finished: {job!r}")
+        s = self.store.get("scout")
+        self.assertTrue(s.ok, f"exit {s.exit_code}: {s.output[-800:]}")
+        self.assertIn("[scout] waiting: deadline (up to 1.0s)", s.output)
+        self.assertIn("[scout] woken: the requested wait of 1.0s elapsed", s.output)
+        self.assertIn("handled [woken: the requested wait of 1.0s elapsed]", s.result)
+        self.assertEqual(s.turns, 2, "one turn before the wait, one after the wake")
 
     def test_spawn_returns_before_the_child_finishes(self):
         os.environ["FAKE_TURNS"] = "1"

@@ -56,6 +56,20 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 # The tool wrapper greps stdout for this. Deliberately unmistakable.
 WAIT_SENTINEL = "__HARNESS_WAIT_SECONDS__"
 
+# The structural end-of-turn marker: kernel-prelude.py's WaitSignal handler publishes
+# the wait request as display_data under this MIME, prime's kernel manager lifts it
+# onto the execute result, and the ipython tool ends the TURN on it — not just the
+# cell. A display payload rather than stdout, because stdout is model-reachable text
+# (a cat of a transcript printed a sentinel once) and a display bundle under a vendor
+# MIME is not something ordinary output produces.
+WAIT_MARKER_MIME = "application/vnd.harness.wait+json"
+
+
+def _wait_ends_turn(env: Optional[Dict[str, str]] = None) -> bool:
+    """Default on. HARNESS_WAIT_ENDS_TURN=0 restores the host-side sleep, for benchmarks."""
+    env = os.environ if env is None else env
+    return env.get("HARNESS_WAIT_ENDS_TURN", "1") != "0"
+
 def _default_job_dir(env: Optional[Dict[str, str]] = None, warn=None) -> str:
     """
     Where jobs live, scoped to ONE agent session.
@@ -161,7 +175,15 @@ class WaitSignal(BaseException):
 
     Derives from BaseException so a stray `except Exception:` around the agent's own
     code cannot swallow it and silently resurrect the bug.
+
+    `args[0]` is the clamped wake_after in seconds, as it always was. `request` is the
+    whole wake request — the same dict the scheduler reads from wake.json — which the
+    prelude's handler publishes as the end-of-turn marker (WAIT_MARKER_MIME).
     """
+
+    def __init__(self, seconds: Any = None, request: Optional[Dict[str, Any]] = None):
+        super().__init__(*(() if seconds is None else (seconds,)))
+        self.request = request
 
 
 # --------------------------------------------------------------------------------
@@ -1514,7 +1536,8 @@ class JobStore:
     def wait(self, *names: Any, wake_after: Any = None, mode: Optional[str] = None) -> None:
         """
         Put a deadline on the agent's attention. **Must be the last statement in the
-        cell**, and it does not block: the kernel is released and the host waits.
+        cell**, and it does not block: the cell ends, your turn ends with it, the
+        kernel is released, and a new turn opens with a message saying why you woke.
 
             jobs.wait("build", wake_after="10m")             # wake when build finishes
             jobs.wait([a, b], wake_after="10m")              # handles or names, a list or varargs
@@ -1539,6 +1562,7 @@ class JobStore:
             mode = "all"
         seconds = parse_duration(wake_after)
         clamped = max(self._min_wait, min(seconds, self._max_wait))
+        armed_at = time.time()
         pending = []
         for rec in self._all():
             fresh = self._refresh(rec)
@@ -1569,7 +1593,7 @@ class JobStore:
             if armed:
                 for line in armed:
                     self._emit(line)
-                raise WaitSignal(clamped)
+                raise WaitSignal(clamped, self._wake_request(clamped, seconds, armed_at, watch, live_names, mode))
             self._emit("[jobs] nothing here can resume you after a wait in this session; "
                        "check the job yourself in a later cell")
         # Scheduler mode (runtime/scheduler.py): the wake request goes on DISK,
@@ -1578,6 +1602,7 @@ class JobStore:
         # a wait with no names keeps the original contract — any running job
         # finishing, or the deadline. Written atomically for the same reason job
         # records are.
+        request = self._wake_request(clamped, seconds, armed_at, watch, live_names, mode)
         wake_file = os.environ.get("HARNESS_WAKE_FILE")
         if wake_file:
             try:
@@ -1586,17 +1611,6 @@ class JobStore:
                 # against a 35-second build). Same pattern as _record's makedirs.
                 os.makedirs(os.path.dirname(wake_file) or ".", exist_ok=True)
                 tmp = f"{wake_file}.tmp"
-                request = {
-                    "wake_at": time.time() + clamped,
-                    "wake_after": clamped,
-                    "watch": watch if watch else live_names,
-                }
-                if watch:
-                    request.update({
-                        "mode": mode,
-                        "armed_at": time.time(),
-                        "mailboxes": self._mailboxes(watch),
-                    })
                 with open(tmp, "w") as fh:
                     json.dump(request, fh)
                 os.replace(tmp, wake_file)
@@ -1611,7 +1625,56 @@ class JobStore:
         self._emit(f"{WAIT_SENTINEL}:{clamped}:{token}" if token else f"{WAIT_SENTINEL}:{clamped}")
         # Sentinel first, then end the cell. Anything below the call is unreachable by
         # construction rather than by inspection — see WaitSignal.
-        raise WaitSignal(clamped)
+        raise WaitSignal(clamped, request)
+
+    def _wake_request(self, clamped: int, requested: int, armed_at: float, watch: List[str],
+                      live_names: List[str], mode: Optional[str]) -> Dict[str, Any]:
+        """
+        Everything a host needs to wake this session, and nothing it has to parse.
+
+        One shape for every consumer: the scheduler reads it from wake.json, and the
+        end-of-turn marker carries it to RPC hosts on `agent_end`, so both evaluate
+        the same request with `scheduler.reason_for`. `targets` is what the agent
+        named ([] for a bare deadline wait); `watch` is what actually wakes it — the
+        named targets, or every job live when it waited.
+        """
+        request: Dict[str, Any] = {
+            "wake_at": armed_at + clamped,
+            "wake_after": clamped,
+            "requested": requested,
+            "armed_at": armed_at,
+            "watch": watch if watch else live_names,
+            "targets": [*watch],
+            "job_dir": self.job_dir,
+        }
+        if watch:
+            request["mode"] = mode
+            request["mailboxes"] = self._mailboxes(watch)
+            streams = self._stream_offsets(watch)
+            if streams:
+                request["streams"] = streams
+        return request
+
+    def _stream_offsets(self, names: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Each named expect="stream" job's log and its size now.
+
+        A streaming condition never exits, so "finished" can never wake a wait on it;
+        what the agent is waiting for is its next line. The offset is the arming
+        point, so only output produced AFTER the wait counts.
+        """
+        out = {}
+        for name in names:
+            rec = self._read(name) or {}
+            log = rec.get("log")
+            if rec.get("expect") != "stream" or not log:
+                continue
+            try:
+                offset = os.path.getsize(log)
+            except OSError:
+                offset = 0
+            out[name] = {"log": log, "offset": offset}
+        return out
 
     def _known_names(self) -> List[str]:
         """Every job and agent a wait may name: this store's, and each provider's."""

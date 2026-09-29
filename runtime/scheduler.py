@@ -39,7 +39,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import jobs as J
 from agent_mailbox import Mailbox
@@ -47,6 +47,7 @@ from agent_mailbox import Mailbox
 WAKE_FILE = "wake.json"
 SESSION_FILE = "session.json"
 LEASE_DIR = "lease"
+INBOX_DIR = "inbox"
 
 
 # -- lease: single-writer, stale-reclaimable, identity-checked ---------------------
@@ -110,32 +111,51 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     """
     Why this session should wake NOW, or None.
 
-    A missing/unreadable wake.json is "not waiting" — never a wake. A wait with no
-    names (the original contract) wakes when any running job it listed leaves the
-    live states. A named wait carries a mode: "all" wakes when every named job has
-    finished, "any" when the first one does; and a named subagent that wrote to its
-    parent since the wait was armed wakes it either way. The deadline is the
-    backstop for both.
+    A user message in the session's inbox wakes it whether or not it is waiting —
+    someone spoke to it. Otherwise a missing/unreadable wake.json is "not waiting",
+    never a wake, and a present one is judged by `reason_for`.
     """
-    try:
-        with open(os.path.join(session_dir, WAKE_FILE)) as fh:
-            wake = json.load(fh)
-    except (OSError, ValueError):
+    users = pending_user_messages(session_dir)
+    if users:
+        return _user_reason(users)
+    wake = _read_wake(session_dir)
+    if wake is None:
         return None
-    store = J.JobStore(_job_dir(session_dir), emit=lambda m: None)
+    return reason_for(wake, _job_dir(session_dir, wake), now)
+
+
+def reason_for(wake: dict, job_dir: Optional[str] = None, now: Callable[[], float] = time.time) -> Optional[str]:
+    """
+    Why a wait request (wake.json, or the `request` on an RPC `agent_end`) is due NOW.
+
+    The wake sources, first match wins:
+      - a named subagent wrote to its parent since the wait (either mode);
+      - a named expect="stream" job printed new output since the wait was armed;
+      - the watched jobs finished — all of them for mode "all", the first otherwise.
+        A condition job (`until <cond>; do sleep N; done`) finishing IS its
+        condition firing, and says whether it succeeded, failed or timed out;
+      - the wake_after deadline, the backstop for all of them.
+    A wait with no names watches every job live when it waited, as it always did.
+    """
+    store = J.JobStore(job_dir or wake.get("job_dir"), emit=lambda m: None)
     watch = wake.get("watch") or []
     mode = wake.get("mode")
     finished = {}
     for name in watch:
         rec = store._refresh(store._read(name))
         if rec and rec.get("state") not in J.LIVE_STATES:
-            finished[name] = f"{rec.get('state')} — {rec.get('reason') or ''}".strip(" —")
+            finished[name] = describe_finish(rec)
     spoke = _messages_since(wake.get("mailboxes") or {}, wake.get("armed_at"))
     if spoke:
         return "; ".join(f"agent {n!r} sent you a message: {t}" for n, t in spoke.items())
-    if mode == "all":
-        if watch and len(finished) == len(watch):
-            return "all finished: " + ", ".join(f"{n} ({why})" for n, why in finished.items())
+    streamed = _new_output(wake.get("streams") or {})
+    if mode == "all" and len(watch) > 1:
+        if all(n in finished or n in streamed for n in watch):
+            parts = [f"{n} ({finished[n]})" if n in finished else f"{n} (new output)" for n in watch]
+            return "all finished: " + ", ".join(parts) + _stream_tail(streamed)
+    elif streamed:
+        name, text = next(iter(streamed.items()))
+        return f"job {name!r} printed new output since you waited:{_indent(text)}"
     elif finished:
         name, why = next(iter(finished.items()))
         return f"job {name!r} finished: {why}"
@@ -143,6 +163,55 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     if wake_at is not None and now() >= wake_at:
         return f"the requested wait of {wake.get('wake_after', '?')}s elapsed"
     return None
+
+
+def describe_finish(rec: dict) -> str:
+    """How a job ended, in words the agent's next action depends on."""
+    state, reason = rec.get("state"), rec.get("reason") or ""
+    if state == "done":
+        code = rec.get("exit_code")
+        return "succeeded (exit 0)" if code == 0 else f"failed (exit {code})"
+    if state == "deadline":
+        return f"timed out — {reason}".strip(" —")
+    return f"{state} — {reason}".strip(" —")
+
+
+# How much of a stream's new output a wake message carries; the rest is in the log.
+STREAM_WAKE_LINES = 20
+STREAM_WAKE_BYTES = 4096
+
+
+def _new_output(streams: dict) -> dict:
+    """name -> the output each watched stream job wrote after its arming offset."""
+    out = {}
+    for name, spec in streams.items():
+        try:
+            with open(spec.get("log") or "", "rb") as fh:
+                fh.seek(int(spec.get("offset") or 0))
+                data = fh.read(STREAM_WAKE_BYTES)
+        except (OSError, ValueError):
+            continue
+        text = data.decode("utf-8", errors="replace")
+        if text.strip():
+            out[name] = "\n".join(text.rstrip("\n").splitlines()[-STREAM_WAKE_LINES:])
+    return out
+
+
+def _indent(text: str) -> str:
+    return "".join(f"\n    {line}" for line in text.splitlines())
+
+
+def _stream_tail(streamed: dict) -> str:
+    return "".join(f"\n  {n}:{_indent(t)}" for n, t in streamed.items())
+
+
+def _read_wake(session_dir: str) -> Optional[dict]:
+    try:
+        with open(os.path.join(session_dir, WAKE_FILE)) as fh:
+            wake = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return wake if isinstance(wake, dict) else None
 
 
 def _messages_since(mailboxes: dict, armed_at: Optional[float]) -> dict:
@@ -164,6 +233,80 @@ def _messages_since(mailboxes: dict, armed_at: Optional[float]) -> dict:
     return out
 
 
+# -- user messages: the one wake source that is not the agent's own ------------------
+#
+# A message for the session is a file in <session>/inbox/, written atomically. It
+# wakes the session whether or not it is waiting, and it is delivered as the new
+# turn's opening message, after the line saying why the turn started.
+
+def post_user_message(session_dir: str, text: str, sender: str = "user") -> str:
+    """Queue a message for the session's next turn. Returns the message file."""
+    box = os.path.join(session_dir, INBOX_DIR)
+    os.makedirs(box, exist_ok=True)
+    name = f"{time.time():.6f}-{uuid.uuid4().hex[:8]}.json"
+    tmp = os.path.join(box, f".{name}.tmp")
+    with open(tmp, "w") as fh:
+        json.dump({"from": sender, "text": text, "at": time.time()}, fh)
+    final = os.path.join(box, name)
+    os.replace(tmp, final)
+    return final
+
+
+def pending_user_messages(session_dir: str) -> List[dict]:
+    """Undelivered inbox messages, oldest first, each with its file path."""
+    box = os.path.join(session_dir, INBOX_DIR)
+    try:
+        names = sorted(n for n in os.listdir(box) if n.endswith(".json") and not n.startswith("."))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        try:
+            with open(os.path.join(box, name)) as fh:
+                msg = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        msg["path"] = os.path.join(box, name)
+        out.append(msg)
+    return out
+
+
+def _user_reason(messages: List[dict]) -> str:
+    who = sorted({str(m.get("from") or "user") for m in messages})
+    n = len(messages)
+    return f"{n} new message{'s' if n != 1 else ''} from {', '.join(who)}"
+
+
+def _consume_user_messages(messages: List[dict]) -> None:
+    """Delivered messages are renamed, not deleted: a crash mid-run leaves evidence."""
+    for msg in messages:
+        path = msg.get("path")
+        if path:
+            try:
+                os.replace(path, f"{path}.delivered")
+            except OSError:
+                pass
+
+
+def wake_message(reason: str, user_messages: Sequence[dict] = (), cancelled_wait: bool = False) -> str:
+    """
+    The opening message of a woken turn: why it started, then anything said to it.
+
+    One format for every host that wakes a session — the scheduler, print mode's own
+    wake, and RPC hosts that want to match — so a transcript reads the same
+    whichever woke it.
+    """
+    if not user_messages:
+        return f"[woken: {reason}] Check your jobs and continue the task."
+    lines = [f"[woken: {reason}]"]
+    if cancelled_wait:
+        lines.append("[your pending jobs.wait was cancelled by this; wait again if you still need to]")
+    for msg in user_messages:
+        lines.append("")
+        lines.append(str(msg.get("text") or ""))
+    return "\n".join(lines)
+
+
 def consume_messages(session_dir: str) -> None:
     """The wake that carries a message marks it read, so waiting again does not re-fire on it."""
     try:
@@ -175,10 +318,10 @@ def consume_messages(session_dir: str) -> None:
         Mailbox(box).mark_read()
 
 
-def _job_dir(session_dir: str) -> str:
+def _job_dir(session_dir: str, wake: Optional[dict] = None) -> str:
     """The session's job dir: session.json may name one (a kernel whose jobs
-    live elsewhere, e.g. /tmp/harness/jobs on terminal-bench); default is the
-    session-local jobs/."""
+    live elsewhere, e.g. /tmp/harness/jobs on terminal-bench); failing that, the
+    one the kernel recorded in its wake request; default is the session-local jobs/."""
     try:
         with open(os.path.join(session_dir, SESSION_FILE)) as fh:
             spec = json.load(fh)
@@ -187,6 +330,9 @@ def _job_dir(session_dir: str) -> str:
             return configured
     except (OSError, ValueError):
         pass
+    recorded = (wake or {}).get("job_dir")
+    if recorded and os.path.isdir(recorded):
+        return recorded
     return os.path.join(session_dir, "jobs")
 
 
@@ -198,14 +344,20 @@ def run_wake(session_dir: str, reason: str, *, runner=subprocess.run) -> int:
 
     The wake.json is consumed BEFORE the run: the runtime writes a fresh one if
     the agent waits again, and a stale request must not double-fire. It is
-    renamed (not deleted) so a crash mid-run leaves evidence of what fired.
+    renamed (not deleted) so a crash mid-run leaves evidence of what fired. User
+    messages are consumed the same way and delivered in the turn's opening message;
+    a wait they interrupt is cancelled, and the message says so.
     """
     with open(os.path.join(session_dir, SESSION_FILE)) as fh:
         spec = json.load(fh)
     wake_path = os.path.join(session_dir, WAKE_FILE)
-    os.replace(wake_path, f"{wake_path}.fired")
+    was_waiting = os.path.exists(wake_path)
+    if was_waiting:
+        os.replace(wake_path, f"{wake_path}.fired")
+    users = pending_user_messages(session_dir)
+    _consume_user_messages(users)
 
-    argv = list(spec["argv"]) + [f"[woken: {reason}] Check your jobs and continue the task."]
+    argv = list(spec["argv"]) + [wake_message(reason, users, cancelled_wait=was_waiting and bool(users))]
     env = dict(os.environ)
     env["HARNESS_JOB_DIR"] = os.path.join(session_dir, "jobs")
     env["HARNESS_WAKE_FILE"] = wake_path
@@ -264,6 +416,7 @@ def drain(sessions_root: str, *, interval: float = 5.0, deadline: Optional[float
         pending = [
             n for n in (os.listdir(sessions_root) if os.path.isdir(sessions_root) else [])
             if os.path.exists(os.path.join(sessions_root, n, WAKE_FILE))
+            or pending_user_messages(os.path.join(sessions_root, n))
         ]
         if not pending:
             log("[scheduler] nothing left waiting; drained")
@@ -283,8 +436,32 @@ def serve(sessions_root: str, *, interval: float = 5.0, now=time.time,
         time.sleep(interval)
 
 
+def _reason_for_request_cli(consume: bool) -> None:
+    """
+    `scheduler.py --reason-for-request [--consume]`: a wait request (JSON) on stdin,
+    `{"reason", "message"}` on stdout — reason null while nothing is due.
+
+    For hosts that are not this scheduler but share the kernel's filesystem: print
+    mode's own wake, and RPC hosts, which receive the request on `agent_end`.
+    --consume marks a waking message read, as the scheduler's wake does.
+    """
+    import sys
+
+    wake = json.load(sys.stdin)
+    reason = reason_for(wake, wake.get("job_dir"))
+    if reason and consume:
+        for box in (wake.get("mailboxes") or {}).values():
+            Mailbox(box).mark_read()
+    print(json.dumps({"reason": reason, "message": wake_message(reason) if reason else None}))
+
+
 if __name__ == "__main__":
     import argparse
+    import sys as _sys
+
+    if "--reason-for-request" in _sys.argv:
+        _reason_for_request_cli("--consume" in _sys.argv)
+        raise SystemExit(0)
 
     ap = argparse.ArgumentParser(description="wake scheduler over a sessions root")
     ap.add_argument("sessions_root")
