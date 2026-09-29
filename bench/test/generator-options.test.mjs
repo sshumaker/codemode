@@ -86,8 +86,9 @@ describe("PRODUCT_PORT_OPTIONS", () => {
 	it("every key changes something, so none of them is a typo the generator ignores", () => {
 		const ASSET = { type: "string" };
 		const out = { title: "MadeOutput", type: "object", additionalProperties: false, required: ["assets"], properties: { assets: { type: "array", items: { ...ASSET, format: "product-asset-ref" } } } };
+		const kinded = { title: "KindedOutput", type: "object", additionalProperties: false, required: ["assets"], properties: { assets: { type: "array", items: { ...ASSET, format: "product-ref", "x-ref-kinds": ["artifact"] } } } };
 		const cat = [
-			{ server: "acts", tools: [tool("make_image", { category: "image", outputSchema: out }), tool("make_video", { category: "video", outputSchema: out })] },
+			{ server: "acts", tools: [tool("make_image", { category: "image", outputSchema: out }), tool("make_video", { category: "video", outputSchema: out }), tool("make_audio", { category: "audio", outputSchema: kinded })] },
 			{ server: "agent", tools: [{ ...tool("wait_x"), inputSchema: { type: "object", properties: { t: { type: "number", maximum: 60 } } }, outputSchema: out }] },
 		];
 		const render = (opts) => JSON.stringify(generate(cat, { apiLayout: "consolidated", validateArgs: true, ...opts }).files);

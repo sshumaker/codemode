@@ -15,7 +15,27 @@
  * surface, whether or not the dump marked any tool `launches` / `awaitsInputs`.
  */
 export const PRODUCT_PORT_OPTIONS = Object.freeze({
+	// Catalogues recorded before an upstream schema change spelled the kind in the format.
 	refFormats: Object.freeze({ asset: "product-asset-ref", shape: "product-shape-ref", job: "product-job-ref" }),
+	// Every id is `{format: "product-ref", "x-ref-kinds": [...]}`. Each kind word maps to
+	// the category it is typed as; null marks an id that is not an asset to pass back.
+	refKinds: Object.freeze({
+		key: "x-ref-kinds",
+		kinds: Object.freeze({
+			artifact: "asset",
+			image: "asset",
+			video: "asset",
+			audio: "asset",
+			document: "asset",
+			media: "asset",
+			shape: "shape",
+			frame: "shape",
+			job: "job",
+			page: null,
+			folder: null,
+			session: null,
+		}),
+	}),
 	bridgeHeader: "x-product-bridge",
 	bridgeHeaderNote: Object.freeze([
 		"W40 §3a: 10.7% of measured rounds skipped this bridge entirely and POSTed",

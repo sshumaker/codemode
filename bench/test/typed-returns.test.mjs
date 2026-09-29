@@ -30,6 +30,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { generate, returnType } from "../generate.mjs";
 import { collectOutputTypes, outputClassName, renderOutputTypes, untypedTools, UNTYPED_RESULT } from "../output-types.mjs";
+import { PRODUCT_PORT_OPTIONS } from "../generator-presets.mjs";
 
 // The kernel's interpreter when it is on this machine: Python 3.11 evaluates
 // annotations at def time, 3.14 defers them, and a NameError in a hint is exactly

@@ -23,7 +23,11 @@
  *  - one class per DISTINCT schema (the 45 creative actions share one envelope
  *    and get one class, named by the schema's own `title`);
  *  - `$defs` become nested classes; `anyOf [X, null]` becomes `X | None`;
- *  - a string whose `format` is the catalogue's asset-ref format IS an asset ref. A class whose fields
+ *  - a union (`anyOf`/`oneOf` of records, arms `$ref`s into the root `$defs`,
+ *    possibly nesting further unions) flattens into one list of variant classes,
+ *    and a `discriminator` mapping or a `const` key narrows which arm a payload is;
+ *  - a string whose `format` is the catalogue's asset-ref format, or whose kind
+ *    annotation (`refKinds`) names an asset kind, IS an asset ref. A class whose fields
  *    carry asset refs gets `.ids`, `.id`, `__str__` (the id), `__iter__` and
  *    `__len__`, which is what lets a result be passed straight back;
  *  - a tool with NO outputSchema gets the untyped base `ToolResult` (parsed JSON
@@ -43,8 +47,25 @@
  */
 export const DEFAULT_REF_FORMATS = Object.freeze({ asset: "asset-ref", shape: "shape-ref", job: "job-ref" });
 
+const formatTable = (formats) =>
+	new Map(Object.entries({ ...DEFAULT_REF_FORMATS, ...formats }).filter(([, format]) => format).map(([kind, format]) => [format, kind]));
+
 // Scoped to one collectOutputTypes() call; see there.
-let refFormatKinds = new Map(Object.entries(DEFAULT_REF_FORMATS).map(([kind, format]) => [format, kind]));
+let refPolicy = { formats: formatTable({}), kindsKey: null, kinds: new Map() };
+
+// A field whose kind words map to several categories is treated as the first here:
+// a field that may hold an asset id is passable wherever one is expected.
+const REF_CATEGORY_ORDER = ["asset", "shape", "job"];
+
+/** The ref category ("asset" | "shape" | "job" | null) a string schema node carries. */
+function refCategory(node) {
+	const words = refPolicy.kindsKey ? node[refPolicy.kindsKey] : undefined;
+	if (Array.isArray(words)) {
+		const found = new Set(words.map((w) => refPolicy.kinds.get(w)).filter(Boolean));
+		return REF_CATEGORY_ORDER.find((c) => found.has(c)) ?? null;
+	}
+	return refPolicy.formats.get(node.format) ?? null;
+}
 
 /** The fallback class every untyped tool returns. Also the base of every typed one. */
 export const UNTYPED_RESULT = "ToolResult";
@@ -95,7 +116,7 @@ function fieldType(node, { name, defs, classes, prefix }) {
 	if (dn) {
 		const target = defs[dn];
 		if (!target) return { py: "Any", ref: null, cls: null };
-		const cls = ensureClass(dn, target, { defs, classes, prefix });
+		const cls = isUnionNode(target) ? ensureUnion(dn, target, { defs, classes, prefix }) : ensureClass(dn, target, { defs, classes, prefix });
 		return { py: cls, ref: null, cls };
 	}
 	const variants = node.anyOf ?? node.oneOf;
@@ -116,7 +137,7 @@ function fieldType(node, { name, defs, classes, prefix }) {
 		return { py: node.type.includes("null") ? `${py} | None` : py, ref: parts.find((p) => p.ref)?.ref ?? null, cls: null };
 	}
 	if (node.type === "string") {
-		const ref = refFormatKinds.get(node.format) ?? null;
+		const ref = refCategory(node);
 		if (Array.isArray(node.enum) && node.enum.every((e) => typeof e === "string")) {
 			return { py: `Literal[${node.enum.map((e) => JSON.stringify(e)).join(", ")}]`, ref, cls: null };
 		}
@@ -146,18 +167,18 @@ function ensureClass(name, node, { defs, classes, prefix }) {
 	// Same name, different shape (two schemas each with a nested `Item`): suffix
 	// the later one with its owner rather than silently merging two records.
 	const key = canonical({ ...node, title: undefined, description: undefined });
-	const existing = classes.get(cls);
-	if (existing && existing.key !== key) cls = `${prefix}${cls}`;
+	cls = claimName(cls, key, classes, `${prefix}${cls}`);
 	if (classes.has(cls)) return cls;
 	// Reserve before recursing so a self-referential schema terminates.
 	const entry = { name: cls, key, node, fields: [], description: node.description ?? "" };
 	classes.set(cls, entry);
 	const required = new Set(node.required ?? []);
+	const taken = new Set();
 	for (const [fname, fnode] of Object.entries(node.properties ?? {})) {
 		const t = fieldType(fnode, { name: `${cls}${pascal(fname)}`, defs, classes, prefix: cls });
 		entry.fields.push({
 			name: fname,
-			pyName: isIdent(fname) && !PY_RESERVED.has(fname) ? fname : `${fname.replace(/[^A-Za-z0-9_]/g, "_")}_`,
+			pyName: fieldPyName(fname, taken),
 			required: required.has(fname),
 			py: t.py,
 			ref: t.ref,
@@ -168,6 +189,144 @@ function ensureClass(name, node, { defs, classes, prefix }) {
 		});
 	}
 	return cls;
+}
+
+/** `cls` if free or already this shape, else `alt`, numbered until one is. */
+function claimName(cls, key, classes, alt) {
+	const existing = classes.get(cls);
+	if (!existing || existing.key === key) return cls;
+	let name = alt;
+	for (let n = 2; classes.has(name) && classes.get(name).key !== key; n++) name = `${alt}${n}`;
+	return name;
+}
+
+/**
+ * The attribute a payload key becomes. Leading underscores are stripped: inside a
+ * class body `__x` is name-mangled and `_x` reads as private, and the product
+ * publishes `_external_content_notice` on every external result. A name that is
+ * not an identifier as-is, or is reserved, gets a trailing `_`; so does one another
+ * field of the same class already took.
+ */
+function fieldPyName(fname, taken) {
+	const stripped = String(fname).replace(/^_+/, "");
+	let py = stripped.replace(/[^A-Za-z0-9_]/g, "_");
+	if (!py || /^[0-9]/.test(py)) py = `f_${py}`;
+	if (py !== stripped || PY_RESERVED.has(py)) py = `${py}_`;
+	while (taken.has(py) || PY_RESERVED.has(py)) py = `${py}_`;
+	taken.add(py);
+	return py;
+}
+
+const hasProperties = (node) => !!node.properties && Object.keys(node.properties).length > 0;
+
+/** A union node: an `anyOf`/`oneOf` that is not itself a record with fields. */
+const isUnionNode = (node) => !!node && typeof node === "object" && !hasProperties(node) && Array.isArray(node.anyOf ?? node.oneOf) && (node.anyOf ?? node.oneOf).length > 0;
+
+/** A discriminator's mapping as `{ prop, byDef: Map<defName, values[]> }`, or null. */
+function discriminatorOf(node) {
+	const d = node.discriminator;
+	if (!d || typeof d.propertyName !== "string" || !d.mapping || typeof d.mapping !== "object") return null;
+	const byDef = new Map();
+	for (const [value, ref] of Object.entries(d.mapping)) {
+		const dn = refName(ref);
+		if (dn) byDef.set(dn, [...(byDef.get(dn) ?? []), value]);
+	}
+	return { prop: d.propertyName, byDef };
+}
+
+/**
+ * Every record arm under a union node, nested unions flattened, in declaration
+ * order: `{ cls, node, tags }`, where `tags` holds the values an enclosing
+ * discriminator mapping assigns to the arm (`Map<prop, values[]>`).
+ */
+function unionArms(node, ctx, out = [], tags = new Map()) {
+	if (!node || typeof node !== "object" || node.type === "null") return out;
+	const dn = refName(node.$ref);
+	if (dn) {
+		const target = ctx.defs[dn];
+		if (!target) return out;
+		if (isUnionNode(target)) return unionArms(target, ctx, out, tags);
+		const title = isIdent(target.title) && target.title !== UNTYPED_RESULT ? target.title : dn;
+		out.push({ cls: ensureClass(title, target, ctx), node: target, tags });
+		return out;
+	}
+	if (isUnionNode(node)) {
+		const disc = discriminatorOf(node);
+		for (const branch of node.anyOf ?? node.oneOf) {
+			const bn = refName(branch?.$ref);
+			const sub = disc && bn && disc.byDef.has(bn) ? new Map([...tags, [disc.prop, disc.byDef.get(bn)]]) : tags;
+			unionArms(branch, ctx, out, sub);
+		}
+		return out;
+	}
+	// An inline record arm (older catalogues): its own $defs, named by its title.
+	const vdefs = node.$defs ?? node.definitions ?? ctx.defs;
+	const vname = isIdent(node.title) ? node.title : `${ctx.prefix}Variant${out.length + 1}`;
+	out.push({ cls: ensureClass(vname, node, { defs: vdefs, classes: ctx.classes, prefix: vname }), node, tags });
+	return out;
+}
+
+/** Per arm, the values each constrained key may take: discriminator tags, then `const`s. */
+function armConstraints(arm) {
+	const allowed = new Map(arm.tags);
+	for (const [k, p] of Object.entries(arm.node.properties ?? {})) {
+		if (allowed.has(k) || !p || typeof p !== "object") continue;
+		if ("const" in p) allowed.set(k, [p.const]);
+		else if (Array.isArray(p.enum) && p.enum.length === 1) allowed.set(k, [p.enum[0]]);
+	}
+	return allowed;
+}
+
+/**
+ * The `(class, constraints)` pairs a union dispatches on. An arm reached twice keeps
+ * only the keys both paths constrain, values merged. A key every arm constrains to
+ * the same values (the external-content notice) tells no arm apart and is dropped.
+ */
+function unionMatch(arms) {
+	const byCls = new Map();
+	for (const arm of arms) {
+		const allowed = armConstraints(arm);
+		const seen = byCls.get(arm.cls);
+		if (!seen) {
+			byCls.set(arm.cls, allowed);
+			continue;
+		}
+		for (const k of [...seen.keys()]) {
+			if (allowed.has(k)) seen.set(k, [...new Set([...seen.get(k), ...allowed.get(k)])]);
+			else seen.delete(k);
+		}
+	}
+	const all = [...byCls.values()];
+	const keys = new Set(all.flatMap((m) => [...m.keys()]));
+	for (const k of keys) {
+		const sig = (m) => (m.has(k) ? canonical([...m.get(k)].sort()) : null);
+		if (all.every((m) => sig(m) !== null && sig(m) === sig(all[0]))) all.forEach((m) => m.delete(k));
+	}
+	return [...byCls].filter(([, m]) => m.size > 0).map(([cls, m]) => [cls, [...m]]);
+}
+
+/**
+ * Register (once) the class for a union node and return its name. `reserve` claims
+ * the name before the arms are built, so a union reached again through one of its
+ * own arms' fields terminates; a tool's root union does not, so an arm titled like
+ * the tool keeps its name and the union takes `...Union`.
+ */
+function ensureUnion(name, node, { defs, classes, prefix }, { reserve = true } = {}) {
+	const want = isIdent(name) ? name : pascal(name);
+	const key = canonical({ ...node, title: undefined, description: undefined });
+	if (classes.get(want)?.key === key) return want;
+	const entry = { name: want, key, node, fields: [], description: node.description ?? "", union: [], match: [] };
+	const reserved = reserve && !classes.has(want);
+	if (reserved) classes.set(want, entry);
+	const arms = unionArms(node, { defs, classes, prefix: want });
+	if (!reserved) {
+		entry.name = claimName(want, key, classes, reserve ? `${prefix}${want}` : `${want}Union`);
+		if (classes.get(entry.name)?.key === key) return entry.name;
+		classes.set(entry.name, entry);
+	}
+	entry.union = [...new Set(arms.map((a) => a.cls))];
+	entry.match = unionMatch(arms);
+	return entry.name;
 }
 
 const PY_RESERVED = new Set([
@@ -189,13 +348,17 @@ const BASE_ATTRS = new Set(["id", "ids", "text", "keys", "items", "values", "get
  *
  * `tools` are normalized tools (`name`, `pyName`, `outputSchema`).
  */
-export function collectOutputTypes(tools, { refFormats = DEFAULT_REF_FORMATS } = {}) {
-	const previous = refFormatKinds;
-	refFormatKinds = new Map(Object.entries({ ...DEFAULT_REF_FORMATS, ...refFormats }).filter(([, format]) => format).map(([kind, format]) => [format, kind]));
+export function collectOutputTypes(tools, { refFormats = DEFAULT_REF_FORMATS, refKinds = null } = {}) {
+	const previous = refPolicy;
+	refPolicy = {
+		formats: formatTable(refFormats),
+		kindsKey: refKinds?.key ?? null,
+		kinds: new Map(Object.entries(refKinds?.kinds ?? {}).filter(([, category]) => category)),
+	};
 	try {
 		return collectOutputTypesWith(tools);
 	} finally {
-		refFormatKinds = previous;
+		refPolicy = previous;
 	}
 }
 
@@ -215,17 +378,12 @@ function collectOutputTypesWith(tools) {
 			continue;
 		}
 		const want = outputClassName(tool);
-		if (Array.isArray(schema.anyOf)) {
-			// A union (an `anyOf` of closed records): each variant is its own closed class;
-			// the union class dispatches on which variant accepts the payload's keys.
-			const variantNames = schema.anyOf.map((v, i) => {
-				const vdefs = v.$defs ?? v.definitions ?? schema.$defs ?? {};
-				const vname = typeof v.title === "string" && isIdent(v.title) ? v.title : `${want}Variant${i + 1}`;
-				return ensureClass(vname, v, { defs: vdefs, classes, prefix: vname });
-			});
-			let uname = want;
-			if (classes.has(uname)) uname = `${want}Union`;
-			classes.set(uname, { name: uname, key, node: schema, fields: [], description: schema.description ?? "", union: variantNames });
+		if (isUnionNode(schema)) {
+			// A union of closed records — checked before the plain-object branch, since a
+			// published union root also says `type: object`. Each arm is its own class;
+			// the union class dispatches on which arm accepts the payload.
+			const defs = schema.$defs ?? schema.definitions ?? {};
+			const uname = ensureUnion(want, schema, { defs, classes, prefix: want }, { reserve: false });
 			byShape.set(key, uname);
 			byTool.set(tool.name, uname);
 			continue;
@@ -250,6 +408,8 @@ function assetFields(entry) {
 
 const pyStr = (s) => JSON.stringify(String(s));
 
+const pyLiteral = (v) => (v === null ? "None" : v === true ? "True" : v === false ? "False" : JSON.stringify(v));
+
 function docLines(text, indent) {
 	return String(text)
 		.replace(/"""/g, '\\"\\"\\"')
@@ -262,8 +422,8 @@ function docLines(text, indent) {
  * during discovery (h64, pos 31: 1,800 lines, ~40k tokens), so every class is
  * its docstring, its fields, and three spec tuples the base class interprets.
  */
-function renderClass(entry) {
-	if (entry.union) return renderUnionClass(entry);
+function renderClass(entry, later) {
+	if (entry.union) return renderUnionClass(entry, later);
 	const { scalar, many } = assetFields(entry);
 	const req = entry.fields.filter((f) => f.required);
 	const opt = entry.fields.filter((f) => !f.required);
@@ -296,13 +456,14 @@ function renderClass(entry) {
 	}
 	if (!entry.fields.length) lines.push("    pass", "");
 	// The spec the base class interprets: (payload key, field, nested class, how).
+	const nestedOf = (f) => f.cls ?? f.listOf?.cls ?? f.mapOf?.cls ?? null;
 	const spec = entry.fields.map((f) => {
-		const nested = f.cls ?? f.listOf?.cls ?? f.mapOf?.cls ?? null;
+		const nested = nestedOf(f);
 		const how = f.listOf ? "list" : f.mapOf ? "map" : "one";
 		return `(${pyStr(f.name)}, ${pyStr(f.pyName)}, ${nested ?? "None"}, ${pyStr(how)})`;
 	});
 	if (spec.length) {
-		lines.push("", `    _SPEC = (${spec.join(", ")},)`);
+		lines.push("", later.place(entry.name, "_SPEC", `(${spec.join(", ")},)`, entry.fields.map(nestedOf)));
 		lines.push(`    _REQUIRED = frozenset(${JSON.stringify(req.map((f) => f.name)).replace(/"/g, "'")})`);
 	}
 	const assetSpec = [...many, ...scalar].map((f) => `(${pyStr(f.pyName)}, ${pyStr(f.mapOf ? "map" : f.listOf ? "list" : "one")})`);
@@ -319,18 +480,49 @@ function renderClass(entry) {
 }
 
 /**
+ * Class attributes naming other classes, placed in the class body when those are
+ * already defined and after every class otherwise: a recursive record (a comment
+ * whose `replies` are comments) names itself, and a class body cannot.
+ */
+function deferredAttrs() {
+	const defined = new Set();
+	const trailer = [];
+	let current = null;
+	const api = {
+		defining(name) {
+			if (current) defined.add(current);
+			current = name;
+			return api;
+		},
+		place(owner, attr, value, names) {
+			if (names.every((n) => !n || defined.has(n))) return `    ${attr} = ${value}`;
+			trailer.push(`${owner}.${attr} = ${value}`);
+			return `    # ${attr}: set below, once every class it names exists.`;
+		},
+		render: () => (trailer.length ? `\n\n\n${trailer.join("\n")}` : ""),
+	};
+	return api;
+}
+
+/**
  * A union: the class a multi-arm tool is annotated with. `from_payload` returns
  * the variant whose key set matches (required keys present, no unknown keys);
  * an instance of the union class itself is never constructed.
  */
-function renderUnionClass(entry) {
+function renderUnionClass(entry, later) {
 	const lines = ["@dataclass(frozen=True, kw_only=True, repr=False)", `class ${entry.name}(ToolResult):`];
 	const doc = [entry.description || `One of: ${entry.union.join(", ")}.`, "", `Variants: ${entry.union.join(", ")}. The value you get IS one of those classes —`, "check with isinstance or look at its fields; each variant lists its own."];
 	lines.push('    """' + doc[0]);
 	lines.push(...docLines(doc.slice(1).join("\n"), "    "));
 	lines.push('    """', "");
-	lines.push(`    _VARIANTS = (${entry.union.join(", ")},)`);
-	lines.push("", "    @classmethod", "    def from_payload(cls, obj):", "        if not isinstance(obj, dict):", "            return ToolResult(raw=obj)", "        keys = set(obj)", "        best, best_score = None, None", "        for v in cls._VARIANTS:", "            declared = {k for k, _f, _c, _h in v._SPEC}", "            if not v._REQUIRED <= keys:", "                continue", "            unknown = len(keys - declared)", "            score = (unknown, -len(keys & declared))", "            if best_score is None or score < best_score:", "                best, best_score = v, score", "        return best.from_payload(obj) if best is not None else ToolResult(raw=obj)");
+	lines.push(later.place(entry.name, "_VARIANTS", `(${entry.union.join(", ")},)`, entry.union));
+	// Per arm, the values its discriminator / const keys may take: an arm whose key
+	// the payload carries with another value is not that payload's arm.
+	if (entry.match?.length) {
+		const armMatch = ([cls, pairs]) => `${cls}: {${pairs.map(([k, vals]) => `${pyStr(k)}: (${vals.map(pyLiteral).join(", ")},)`).join(", ")}}`;
+		lines.push(later.place(entry.name, "_MATCH", `{${entry.match.map(armMatch).join(", ")}}`, entry.match.map(([cls]) => cls)));
+	}
+	lines.push("", "    @classmethod", "    def from_payload(cls, obj):", "        if not isinstance(obj, dict):", "            return ToolResult(raw=obj)", "        keys = set(obj)", "        match = getattr(cls, \"_MATCH\", {})", "        best, best_score = None, None", "        for v in cls._VARIANTS:", "            declared = {k for k, _f, _c, _h in v._SPEC}", "            if not v._REQUIRED <= keys:", "                continue", "            if any(k in obj and obj[k] not in vals for k, vals in match.get(v, {}).items()):", "                continue", "            unknown = len(keys - declared)", "            score = (unknown, -len(keys & declared))", "            if best_score is None or score < best_score:", "                best, best_score = v, score", "        return best.from_payload(obj) if best is not None else ToolResult(raw=obj)");
 	return lines.join("\n");
 }
 
@@ -511,7 +703,8 @@ class ToolResult:
 
 AssetLike = Asset | ToolResult
 `;
-	const body = generated.map(renderClass).join("\n\n\n");
+	const later = deferredAttrs();
+	const body = generated.map((c) => renderClass(c, later.defining(c.name))).join("\n\n\n") + later.render();
 	const registry = `
 
 # Class by name — what \`_client.call\` resolves the wrapper's promised type against.
@@ -567,11 +760,11 @@ def wrap(text: str, expect: str | None = None) -> ToolResult:
 	return head + "\n\n" + body + registry;
 }
 
-/** A schema this compiler can type: a closed object, or an anyOf of them. */
+/** A schema this compiler can type: a closed object, or a union of them. */
 function isTypedSchema(schema) {
 	if (!schema || typeof schema !== "object") return false;
 	if (schema.type === "object") return true;
-	return Array.isArray(schema.anyOf) && schema.anyOf.length > 0 && schema.anyOf.every((v) => v && v.type === "object");
+	return isUnionNode(schema) && (schema.anyOf ?? schema.oneOf).every((v) => v && (v.type === "object" || typeof v.$ref === "string" || isUnionNode(v)));
 }
 
 /** The tools in `tools` that publish no usable outputSchema. */
