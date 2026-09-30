@@ -2136,7 +2136,8 @@ def _read_first(server: str, tool: str, path: str) -> None:
 Every tool module calls \`_client.call\`, which forwards to the shared MCP proxy.
 """
 
-${mode === "inline" ? "import inspect\n" : ""}import json
+${mode === "inline" ? "import inspect\n" : ""}import asyncio
+import json
 import os
 ${validateArgs ? "import re\n" : ""}${waitSurface ? "import urllib.parse\n" : ""}import urllib.request${typedReturns ? "\n\nfrom ._types import Asset, AssetLike, ToolResult, asset_id as _asset_ids, wrap as _wrap" : ""}
 
@@ -2164,6 +2165,12 @@ except ValueError:
 
 class McpError(RuntimeError):
     """An MCP tool returned an error, or the server was unreachable."""
+
+
+def _fetch(request) -> dict:
+    """Blocking. From a coroutine, go through asyncio.to_thread or gather runs serially."""
+    with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+        return json.loads(response.read())
 
 ${validator}${adapter}${waiter}${gate}
 async def call(server: str, tool: str, args: dict${typedReturns ? ', _expect: str | None = None' : ""}${mode === "inline" ? ", _doc: str | None = None, _path: str | None = None" : mode === "redirect" || readGate ? ", _path: str | None = None" : ""}) -> ${typedReturns ? "ToolResult" : "str"}:
@@ -2204,8 +2211,7 @@ ${bridgeHeader ? `${(bridgeHeaderNote ?? []).map((l) => `    # ${l}\n`).join("")
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            body = json.loads(response.read())
+        body = await asyncio.to_thread(_fetch, request)
     except Exception as exc:  # noqa: BLE001 - surfaced to the agent as-is
         raise McpError(f"{server}.{tool}: proxy unreachable: {exc}") from exc
 
@@ -2281,8 +2287,7 @@ class Handle:
     def _status(self) -> dict:
         request = urllib.request.Request(_PROXY + "/job/" + urllib.parse.quote(self.name, safe=""))
         try:
-            with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-                return json.loads(response.read())
+            return _fetch(request)
         except Exception as exc:  # noqa: BLE001
             raise McpError(f"{self.kind} {self.name!r}: proxy unreachable: {exc}") from exc
 
@@ -2356,8 +2361,7 @@ def wait_for(*things) -> None:
         _PROXY + "/wait", data=json.dumps(payload).encode(), headers={"content-type": "application/json"}, method="POST"
     )
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            body = json.loads(response.read())
+        body = _fetch(request)
     except Exception as exc:  # noqa: BLE001
         raise McpError(f"wait_for: proxy unreachable: {exc}") from exc
     if body.get("unknown"):
@@ -2398,8 +2402,7 @@ def launch(server: str, tool: str, args: dict, name: str | None = None, expect: 
         headers={"content-type": "application/json"${bridgeHeader ? `, "${bridgeHeader}": "api/_client"` : ""}}, method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            body = json.loads(response.read())
+        body = _fetch(request)
     except Exception as exc:  # noqa: BLE001
         raise McpError(f"{server}.{tool}: proxy unreachable: {exc}") from exc
     if not body.get("ok"):
