@@ -228,7 +228,7 @@ describe("the validator's shape", () => {
 		// The kernel is a bare uv-managed environment; an ImportError here would
 		// silently disable the entire arm rather than fail one call.
 		const imports = [...client.matchAll(/^import (\w+)|^from (\w+)/gm)].map((m) => m[1] ?? m[2]);
-		assert.deepEqual([...new Set(imports)].sort(), ["json", "os", "re", "urllib"]);
+		assert.deepEqual([...new Set(imports)].sort(), ["asyncio", "json", "os", "re", "urllib"]);
 	});
 
 	it("declines to enforce a format it has not implemented", () => {
