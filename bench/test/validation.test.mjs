@@ -214,7 +214,7 @@ describe("the validator's shape", () => {
 
 	it("raises before the request is built, not after", () => {
 		const validate = client.indexOf("_validate(server, tool, sent)");
-		assert.ok(validate < client.indexOf("urllib.request.Request"), "the request is built before validation");
+		assert.ok(validate < client.indexOf('_request("/call"'), "the request is built before validation");
 	});
 
 	it("does not accept bool for a number, or int for a bool", () => {
