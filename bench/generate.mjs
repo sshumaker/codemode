@@ -704,7 +704,7 @@ function stripProse(node) {
  * "Math MCP" would otherwise be reported as `api.Math MCP.add` — a correction that
  * cannot be pasted back into a cell.
  */
-export function renderSchemas(normalized, { waitSurface = false } = {}) {
+export function renderSchemas(normalized, { waitSurface = false, modules = null } = {}) {
 	const packages = {};
 	const tools = {};
 	const examples = {};
@@ -732,7 +732,22 @@ export function renderSchemas(normalized, { waitSurface = false } = {}) {
 		}
 		if (Object.keys(perTool).length > 0) examples[server] = perTool;
 	}
-	return `${JSON.stringify(waitSurface ? { packages, tools, examples, time } : { packages, tools, examples }, null, 1)}\n`;
+	const table = waitSurface ? { packages, tools, examples, time } : { packages, tools, examples };
+	// Only a tree with category modules carries it: there the server's package is not
+	// where the function lives, so an error naming it names a call that was never made.
+	if (modules && Object.keys(modules).length > 0) table.modules = modules;
+	return `${JSON.stringify(table, null, 1)}\n`;
+}
+
+/** `{<server>: {<tool>: <module>}}` for every tool rendered in a category module. */
+export function categoryModuleMap(normalized, claimed) {
+	const out = {};
+	for (const { server, pyServer, tools } of normalized) {
+		for (const group of categoryModules(tools, pyServer, claimed).groups) {
+			for (const tool of group.tools) (out[server] ??= {})[tool.name] = group.module;
+		}
+	}
+	return out;
 }
 
 /**
@@ -936,7 +951,9 @@ def _validate(server: str, tool: str, args: dict) -> None:
     # The import path the agent types, not the wire name: a server called "Math MCP"
     # is imported as api.math_mcp, and a correction naming "api.Math MCP.add" cannot
     # be pasted back into a cell.
-    call = f"api.{(_table().get('packages') or {}).get(server, server)}.{tool}"
+    # In a category layout the function lives in its category's module, not the server's.
+    module = ((_table().get("modules") or {}).get(server) or {}).get(tool)
+    call = f"api.{module or (_table().get('packages') or {}).get(server, server)}.{tool}"
 
     for name in schema.get("required", []):
         if name not in args:
@@ -2167,6 +2184,19 @@ class McpError(RuntimeError):
     """An MCP tool returned an error, or the server was unreachable."""
 
 
+def _request(route: str, payload: dict | None = None, *, tagged: bool = False) -> urllib.request.Request:
+    """Every request this client makes, so each route carries the same egress token."""
+    headers = {} if payload is None else {"content-type": "application/json"}
+${bridgeHeader ? `${(bridgeHeaderNote ?? []).map((l) => `    # ${l}
+`).join("")}    if tagged:
+        headers["${bridgeHeader}"] = "api/_client"
+` : ""}    if _EGRESS_TOKEN:
+        headers["x-egress-token"] = _EGRESS_TOKEN
+    if payload is None:
+        return urllib.request.Request(_PROXY + route, headers=headers)
+    return urllib.request.Request(_PROXY + route, data=json.dumps(payload).encode(), headers=headers, method="POST")
+
+
 def _fetch(request) -> dict:
     """Blocking. From a coroutine, go through asyncio.to_thread or gather runs serially."""
     with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
@@ -2200,16 +2230,7 @@ async def call(server: str, tool: str, args: dict${typedReturns ? ', _expect: st
         "args": ${validateArgs ? "sent" : typedReturns ? "_asset_ids({k: v for k, v in (args or {}).items() if v is not None})" : "{k: v for k, v in (args or {}).items() if v is not None}"},
         "meta": {"arm": "codemode", "runId": _RUN_ID},
     }
-${bridgeHeader ? `${(bridgeHeaderNote ?? []).map((l) => `    # ${l}\n`).join("")}    headers = {"content-type": "application/json", "${bridgeHeader}": "api/_client"}
-` : `    headers = {"content-type": "application/json"}
-`}    if _EGRESS_TOKEN:
-        headers["x-egress-token"] = _EGRESS_TOKEN
-    request = urllib.request.Request(
-        _PROXY + "/call",
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST",
-    )
+    request = _request("/call", payload, tagged=True)
     try:
         body = await asyncio.to_thread(_fetch, request)
     except Exception as exc:  # noqa: BLE001 - surfaced to the agent as-is
@@ -2285,7 +2306,7 @@ class Handle:
         return self
 
     def _status(self) -> dict:
-        request = urllib.request.Request(_PROXY + "/job/" + urllib.parse.quote(self.name, safe=""))
+        request = _request("/job/" + urllib.parse.quote(self.name, safe=""))
         try:
             return _fetch(request)
         except Exception as exc:  # noqa: BLE001
@@ -2327,8 +2348,14 @@ class _Ready:
         return "ready"
 
 
+_WAIT_ACCEPTS = (
+    "wait_for takes asset ids, job ids, results that carry either, records with a 'job_id', "
+    "Handles from spawn_* calls, or lists of these"
+)
+
+
 def _ready_ids(things) -> tuple[list[str], list[str]]:
-    """Split wait_for's arguments into asset ids and launch names."""
+    """Split wait_for's arguments into asset ids and job ids / launch names."""
     assets: list = []
     jobs: list = []
     for t in things:
@@ -2338,8 +2365,16 @@ def _ready_ids(things) -> tuple[list[str], list[str]]:
             a, j = _ready_ids(t)
             assets.extend(a)
             jobs.extend(j)
+        elif isinstance(t, str):
+            assets.append(t)${typedReturns ? `
+        elif isinstance(t, Asset) or (isinstance(t, ToolResult) and t._asset_refs()):
+            assets.append(_asset_ids(t))
+        elif isinstance(t, ToolResult) and t._job_refs():
+            jobs.extend(t._job_refs())` : ""}
+        elif isinstance(t, ${typedReturns ? "(dict, ToolResult)" : "dict"}) and isinstance(t.get("job_id"), str):
+            jobs.append(t["job_id"])
         else:
-            assets.extend(${typedReturns ? "_asset_ids([t])" : "[str(t)]"})
+            raise ${validateArgs ? "ArgumentError" : "TypeError"}(f"{_WAIT_ACCEPTS}; got {type(t).__name__}: {t!r:.200}")
     return assets, jobs
 
 
@@ -2355,11 +2390,9 @@ def wait_for(*things) -> None:
     """
     assets, jobs = _ready_ids(things)
     if not assets and not jobs:
-        raise TypeError("wait_for needs at least one asset id, result, or Handle")
+        raise ${validateArgs ? "ArgumentError" : "TypeError"}(f"{_WAIT_ACCEPTS}; got nothing to wait for")
     payload = {"assets": assets, "jobs": jobs, "meta": {"arm": "codemode", "runId": _RUN_ID}}
-    request = urllib.request.Request(
-        _PROXY + "/wait", data=json.dumps(payload).encode(), headers={"content-type": "application/json"}, method="POST"
-    )
+    request = _request("/wait", payload)
     try:
         body = _fetch(request)
     except Exception as exc:  # noqa: BLE001
@@ -2397,10 +2430,7 @@ def launch(server: str, tool: str, args: dict, name: str | None = None, expect: 
     """Start a launch (a spawn_* API) and return its Handle at once."""
     sent = ${typedReturns ? "_asset_ids({k: v for k, v in (args or {}).items() if v is not None})" : "{k: v for k, v in (args or {}).items() if v is not None}"}${validateArgs ? "\n    _validate(server, tool, sent)" : ""}
     payload = {"server": server, "tool": tool, "args": sent, "name": name, "expect": expect, "meta": {"arm": "codemode", "runId": _RUN_ID}}
-    request = urllib.request.Request(
-        _PROXY + "/spawn", data=json.dumps(payload).encode(),
-        headers={"content-type": "application/json"${bridgeHeader ? `, "${bridgeHeader}": "api/_client"` : ""}}, method="POST",
-    )
+    request = _request("/spawn", payload, tagged=True)
     try:
         body = _fetch(request)
     except Exception as exc:  # noqa: BLE001
@@ -2697,7 +2727,10 @@ export function generate(
 	// The typed result surface. Its own module so `_client` imports it and any
 	// cell can too: `from api._types import Asset` is a thing a person would try.
 	if (typedReturns) files["_types.py"] = renderOutputTypes(returnShapes, { example: typesExample, resultCall: waitCalls?.result });
-	if (validateArgs) files["_schemas.json"] = renderSchemas(normalized, { waitSurface });
+	if (validateArgs) {
+		const modules = layoutMode === "consolidated" ? categoryModuleMap(normalized, claimed) : null;
+		files["_schemas.json"] = renderSchemas(normalized, { waitSurface, modules });
+	}
 	// Only the mode that cites siblings pays for the table. Every extra file in
 	// the tree is one more line in the agent's `grep -ril`.
 	if (gateMode === "inline") files["_neighbours.json"] = renderNeighbours(normalized);

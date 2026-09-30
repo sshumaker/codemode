@@ -61,15 +61,16 @@ describe("the wait surface renders only when the catalogue has a use for it", ()
 
 describe("the bridge header", () => {
 	it(`defaults to ${DEFAULT_BRIDGE_HEADER}, is renamable, and null sends none`, () => {
-		const header = (opts) => generate(PLAIN, opts).files["_client.py"].match(/^ {4}headers = .*$/m)[0];
-		assert.equal(header({}), `    headers = {"content-type": "application/json", "${DEFAULT_BRIDGE_HEADER}": "api/_client"}`);
-		assert.equal(header({ bridgeHeader: "x-acme-bridge" }), '    headers = {"content-type": "application/json", "x-acme-bridge": "api/_client"}');
-		assert.equal(header({ bridgeHeader: null }), '    headers = {"content-type": "application/json"}');
+		const header = (opts) => generate(PLAIN, opts).files["_client.py"].match(/^ {4}if tagged:\n {8}headers\[.*$/m)?.[0] ?? null;
+		assert.equal(header({}), `    if tagged:\n        headers["${DEFAULT_BRIDGE_HEADER}"] = "api/_client"`);
+		assert.equal(header({ bridgeHeader: "x-acme-bridge" }), '    if tagged:\n        headers["x-acme-bridge"] = "api/_client"');
+		assert.equal(header({ bridgeHeader: null }), null);
+		assert.match(generate(PLAIN).files["_client.py"], /request = _request\("\/call", payload, tagged=True\)/);
 	});
 
 	it("the launch request carries the same header", () => {
 		const client = generate(TIMED, { bridgeHeader: "x-acme-bridge" }).files["_client.py"];
-		assert.match(client, /_PROXY \+ "\/spawn".*\n\s+headers=\{"content-type": "application\/json", "x-acme-bridge": "api\/_client"\}/);
+		assert.match(client, /request = _request\("\/spawn", payload, tagged=True\)/);
 	});
 });
 

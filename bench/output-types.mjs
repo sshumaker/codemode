@@ -410,6 +410,11 @@ function assetFields(entry) {
 	return { scalar, many };
 }
 
+/** The job-ref fields of a class: what `wait_for(result)` waits on when it carries no asset. */
+function jobFields(entry) {
+	return entry.fields.filter((f) => f.ref === "job" && (f.listOf || f.mapOf || f.py.startsWith("str")));
+}
+
 const pyStr = (s) => JSON.stringify(String(s));
 
 const pyLiteral = (v) => (v === null ? "None" : v === true ? "True" : v === false ? "False" : JSON.stringify(v));
@@ -472,6 +477,8 @@ function renderClass(entry, later) {
 	}
 	const assetSpec = [...many, ...scalar].map((f) => `(${pyStr(f.pyName)}, ${pyStr(f.mapOf ? "map" : f.listOf ? "list" : "one")})`);
 	if (assetSpec.length) lines.push(`    _ASSET_FIELDS = (${assetSpec.join(", ")},)`);
+	const jobSpec = jobFields(entry).map((f) => `(${pyStr(f.pyName)}, ${pyStr(f.mapOf ? "map" : f.listOf ? "list" : "one")})`);
+	if (jobSpec.length) lines.push(`    _JOB_FIELDS = (${jobSpec.join(", ")},)`);
 	// Only a class whose PURPOSE is producing assets stringifies to the id. A read
 	// result carries an asset_id too, and `print(read_result)` printing eight
 	// characters instead of the record cost three cells per trace (h64, pos 3, 12).
@@ -605,6 +612,8 @@ class ToolResult:
     _REQUIRED: frozenset = frozenset()
     # Fields carrying asset refs, as (field, "one" | "list" | "map").
     _ASSET_FIELDS: tuple = ()
+    # Fields carrying job refs, same shape: what wait_for waits on when no asset is here.
+    _JOB_FIELDS: tuple = ()
 
     def __getitem__(self, key):
         if isinstance(self.raw, (dict, list)):
@@ -642,8 +651,14 @@ class ToolResult:
         # The refs this result carries. A method with a private name so a payload
         # field called "id" or "ids" (shape records have one) cannot shadow it —
         # coercion and __str__ go through here, never through the properties.
+        return self._refs(type(self)._ASSET_FIELDS)
+
+    def _job_refs(self) -> list[str]:
+        return self._refs(type(self)._JOB_FIELDS)
+
+    def _refs(self, fields: tuple) -> list[str]:
         out: list = []
-        for f, how in type(self)._ASSET_FIELDS:
+        for f, how in fields:
             v = getattr(self, f, None)
             if v is None:
                 continue
