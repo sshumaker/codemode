@@ -14,7 +14,7 @@
  *
  * See docs/DESIGN.md.
  */
-import { isNestedShape, paramAdapter, paramExample } from "./pythonic-args.mjs";
+import { isNestedShape, isNullable, paramAdapter, paramExample } from "./pythonic-args.mjs";
 
 /** JSON Schema type -> Python type hint. */
 import { DEFAULT_REF_FORMATS, UNTYPED_RESULT, collectOutputTypes, renderOutputTypes, untypedTools } from "./output-types.mjs";
@@ -206,6 +206,7 @@ function coercion(param) {
 
 /** The import alias each helper is called through, in a stable order. */
 const HELPER_IMPORTS = {
+	unset: "UNSET as _UNSET",
 	labeled_ids: "labeled_ids as _labeled_ids",
 	as_list: "as_list as _as_list",
 	wait_bridge: "wait_bridge as _wait_bridge",
@@ -215,6 +216,7 @@ const HELPER_IMPORTS = {
 function clientImport(tools, from, waitBridge = false) {
 	const helpers = new Set();
 	for (const tool of tools) for (const p of tool.params) if (p.adapter) helpers.add(coercion(p).helper);
+	if (tools.some((t) => t.params.some((p) => !p.required))) helpers.add("unset");
 	if (waitBridge && tools.some((t) => waitToolParam(t))) helpers.add("wait_bridge");
 	const extra = Object.keys(HELPER_IMPORTS)
 		.filter((h) => helpers.has(h))
@@ -245,6 +247,7 @@ export function normalizeTool(tool) {
 			description: (spec?.description ?? "").trim(),
 			// The coercion this parameter accepts, if any: `{labelKey, idKey, stem}`.
 			adapter,
+			nullable: isNullable(spec),
 			// A literal of the right shape, for the error channel. Every container gets
 			// one; only a container OF containers (`nested`) is worth the characters in
 			// an INDEX line or a docstring.
@@ -988,6 +991,46 @@ def _validate(server: str, tool: str, args: dict) -> None:
 }
 
 /**
+ * The unset sentinel and the one filter every send path applies, in `_client.py`.
+ *
+ * A wrapper's optional parameters default to `UNSET`, not None, so an omitted
+ * argument and an explicit `None` stay distinguishable down to the send. Its repr
+ * is "None", so `help()` and `inspect.signature` still read `= None`. Falsy, so a
+ * helper that tests an optional value for truth (`wait_bridge`) reads it as absent.
+ */
+function renderSendable(nullable) {
+	const entries = nullable.map(([server, tool, names]) => `    (${JSON.stringify(server)}, ${JSON.stringify(tool)}): frozenset({${names.map((n) => JSON.stringify(n)).join(", ")}}),`);
+	const table = entries.length ? `{\n${entries.join("\n")}\n}` : "{}";
+	return `
+
+class _Unset:
+    """The default of every optional wrapper parameter: not passed, distinct from None."""
+
+    def __repr__(self) -> str:
+        return "None"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET = _Unset()
+
+# Per (server, tool), the parameters whose schema accepts null. Generated.
+_NULLABLE: dict[tuple[str, str], frozenset[str]] = ${table}
+
+
+def _sendable(args: dict | None, nullable: frozenset[str] | None = None) -> dict:
+    """The arguments to send: UNSET dropped, None kept only where the schema accepts null."""
+    return {
+        k: v
+        for k, v in (args or {}).items()
+        if v is not UNSET and (v is not None or (nullable is not None and k in nullable))
+    }
+
+`;
+}
+
+/**
  * The T1 coercion, rendered into `_client.py` only when some tool takes an
  * adaptable argument.
  *
@@ -1002,7 +1045,12 @@ def _validate(server: str, tool: str, args: dict) -> None:
  * unrecognised value is returned unchanged for the validator to reject, and
  * nothing here can turn a valid call into an invalid one.
  */
-function renderAdapters(helpers) {
+function renderAdapters(helpers, typedReturns = false) {
+	// A typed result is reduced to its id by the same `asset_id` `_call` applies to
+	// every argument, only first: the adapters decide by shape (is this an id? a lone
+	// scalar?), and a result is neither until it has been coerced. Idempotent, so the
+	// second pass in `_call` changes nothing.
+	const coerce = typedReturns ? "\n    value = _asset_ids(value)" : "";
 	const labeledIds = `
 
 def labeled_ids(value: object, label_key: str, id_key: str, stem: str) -> object:
@@ -1017,7 +1065,7 @@ def labeled_ids(value: object, label_key: str, id_key: str, stem: str) -> object
 
     Anything else is returned unchanged, so a value this function does not
     understand reaches the schema check rather than a rewrite of it.
-    """
+    """${coerce}
     if isinstance(value, dict):
         return [{label_key: str(key), id_key: item} for key, item in value.items()]
     if isinstance(value, (list, tuple)):
@@ -1044,7 +1092,7 @@ def as_list(value: object, item_type: str) -> object:
     error still reaches the schema check as itself rather than buried in a list.
     Which parameters get this at all is decided at compile time — an array of
     objects, or one demanding two items, is never wrapped.
-    """
+    """${coerce}
     # Python's bool is an int subclass, so it has to be excluded explicitly, or
     # flags=True would arrive at an array-of-integer parameter as [True].
     if isinstance(value, bool):
@@ -1481,7 +1529,7 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, wait
 		const widened = p.type.replace(/\blist\[str\]/g, "list[str | AssetLike]");
 		return `${widened} | AssetLike`;
 	};
-	const args = tool.params.map((p) => (p.required ? `${p.pyName}: ${hint(p)}` : `${p.pyName}: ${hint(p)} | None = None`));
+	const args = tool.params.map((p) => (p.required ? `${p.pyName}: ${hint(p)}` : `${p.pyName}: ${hint(p)} | None = _UNSET`));
 	// A launch takes an optional NAME first (positional — `spawn_judge("kite-check", ...)`),
 	// then the tool's own parameters keyword-only, and returns a Handle, never the result.
 	// Plain `def`, not a coroutine: a launch returns in ~1 s and two of three h68 jobs
@@ -1871,6 +1919,7 @@ function isAssetParam(name) {
 
 export function renderClient({
 	docsGate = "off",
+	nullable = [],
 	readGate = false,
 	validateArgs = false,
 	adapters = [],
@@ -2144,7 +2193,8 @@ def _read_first(server: str, tool: str, path: str) -> None:
 	// Rendered only for the helpers the catalogue actually needs — an unused helper
 	// in the tree is one more thing in the agent's `grep -ril` and one more line of
 	// difference between two trees that are supposed to be identical.
-	const adapter = renderAdapters(new Set(adapters));
+	const adapter = renderAdapters(new Set(adapters), typedReturns);
+	const sendable = renderSendable(nullable);
 	// Only when the catalogue actually has a wait tool: an unused coroutine in the
 	// transport is one more thing in the agent's `grep -ril`.
 	const waiter = waitBridge ? renderWaitBridge() : "";
@@ -2202,12 +2252,13 @@ def _fetch(request) -> dict:
     with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
         return json.loads(response.read())
 
-${validator}${adapter}${waiter}${gate}
+${sendable}${validator}${adapter}${waiter}${gate}
 async def call(server: str, tool: str, args: dict${typedReturns ? ', _expect: str | None = None' : ""}${mode === "inline" ? ", _doc: str | None = None, _path: str | None = None" : mode === "redirect" || readGate ? ", _path: str | None = None" : ""}) -> ${typedReturns ? "ToolResult" : "str"}:
     """Invoke an MCP tool and return its ${typedReturns ? "typed result (see _types.py)" : "text result"}.
 
-    Arguments whose value is None are dropped, so optional parameters left at
-    their default are not sent as explicit nulls — several servers reject that.
+    Arguments go through \`_sendable\`: an optional parameter left at its default
+    is not sent, and an explicit None is sent as null only where the parameter's
+    schema accepts null — several servers reject a null anywhere else.
 
     Raises:${validateArgs ? "\n        ArgumentError: An argument does not satisfy this API's schema. Nothing was sent." : ""}${mode === "off" ? "" : "\n        DocsFirst: This is the first call to this API; read the message, then call again."}${readGate ? "\n        ReadFirst: This API's contract has not been read. Read it, then call again." : ""}
         McpError: The server returned an error or could not be reached.
@@ -2220,14 +2271,14 @@ async def call(server: str, tool: str, args: dict${typedReturns ? ', _expect: st
 						? // Coercion BEFORE validation: an `Asset` at a string parameter is exactly
 							// what this feature invites, and the validator would reject the object it
 							// was handed. Coerce, then check what will actually be sent.
-							'\n    sent = _asset_ids({k: v for k, v in (args or {}).items() if v is not None})\n    _validate(server, tool, sent)'
-						: '\n    sent = {k: v for k, v in (args or {}).items() if v is not None}\n    _validate(server, tool, sent)')
+							'\n    sent = _asset_ids(_sendable(args, _NULLABLE.get((server, tool))))\n    _validate(server, tool, sent)'
+						: '\n    sent = _sendable(args, _NULLABLE.get((server, tool)))\n    _validate(server, tool, sent)')
 				: ""
 		}
     payload = {
         "server": server,
         "tool": tool,
-        "args": ${validateArgs ? "sent" : typedReturns ? "_asset_ids({k: v for k, v in (args or {}).items() if v is not None})" : "{k: v for k, v in (args or {}).items() if v is not None}"},
+        "args": ${validateArgs ? "sent" : typedReturns ? "_asset_ids(_sendable(args, _NULLABLE.get((server, tool))))" : "_sendable(args, _NULLABLE.get((server, tool)))"},
         "meta": {"arm": "codemode", "runId": _RUN_ID},
     }
     request = _request("/call", payload, tagged=True)
@@ -2428,7 +2479,7 @@ def result(name: str):
 
 def launch(server: str, tool: str, args: dict, name: str | None = None, expect: str | None = None) -> Handle:
     """Start a launch (a spawn_* API) and return its Handle at once."""
-    sent = ${typedReturns ? "_asset_ids({k: v for k, v in (args or {}).items() if v is not None})" : "{k: v for k, v in (args or {}).items() if v is not None}"}${validateArgs ? "\n    _validate(server, tool, sent)" : ""}
+    sent = ${typedReturns ? "_asset_ids(_sendable(args, _NULLABLE.get((server, tool))))" : "_sendable(args, _NULLABLE.get((server, tool)))"}${validateArgs ? "\n    _validate(server, tool, sent)" : ""}
     payload = {"server": server, "tool": tool, "args": sent, "name": name, "expect": expect, "meta": {"arm": "codemode", "runId": _RUN_ID}}
     request = _request("/spawn", payload, tagged=True)
     try:
@@ -2662,6 +2713,12 @@ export function generate(
 	// property of the SCHEMAS: a catalogue without one renders the tree it always did
 	// even with the option on.
 	const hasWaitTool = normalized.some((s) => s.tools.some((t) => waitToolParam(t)));
+	// Per tool, the wire names whose schema accepts null: where an explicit None is sent.
+	const nullable = normalized.flatMap((s) =>
+		s.tools
+			.map((t) => [s.server, t.name, t.params.filter((p) => p.nullable).map((p) => p.name)])
+			.filter(([, , names]) => names.length > 0),
+	);
 	const adapters = new Set(
 		normalized.flatMap((s) =>
 			s.tools.flatMap((t) => t.params.filter((p) => p.adapter).map((p) => coercion(p).helper)),
@@ -2717,7 +2774,7 @@ export function generate(
 		// Throws on read-gate + docs-gate and on read-gate + per-method, before a
 		// single file is written. A tree that half-satisfies a label is the failure
 		// mode this project keeps rediscovering.
-		"_client.py": renderClient({ docsGate: gateMode, readGate, validateArgs, adapters, waitBridge: waitBridge && hasWaitTool, apiLayout: layoutMode, typedReturns, returnShapes, waitSurface, bridgeHeader, bridgeHeaderNote, waitCalls }),
+		"_client.py": renderClient({ docsGate: gateMode, readGate, validateArgs, adapters, nullable, waitBridge: waitBridge && hasWaitTool, apiLayout: layoutMode, typedReturns, returnShapes, waitSurface, bridgeHeader, bridgeHeaderNote, waitCalls }),
 	};
 	// Only when the gate is on: the map is the gate's evidence, and an unused span
 	// table in the tree is one more hit in the agent's `grep -ril`.

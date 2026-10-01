@@ -61,6 +61,19 @@ function declaredType(schema) {
 	return type;
 }
 
+/**
+ * True when the schema accepts JSON null — a `type` naming "null", or an
+ * anyOf/oneOf with a null arm. An explicit `None` for such a parameter is a value
+ * (clear this field), not an omission, so the client sends it.
+ */
+export function isNullable(schema) {
+	if (!schema || typeof schema !== "object") return false;
+	const type = schema.type;
+	if (type === "null" || (Array.isArray(type) && type.includes("null"))) return true;
+	const variants = schema.anyOf ?? schema.oneOf;
+	return Array.isArray(variants) && variants.some((v) => isNullable(v));
+}
+
 /** True when this parameter is a container — an array or an object. */
 export function isNonScalar(schema) {
 	const type = declaredType(schema);

@@ -295,7 +295,7 @@ describe("the widened signature", () => {
 		assert.ok(coerce < call, "the argument is sent before it is coerced");
 		// Imported only by modules that use it.
 		assert.match(module, /from \.\._client import call as _call, labeled_ids as _labeled_ids/);
-		assert.match(files["agent_tools/complete_job.py"], /from \.\._client import call as _call\n/);
+		assert.match(files["agent_tools/complete_job.py"], /from \.\._client import call as _call, UNSET as _UNSET\n/);
 	});
 
 	it("renders the helper into _client only for a catalogue that has something to adapt", () => {
@@ -305,7 +305,7 @@ describe("the widened signature", () => {
 
 	it("carries the coercion into the consolidated layout too", () => {
 		const app = generate(PRODUCT, { apiLayout: "consolidated" }).files["agent_tools.py"];
-		assert.match(app, /from \._client import call as _call, labeled_ids as _labeled_ids/);
+		assert.match(app, /from \._client import call as _call, UNSET as _UNSET, labeled_ids as _labeled_ids/);
 		assert.match(app, /assets = _labeled_ids\(assets, "label", "asset_id", "asset"\)/);
 	});
 });

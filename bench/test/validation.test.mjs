@@ -203,13 +203,13 @@ describe("the validator's shape", () => {
 		assert.match(client, /class ArgumentError\(McpError, TypeError\):/);
 	});
 
-	it("validates what is actually sent, after the None-drop", () => {
+	it("validates what is actually sent, after the unset/None filter", () => {
 		// The generated wrappers pass every parameter on every call, so validating
 		// before the drop would read each unset optional as a null type violation.
-		const sent = client.indexOf("sent = {k: v for k, v in (args or {}).items() if v is not None}");
+		const sent = client.indexOf("sent = _sendable(args, _NULLABLE.get((server, tool)))");
 		const validate = client.indexOf("_validate(server, tool, sent)");
 		assert.ok(sent > 0 && validate > 0, "the validation call was not rendered");
-		assert.ok(sent < validate, "arguments are validated before the None-drop");
+		assert.ok(sent < validate, "arguments are validated before the unset/None filter");
 	});
 
 	it("raises before the request is built, not after", () => {
