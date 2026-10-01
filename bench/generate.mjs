@@ -1002,7 +1002,12 @@ def _validate(server: str, tool: str, args: dict) -> None:
  * unrecognised value is returned unchanged for the validator to reject, and
  * nothing here can turn a valid call into an invalid one.
  */
-function renderAdapters(helpers) {
+function renderAdapters(helpers, typedReturns = false) {
+	// A typed result is reduced to its id by the same `asset_id` `_call` applies to
+	// every argument, only first: the adapters decide by shape (is this an id? a lone
+	// scalar?), and a result is neither until it has been coerced. Idempotent, so the
+	// second pass in `_call` changes nothing.
+	const coerce = typedReturns ? "\n    value = _asset_ids(value)" : "";
 	const labeledIds = `
 
 def labeled_ids(value: object, label_key: str, id_key: str, stem: str) -> object:
@@ -1017,7 +1022,7 @@ def labeled_ids(value: object, label_key: str, id_key: str, stem: str) -> object
 
     Anything else is returned unchanged, so a value this function does not
     understand reaches the schema check rather than a rewrite of it.
-    """
+    """${coerce}
     if isinstance(value, dict):
         return [{label_key: str(key), id_key: item} for key, item in value.items()]
     if isinstance(value, (list, tuple)):
@@ -1044,7 +1049,7 @@ def as_list(value: object, item_type: str) -> object:
     error still reaches the schema check as itself rather than buried in a list.
     Which parameters get this at all is decided at compile time — an array of
     objects, or one demanding two items, is never wrapped.
-    """
+    """${coerce}
     # Python's bool is an int subclass, so it has to be excluded explicitly, or
     # flags=True would arrive at an array-of-integer parameter as [True].
     if isinstance(value, bool):
@@ -2144,7 +2149,7 @@ def _read_first(server: str, tool: str, path: str) -> None:
 	// Rendered only for the helpers the catalogue actually needs — an unused helper
 	// in the tree is one more thing in the agent's `grep -ril` and one more line of
 	// difference between two trees that are supposed to be identical.
-	const adapter = renderAdapters(new Set(adapters));
+	const adapter = renderAdapters(new Set(adapters), typedReturns);
 	// Only when the catalogue actually has a wait tool: an unused coroutine in the
 	// transport is one more thing in the agent's `grep -ril`.
 	const waiter = waitBridge ? renderWaitBridge() : "";
