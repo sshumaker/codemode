@@ -264,8 +264,10 @@ class Agents:
         Start a child agent on a self-contained subtask; returns its handle at once.
 
         name= is required. The child sees `prompt` and nothing else. Keywords: model,
-        tools, max_turns, max_cost, timeout, system_prompt, cwd, agent (a reusable
-        Agent(...) definition). See help(agents.spawn) / api/subagents.md.
+        tools, max_turns, max_cost, timeout, system_prompt, cwd, placement ("cloud" or
+        "device": the user's own computer, where the host offers it; default the
+        parent's), agent (a reusable Agent(...) definition). See help(agents.spawn) /
+        api/subagents.md.
         """
         job = self._spawner().spawn(prompt, name, **kw)
         return AgentHandle(job.name, self._backend())

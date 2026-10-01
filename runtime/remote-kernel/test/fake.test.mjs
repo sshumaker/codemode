@@ -182,3 +182,40 @@ describe("jobs.wait ends the turn over the remote kernel [fake]", () => {
 		}
 	});
 });
+
+describe("the kernel's ports can be named [fake]", () => {
+	it("the tunnel and ipykernel take the ports they are given, for a sandbox that allows only those", { timeout: 180_000 }, async () => {
+		const { RemoteKernelLink } = await import(`${DIST}/core/kernel/remote/link.js`);
+		const { dispatchHostRequest } = await import(`${DIST}/core/kernel/remote/manager.js`);
+		const { RemotePathMap } = await import(`${DIST}/core/kernel/remote/pathmap.js`);
+		const { setRemoteRuntimeForTest } = await import(`${DIST}/core/kernel/remote/tools.js`);
+		const { createAllToolDefinitions } = await import(`${DIST}/core/tools/index.js`);
+		const base = 41000 + (process.pid % 2000) * 10;
+		const srv = await startFakeServer({
+			env: { KERNEL_SERVER_TUNNEL_PORT: String(base), HARNESS_KERNEL_PORT_RANGE: `${base + 1}-${base + 9}` },
+		});
+		const link = new RemoteKernelLink({ connection: () => ({ url: srv.url, token: srv.token }), pingIntervalMs: 2000, deadAfterMs: 10_000 });
+		link.handlers.hostRequest = dispatchHostRequest;
+		const local = mkdtempSync(join(tmpdir(), "rk-ports-"));
+		const saved = { ...process.env };
+		process.env.HARNESS_REMOTE_KERNEL_URL = srv.url;
+		setRemoteRuntimeForTest({ config: { remoteCwd: srv.cwd }, link, pathMap: () => new RemotePathMap([{ local, remote: srv.cwd }]) }, local);
+		const tools = createAllToolDefinitions(local, {});
+		try {
+			const r = await tools.ipython.execute("ports", {
+				code:
+					"import json, os\nfrom ipykernel import get_connection_file\n" +
+					"c = json.load(open(get_connection_file()))\n" +
+					"print(json.dumps(sorted(c[k] for k in ('shell_port','iopub_port','stdin_port','control_port','hb_port')), separators=(',', ':')), os.environ['HARNESS_MCP_PROXY'])",
+			});
+			const text = r.content.map((c) => c.text ?? "").join("");
+			const [ports, proxy] = text.trim().split(" ");
+			for (const p of JSON.parse(ports)) assert.ok(p > base && p <= base + 9, `kernel port ${p} is in ${base + 1}-${base + 9}`);
+			assert.ok(proxy.startsWith(`http://127.0.0.1:${base}/`), `the tunnel is on ${base}: ${proxy}`);
+		} finally {
+			link.close?.();
+			Object.assign(process.env, saved);
+			await srv.stop();
+		}
+	});
+});

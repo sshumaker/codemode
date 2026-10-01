@@ -37,7 +37,7 @@ function placeBundledSkills(): KernelPythonSkill[] {
 		const source = join(root, name);
 		if (!existsSync(join(source, "pyproject.toml"))) continue;
 		const hash = hashSkillPackage(source);
-		const dir = join(config.stateDir, "skills", hash);
+		const dir = join(config.skillsDir, hash);
 		if (!existsSync(join(dir, ".complete"))) {
 			mkdirSync(dir, { recursive: true });
 			cpSync(source, join(dir, name), { recursive: true });
@@ -55,7 +55,11 @@ function placeBundledSkills(): KernelPythonSkill[] {
 }
 
 async function prebake(): Promise<void> {
-	const pythonSkills = placeBundledSkills();
+	// The venv is current only for the exact skill set a kernel starts with. A loop run with
+	// `--no-skills` starts kernels with none, and a read-only shared venv (one server per
+	// conversation on a user's computer) cannot be re-bootstrapped to match, so the
+	// installer says which set its loops use.
+	const pythonSkills = process.env.KERNEL_SERVER_PREBAKE_SKILLS === "none" ? [] : placeBundledSkills();
 	const log = (line: string) => process.stdout.write(`[prebake] ${line}\n`);
 	log(`skills: ${pythonSkills.map((s) => s.name).join(", ") || "(none)"}`);
 	const python = await ensureKernelPython({ pythonSkills, onProgress: log });

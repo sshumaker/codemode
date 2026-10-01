@@ -45,11 +45,19 @@ import {
 
 export interface KernelServerConfig {
 	port: number;
+	/** The tool tunnel's loopback port; 0 picks one. Fixed, for a sandbox that allows loopback per port. */
+	tunnelPort: number;
 	host: string;
 	/** Shared secret the loop presents in `hello`; unset only for the in-process fake. */
 	token?: string;
 	defaultCwd: string;
 	stateDir: string;
+	/**
+	 * Python skill packages, content-addressed. Defaults to `<stateDir>/skills`. Separate so
+	 * several servers (one per conversation, each with its own stateDir) can share one
+	 * prebaked set, which the venv records by exact path, read-only to all of them.
+	 */
+	skillsDir: string;
 	/** What contains the kernel, reported in every welcome: "daytona-sandbox", "none (local fake)". */
 	boundary: string;
 	/** Start kernels even with open egress; the reason is recorded in the posture. */
@@ -73,10 +81,12 @@ export function kernelServerConfigFromEnv(env: NodeJS.ProcessEnv = process.env):
 	const stateDir = env.KERNEL_SERVER_STATE_DIR ?? join(homedir(), ".harness");
 	return {
 		port: Number(env.KERNEL_SERVER_PORT ?? 8765),
+		tunnelPort: Number(env.KERNEL_SERVER_TUNNEL_PORT ?? 0),
 		host: env.KERNEL_SERVER_HOST ?? "0.0.0.0",
 		token: env.KERNEL_SERVER_TOKEN || undefined,
 		defaultCwd: env.KERNEL_SERVER_CWD ?? join(homedir(), "work"),
 		stateDir,
+		skillsDir: env.KERNEL_SERVER_SKILLS_DIR ?? join(stateDir, "skills"),
 		boundary: env.KERNEL_SERVER_BOUNDARY ?? "unspecified",
 		allowOpenEgress: env.KERNEL_SERVER_ALLOW_OPEN_EGRESS || undefined,
 		graceMs: Number(env.KERNEL_SERVER_GRACE_MS ?? 5 * 60_000),
@@ -294,7 +304,7 @@ export class KernelServer {
 		this.tunnel = createServer((req, res) => void this.onTunnelRequest(req, res));
 		this.tunnel.requestTimeout = 0;
 		this.tunnel.headersTimeout = 60_000;
-		await new Promise<void>((resolve) => this.tunnel?.listen(0, "127.0.0.1", resolve));
+		await new Promise<void>((resolve) => this.tunnel?.listen(this.config.tunnelPort, "127.0.0.1", resolve));
 		const tunnelAddress = this.tunnel.address();
 		this.tunnelPort = typeof tunnelAddress === "object" && tunnelAddress ? tunnelAddress.port : 0;
 		this.http = createServer((req, res) => void this.onHttp(req, res));
@@ -632,7 +642,7 @@ export class KernelServer {
 	}
 
 	get skillsDir(): string {
-		return join(this.config.stateDir, "skills");
+		return this.config.skillsDir;
 	}
 
 	private async putSkill(hash: string, name: string, tgz: string): Promise<{ path: string }> {

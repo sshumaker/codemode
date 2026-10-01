@@ -153,7 +153,11 @@ function fieldType(node, { name, defs, classes, prefix }) {
 	}
 	if (node.type === "object") {
 		if (node.properties && Object.keys(node.properties).length > 0) {
-			const cls = ensureClass(name, node, { defs, classes, prefix });
+			// schemaTitles: a nested record the schema titled (`Mac`) is that class, not
+			// a path-derived one (`MacsMacsItem`). Off by default: typed trees already
+			// measured keep their class names.
+			const titled = useSchemaTitles && typeof node.title === "string" && isIdent(node.title) && node.title !== UNTYPED_RESULT;
+			const cls = ensureClass(titled ? node.title : name, node, { defs, classes, prefix });
 			return { py: cls, ref: null, cls };
 		}
 		if (node.additionalProperties && typeof node.additionalProperties === "object") {
@@ -352,17 +356,22 @@ const BASE_ATTRS = new Set(["id", "ids", "text", "keys", "items", "values", "get
  *
  * `tools` are normalized tools (`name`, `pyName`, `outputSchema`).
  */
-export function collectOutputTypes(tools, { refFormats = DEFAULT_REF_FORMATS, refKinds = null } = {}) {
+let useSchemaTitles = false;
+
+export function collectOutputTypes(tools, { refFormats = DEFAULT_REF_FORMATS, refKinds = null, schemaTitles = false } = {}) {
 	const previous = refPolicy;
+	const previousTitles = useSchemaTitles;
 	refPolicy = {
 		formats: formatTable(refFormats),
 		kindsKey: refKinds?.key ?? null,
 		kinds: new Map(Object.entries(refKinds?.kinds ?? {}).filter(([, category]) => category)),
 	};
+	useSchemaTitles = schemaTitles;
 	try {
 		return collectOutputTypesWith(tools);
 	} finally {
 		refPolicy = previous;
+		useSchemaTitles = previousTitles;
 	}
 }
 

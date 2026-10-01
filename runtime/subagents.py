@@ -253,9 +253,13 @@ class Agent:
         timeout: wall-clock seconds for the whole child (default 1800).
         system_prompt: extra text appended to the child's system prompt.
         cwd: working directory for the child. Defaults to the parent's.
+        placement: where the child's code runs, where the host offers a choice:
+            "cloud", or "device" (the user's own computer). Defaults to the parent's.
+            A device child needs that computer connected; the spawn fails at once,
+            saying so, when it is not.
     """
 
-    __slots__ = ("tools", "model", "max_turns", "max_cost", "timeout", "system_prompt", "cwd")
+    __slots__ = ("tools", "model", "max_turns", "max_cost", "timeout", "system_prompt", "cwd", "placement")
 
     def __init__(
         self,
@@ -267,7 +271,11 @@ class Agent:
         timeout: Any = None,
         system_prompt: Optional[str] = None,
         cwd: Optional[str] = None,
+        placement: Optional[str] = None,
     ):
+        if placement is not None and placement not in ("cloud", "device"):
+            raise ValueError(f'placement= is "cloud" or "device", not {placement!r}')
+        self.placement = placement
         self.tools = tools
         self.model = model
         self.max_turns = max_turns
@@ -477,6 +485,7 @@ class Subagents:
         timeout: Any = None,
         system_prompt: Optional[str] = None,
         cwd: Optional[str] = None,
+        placement: Optional[str] = None,
     ) -> Job:
         if callable(prompt):
             raise TypeError(
@@ -507,7 +516,7 @@ class Subagents:
             self._check_depth()
             cfg = Agent.coerce(agent).merge(
                 tools=tools, model=model, max_turns=max_turns, max_cost=max_cost,
-                timeout=timeout, system_prompt=system_prompt, cwd=cwd,
+                timeout=timeout, system_prompt=system_prompt, cwd=cwd, placement=placement,
             )
             return self._spawn_via_host(name, prompt, cfg)
 
@@ -523,7 +532,13 @@ class Subagents:
             timeout=timeout,
             system_prompt=system_prompt,
             cwd=cwd,
+            placement=placement,
         )
+        if cfg.placement == "device":
+            raise JobError(
+                "placement='device' needs a host that runs children on the user's computer, and "
+                "this kernel launches its children itself, here. Leave placement= out."
+            )
         spec = self._build_spec(name, prompt, cfg)
 
         os.makedirs(spec["child_dir"], exist_ok=True)
@@ -590,6 +605,7 @@ class Subagents:
             "timeout": _jobs.parse_duration(cfg.timeout) if cfg.timeout is not None else None,
             "system_prompt": cfg.system_prompt,
             "cwd": cfg.cwd,
+            "placement": cfg.placement,
         }
         client = self.host()
         reply = client.request(payload)
@@ -1258,7 +1274,8 @@ HELP = """\
 agents — subagents
 
   a = agents.spawn(prompt, name=..., agent=None, tools=None, model=None,
-                   max_turns=None, max_cost=None, timeout=None, system_prompt=None, cwd=None)
+                   max_turns=None, max_cost=None, timeout=None, system_prompt=None, cwd=None,
+                   placement=None)
   agents.get(name) -> handle          raises on a name you did not start
   agents.list()    -> [{name, model, state, turns, cost, unread}]
 
@@ -1311,6 +1328,11 @@ Reusable definitions
     max_turns    turn cap; the child is stopped and its partial work kept
     max_cost     dollar cap, applied as usage streams in
     timeout      wall clock, default 30m ("10m", "1h", 600 all work)
+    placement    where the child's code runs, where the host offers it: "cloud", or
+                 "device" (the user's own computer, next to their files and apps).
+                 Defaults to where you run. A device child needs that computer
+                 connected: the spawn fails at once, saying so, when it is not; tell
+                 the user rather than retry
 
 The handoff is serializable, both ways
     In: the prompt string, and what you send it. Out: its final text, its messages,

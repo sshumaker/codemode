@@ -107,6 +107,32 @@ sub(
 );
 
 
+// ---- kernel ports: nameable, for a sandbox that allows loopback per port ----
+// A kernel on the user's computer may reach loopback only on the ports it owns (other
+// local services listen there too), and Seatbelt can name ports but not owners.
+sub(
+	"core/kernel/index.ts",
+	'function makeConnection(): { info: ConnectionInfo; path: string; tempDir: string } {\n',
+	`${patch("kernel-ports.ts")}\n\nfunction makeConnection(): { info: ConnectionInfo; path: string; tempDir: string } {\n`,
+	"kernel port range helper",
+	"function harnessKernelPorts(",
+);
+sub(
+	"core/kernel/index.ts",
+	'\t\ttransport: "tcp",\n\t\tshell_port: 0,\n\t\tiopub_port: 0,\n\t\tstdin_port: 0,\n\t\tcontrol_port: 0,\n\t\thb_port: 0,\n',
+	'\t\ttransport: "tcp",\n\t\t...harnessKernelPorts(),\n',
+	"connection ports from HARNESS_KERNEL_PORT_RANGE",
+	"...harnessKernelPorts(),",
+);
+
+sub(
+	"core/kernel/index.ts",
+	"\t\t\tif (info && hasResolvedPorts(info)) {\n\t\t\t\treturn info;\n",
+	"\t\t\tif (info && hasResolvedPorts(info) && (await harnessKernelPortsBound(info))) {\n\t\t\t\treturn info;\n",
+	"pinned ports: wait until the kernel is listening on them",
+	"(await harnessKernelPortsBound(info))",
+);
+
 // The continual-harness state injected into the system prompt. Opt back in with
 // PRIME_HARNESS_STATE=1 if we ever want to measure it as its own variable.
 sub(

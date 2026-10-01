@@ -557,6 +557,16 @@ class TestAgentsHost(unittest.TestCase):
                 J.wait([a], wake_after="10m")
         self.assertEqual(self.broker.sent[-1], {"op": "wait", "wake_after": 600, "watch": ["eu"], "mode": "all"})
 
+    def test_placement_travels_to_the_broker_which_decides(self):
+        with mock.patch("builtins.print"):
+            self.agents.spawn("look at my files", name="local", placement="device")
+            self.agents.spawn("research", name="far")
+        spawns = [p for p in self.broker.sent if p["op"] == "spawn"]
+        self.assertEqual(spawns[0]["placement"], "device")
+        self.assertIsNone(spawns[1]["placement"], "left out, the broker's default (the parent's) applies")
+        with self.assertRaises(ValueError):
+            self.agents.spawn("x", name="bad", placement="moon")
+
     def test_result_is_empty_until_done(self):
         with mock.patch("builtins.print"):
             a = self.agents.spawn("research", name="eu")

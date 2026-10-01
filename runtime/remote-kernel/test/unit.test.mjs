@@ -200,6 +200,15 @@ describe("config", () => {
 		assert.equal(toWebSocketUrl("https://a"), "wss://a");
 	});
 
+	it("the server's skills live under its state dir unless KERNEL_SERVER_SKILLS_DIR moves them", () => {
+		const own = server.kernelServerConfigFromEnv({ KERNEL_SERVER_STATE_DIR: "/r/conv-1/state" });
+		assert.equal(own.skillsDir, "/r/conv-1/state/skills");
+		// Several servers, one per conversation: own state, one shared prebaked skill set.
+		const shared = server.kernelServerConfigFromEnv({ KERNEL_SERVER_STATE_DIR: "/r/conv-1/state", KERNEL_SERVER_SKILLS_DIR: "/r/skills" });
+		assert.equal(shared.stateDir, "/r/conv-1/state");
+		assert.equal(shared.skillsDir, "/r/skills");
+	});
+
 	it("a pending connect file asks the caller to wait; an error file fails with its text", () => {
 		const dir = mkdtempSync(join(tmpdir(), "rk-cfg-"));
 		const file = join(dir, "connect.json");

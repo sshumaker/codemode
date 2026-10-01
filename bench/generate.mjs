@@ -18,6 +18,7 @@ import { isNestedShape, isNullable, paramAdapter, paramExample } from "./pythoni
 
 /** JSON Schema type -> Python type hint. */
 import { DEFAULT_REF_FORMATS, UNTYPED_RESULT, collectOutputTypes, renderOutputTypes, untypedTools } from "./output-types.mjs";
+import { collectInputTypes, renderInputTypes } from "./input-types.mjs";
 
 /**
  * The header `_client.call` stamps on every request, so a forwarder can tell a call
@@ -1582,8 +1583,9 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, wait
 			if (waitParam && p.name === waitParam.name) {
 				doc.push(`            ${pyDocstring(waitNote(tool, waitParam))}`);
 			}
-			const example = exampleNote(p);
+			const example = p.inputTyped ? null : exampleNote(p);
 			if (example) doc.push(`            ${pyDocstring(example)}`);
+			if (p.inputCheck) doc.push(`            A ${p.inputCheck.how === "one" ? "" : p.inputCheck.how === "list" ? "list of " : "dict of str to "}${p.inputCheck.cls}; help(${p.inputCheck.cls}) lists its fields.`);
 			// One line, and only for a promoted parameter. Without it the signature
 			// says "required" while the description it sits beside still says the
 			// server has a default for it, and the agent is left to reconcile two
@@ -1643,7 +1645,12 @@ function renderFunction(tool, { server, docsGate = "off", readGate = false, wait
 	// body so the value the docstring documents is the value `_call` validates and
 	// sends. A strict-form argument passes through untouched.
 	const coercions = tool.params.filter((p) => p.adapter).map((p) => `    ${p.pyName} = ${coercion(p).call}`);
-	const callArgs = tool.params.map((p) => `"${p.name}": ${p.pyName}`).join(", ");
+	// Typed inputs: refuse anything but the declared class, then send its payload.
+	const inputChecks = tool.params
+		.filter((p) => p.inputCheck)
+		.map((p) => `    ${p.pyName} = _require_input(${p.pyName}, ${p.inputCheck.cls}, "${p.pyName}", "${p.inputCheck.how}")`);
+	coercions.push(...inputChecks);
+	const callArgs = tool.params.map((p) => `"${p.name}": ${p.inputCheck || p.inputTyped ? `_to_payload(${p.pyName})` : p.pyName}`).join(", ");
 	// `_path` is what arms the gate — `__name__` is already the import path
 	// (`api.<pkg>.<tool>`), so the citation and the package name need no plumbing.
 	// `_doc` is passed only by the mode that shows a docstring, and it is read off
@@ -1693,6 +1700,9 @@ export function renderToolModule(tool, { server, docsGate = "off", waitBridge = 
 		// evaluated at def time on the kernel's Python 3.11 (3.14 defers them, which
 		// is how a NameError here passed a system-python smoke test once).
 		...(typedReturns ? [`from .._types import AssetLike, ${returnType(tool.name, returnShapes)}`] : []),
+		...(tool.params.some((p) => p.inputTyped)
+			? [`from .._types import ${[...new Set(tool.params.flatMap((p) => p.inputClasses ?? []))].sort().concat(["require_input as _require_input", "to_payload as _to_payload"]).join(", ")}`]
+			: []),
 		// `_client` lives at the api/ root, one level above the server package.
 		// Coercion helpers are imported only by modules that call them, so a tree
 		// with no adaptable parameter is byte-identical to the pre-adapter one.
@@ -1744,6 +1754,10 @@ export function renderAppModuleParts(tools, { server, pkg = pyPackage(server), d
 	// names this app actually promises — deduped, and nothing when it promises none.
 	// AssetLike always: the widened parameter hints name it (see renderToolModule).
 	const typedNames = typedReturns ? [...new Set(["AssetLike", ...tools.map((t) => returnType(t.name, returnShapes))])].sort() : [];
+	// Typed inputs: every class a signature in this module names, and the two helpers.
+	const inputNames = [...new Set(tools.flatMap((t) => t.params.flatMap((p) => p.inputClasses ?? [])))].sort();
+	const usesInputs = tools.some((t) => t.params.some((p) => p.inputTyped));
+	if (usesInputs) typedNames.push(...inputNames, "require_input as _require_input", "to_payload as _to_payload");
 	const conventions = appConventions(tools, pkg);
 	const lines = [
 		`"""${pyDocstring(server)} — generated from the MCP schema. Do not edit.`,
@@ -2632,6 +2646,13 @@ export function generate(
 		// dump) renders the string-returning tree it always did, byte-identical, so
 		// no earlier benchmark's measured condition moves. `true`/`false` force it.
 		typedReturns = "auto",
+		// Typed parameters (bench/input-types.mjs): every structured argument becomes a
+		// dataclass in `_types.py`, the wrapper refuses a dict where one is declared.
+		// Opt-in, so no earlier benchmark's tree changes; needs typed returns.
+		typedInputs = false,
+		// Nested output records take their schema `title` as their class name. Off by
+		// default so typed trees already measured keep their class names.
+		schemaTitles = false,
 		// In typed mode, a tool WITHOUT an outputSchema returns the untyped base
 		// `ToolResult`. The product owes a schema on every tool (the product
 		// agents/tool_output.py), so bench/port/build-bundle.mjs refuses a mixed
@@ -2743,7 +2764,26 @@ export function generate(
 				"or pass allowUntyped: true for a catalogue whose schemas you do not control.",
 		);
 	}
-	const returnShapes = typedReturns ? collectOutputTypes(allTools, { refFormats, refKinds }) : null;
+	const returnShapes = typedReturns ? collectOutputTypes(allTools, { refFormats, refKinds, schemaTitles }) : null;
+	if (typedInputs && !typedReturns) {
+		throw new Error("typedInputs needs typed returns: the argument classes live in _types.py, which only a typed tree has");
+	}
+	const inputShapes = typedInputs ? collectInputTypes(allTools, { taken: new Set(returnShapes.classes.keys()) }) : null;
+	if (inputShapes) {
+		for (const t of allTools) {
+			for (const p of t.params) {
+				const typed = inputShapes.params.get(`${t.name}\0${p.name}`);
+				if (!typed) continue;
+				// The class replaces both the plain hint and any shape adapter: a dataclass
+				// argument is the one spelling, so there is nothing left to coerce.
+				p.type = typed.py;
+				p.adapter = null;
+				p.inputTyped = true;
+				p.inputCheck = typed.check;
+				p.inputClasses = [...typed.py.matchAll(/\b[A-Z][A-Za-z0-9_]*\b/g)].map((m) => m[0]).filter((n) => inputShapes.classes.has(n));
+			}
+		}
+	}
 	const launching = allTools.filter((t) => t.launches).map((t) => t.name);
 	if (waitSurface === "auto") waitSurface = launching.length > 0 || allTools.some((t) => t.awaitsInputs);
 	// A launch wrapper returns `_launch(...)`, which only the wait surface defines.
@@ -2783,7 +2823,7 @@ export function generate(
 	// hit in the agent's `grep -ril` and one more thing to read.
 	// The typed result surface. Its own module so `_client` imports it and any
 	// cell can too: `from api._types import Asset` is a thing a person would try.
-	if (typedReturns) files["_types.py"] = renderOutputTypes(returnShapes, { example: typesExample, resultCall: waitCalls?.result });
+	if (typedReturns) files["_types.py"] = renderOutputTypes(returnShapes, { example: typesExample, resultCall: waitCalls?.result }) + (inputShapes ? renderInputTypes(inputShapes) : "");
 	if (validateArgs) {
 		const modules = layoutMode === "consolidated" ? categoryModuleMap(normalized, claimed) : null;
 		files["_schemas.json"] = renderSchemas(normalized, { waitSurface, modules });
