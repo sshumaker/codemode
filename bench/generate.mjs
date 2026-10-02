@@ -2451,7 +2451,8 @@ def wait_for(*things) -> None:
     bound the cell ENDS here (nothing after it runs): call wait_for again to keep
     waiting, or end your turn and you are woken in a fresh cell with the ready ids
     listed. Then read assets with '${readCall}(id)' and collect a launch with
-    '${resultCall}(name)' or the handle's '.result()'.
+    '${resultCall}(name)' or the handle's '.result()'. Raises McpError, naming each
+    failed id and why, as soon as any has failed.
     """
     assets, jobs = _ready_ids(things)
     if not assets and not jobs:
@@ -2468,6 +2469,11 @@ def wait_for(*things) -> None:
             f"wait_for: no launched run named {names}. A spawn_* call returns its Handle when it runs — "
             f"check that the call executed (it is a plain call, no await needed) and use the Handle or its .name."
         )
+    if body.get("failed"):
+        # Failure wins over anything still pending: a failed id never becomes ready.
+        # Measured: a failed image reported "already ready" was reported as done.
+        failures = "; ".join(f"{f.get('id')}: {f.get('reason') or 'failed'}" for f in body["failed"])
+        raise McpError(f"wait_for: failed — {failures}. It produced nothing: do not read it or report it as done.")
     if body.get("ready"):
         # Everything is already finished: no turn to end. Say so and return an awaitable
         # no-op — measured (h68 pos 24): the model writes 'await wait_for(h)', and a bare

@@ -8,6 +8,8 @@
  *    `jobs`, and anything else is an error that names what wait_for takes.
  *  - an ArgumentError named the server's package (`api.maker.echo`) when the function
  *    lives in a category module (`api.session.echo`) — a call the cell never made.
+ *  - a failed id came back from `/wait` as "already ready", and the model reported
+ *    it as done. A `failed` list in the reply now raises, and wins over pending ids.
  *  - only `/call` carried `x-egress-token`, so a bridge could authenticate nothing
  *    else. Every route the client uses now does.
  */
@@ -94,7 +96,18 @@ describe("generated client: wait_for job refs, call-path errors, egress token on
 	it("rejects an unrecognised value with a message naming what wait_for takes, and sends nothing", () => {
 		assert.match(probe.outcomes.wait_unrecognised, /^ArgumentError: wait_for takes asset ids, job ids/);
 		assert.match(probe.outcomes.wait_unrecognised, /got int: 42/);
-		assert.equal(waits().length, 4);
+		assert.equal(waits().filter((w) => !w.assets.includes("img_failed")).length, 4);
+	});
+
+	it("raises on a failed id, naming it and its reason, and never says it is ready", () => {
+		assert.match(probe.outcomes.wait_failed, /^McpError: wait_for: failed — img_failed: upstream auth failed\. It produced nothing/);
+		assert.match(probe.outcomes.wait_failed, /do not read it or report it as done/);
+		assert.deepEqual(waits()[4], { assets: ["img_failed"], jobs: [] });
+	});
+
+	it("raises on failure even while other ids are still pending, rather than ending the cell to wait", () => {
+		assert.match(probe.outcomes.wait_failed_and_pending, /^McpError: wait_for: failed — img_failed: upstream auth failed\./);
+		assert.doesNotMatch(probe.outcomes.wait_failed_and_pending, /WaitSignal|img_pending/);
 	});
 
 	it("names the category module the function lives in, not the server's package", () => {
