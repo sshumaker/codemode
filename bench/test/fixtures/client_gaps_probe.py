@@ -52,8 +52,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"ok": True, "text": json.dumps(RESULTS.get(body["tool"], {}))})
         elif self.path == "/spawn":
             self._send({"ok": True, "name": "judge_1", "kind": "judge"})
+        elif "img_failed" in body.get("assets", []):
+            pending = [a for a in body["assets"] if a != "img_failed"]
+            self._send(
+                {
+                    "ready": False,
+                    "waiting_on": pending,
+                    "failed": [{"id": "img_failed", "reason": "upstream auth failed"}],
+                }
+            )
         else:
-            self._send({"ready": True})
+            self._send({"ready": True, "failed": []})
 
     def do_GET(self):
         self._record(None)
@@ -94,6 +103,8 @@ async def main():
     attempt("wait_job_id_dict", lambda: client.wait_for({"job_id": "job_dict_1"}))
     attempt("wait_mixed_list", lambda: client.wait_for([image, job, "img_bare", {"job_id": "job_dict_2"}]))
     attempt("wait_unrecognised", lambda: client.wait_for(42))
+    attempt("wait_failed", lambda: client.wait_for("img_failed"))
+    attempt("wait_failed_and_pending", lambda: client.wait_for(["img_pending", "img_failed"]))
     try:
         await api.session.echo(text=5)
         outcomes["argument_error"] = "ok"
