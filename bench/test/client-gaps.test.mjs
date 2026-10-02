@@ -10,6 +10,8 @@
  *    lives in a category module (`api.session.echo`) — a call the cell never made.
  *  - a failed id came back from `/wait` as "already ready", and the model reported
  *    it as done. A `failed` list in the reply now raises, and wins over pending ids.
+ *  - a ready reply told the model to read assets it had no read call for. A
+ *    `facts` list in the reply is printed instead: each asset's type and size.
  *  - only `/call` carried `x-egress-token`, so a bridge could authenticate nothing
  *    else. Every route the client uses now does.
  */
@@ -96,7 +98,7 @@ describe("generated client: wait_for job refs, call-path errors, egress token on
 	it("rejects an unrecognised value with a message naming what wait_for takes, and sends nothing", () => {
 		assert.match(probe.outcomes.wait_unrecognised, /^ArgumentError: wait_for takes asset ids, job ids/);
 		assert.match(probe.outcomes.wait_unrecognised, /got int: 42/);
-		assert.equal(waits().filter((w) => !w.assets.includes("img_failed")).length, 4);
+		assert.equal(waits().filter((w) => !w.assets.includes("img_failed")).length, 6);
 	});
 
 	it("raises on a failed id, naming it and its reason, and never says it is ready", () => {
@@ -108,6 +110,21 @@ describe("generated client: wait_for job refs, call-path errors, egress token on
 	it("raises on failure even while other ids are still pending, rather than ending the cell to wait", () => {
 		assert.match(probe.outcomes.wait_failed_and_pending, /^McpError: wait_for: failed — img_failed: upstream auth failed\./);
 		assert.doesNotMatch(probe.outcomes.wait_failed_and_pending, /WaitSignal|img_pending/);
+	});
+
+	it("keeps the generic ready line when the host sends no facts", () => {
+		assert.equal(probe.outcomes.wait_ready_plain, "ok");
+		assert.equal(probe.printed.wait_ready_plain, "[harness] already ready: img_plain — read them now.\n");
+	});
+
+	it("prints one line per described asset, with only the facts the host sent, then the rest", () => {
+		assert.equal(probe.outcomes.wait_ready_with_facts, "ok");
+		assert.deepEqual(probe.printed.wait_ready_with_facts.trimEnd().split("\n"), [
+			"[harness] ready: image:img_described — image/png 1024×768",
+			"[harness] ready: video:vid_1 — video/mp4 1280×720 5 s",
+			"[harness] ready: doc:doc_1 — document",
+			"[harness] ready: job:j_done",
+		]);
 	});
 
 	it("names the category module the function lives in, not the server's package", () => {

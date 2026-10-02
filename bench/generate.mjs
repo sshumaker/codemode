@@ -2443,6 +2443,17 @@ def _ready_ids(things) -> tuple[list[str], list[str]]:
     return assets, jobs
 
 
+def _fact_line(fact: dict) -> str:
+    """'image:ab12cd34 — image/png 1024×1024': an asset's id, then whichever facts the host sent."""
+    parts = [str(fact.get("content_type") or fact.get("kind") or "")]
+    if fact.get("width") and fact.get("height"):
+        parts.append(f"{fact['width']}×{fact['height']}")
+    if fact.get("duration_s"):
+        parts.append(f"{float(fact['duration_s']):g} s")
+    described = " ".join(p for p in parts if p)
+    return f"{fact['id']} — {described}" if described else str(fact["id"])
+
+
 def wait_for(*things) -> None:
     """Wait until every asset id / result / Handle given is finished.
 
@@ -2478,7 +2489,17 @@ def wait_for(*things) -> None:
         # Everything is already finished: no turn to end. Say so and return an awaitable
         # no-op — measured (h68 pos 24): the model writes 'await wait_for(h)', and a bare
         # None there is a TypeError that costs the turn wait_for just saved.
-        print(f"[harness] already ready: {', '.join(assets + jobs)} — read them now.")
+        facts = [f for f in body.get("facts") or [] if isinstance(f, dict) and f.get("id")]
+        if not facts:
+            print(f"[harness] already ready: {', '.join(assets + jobs)} — read them now.")
+            return _Ready()
+        for f in facts:
+            print(f"[harness] ready: {_fact_line(f)}")
+        # The host may spell an id differently ('image:x' for 'artifact:x'): match on the bare id.
+        described = {str(f["id"]).rsplit(":", 1)[-1] for f in facts}
+        rest = [str(i) for i in assets + jobs if str(i).rsplit(":", 1)[-1] not in described]
+        if rest:
+            print(f"[harness] ready: {', '.join(rest)}")
         return _Ready()
     waiting = body.get("waiting_on") or (assets + jobs)
     held = body.get("held_s")

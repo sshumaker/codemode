@@ -9,6 +9,8 @@ carry it.
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import sys
@@ -61,6 +63,18 @@ class Handler(BaseHTTPRequestHandler):
                     "failed": [{"id": "img_failed", "reason": "upstream auth failed"}],
                 }
             )
+        elif "artifact:img_described" in body.get("assets", []):
+            self._send(
+                {
+                    "ready": True,
+                    "failed": [],
+                    "facts": [
+                        {"id": "image:img_described", "kind": "image", "content_type": "image/png", "width": 1024, "height": 768},
+                        {"id": "video:vid_1", "kind": "video", "content_type": "video/mp4", "width": 1280, "height": 720, "duration_s": 5.0},
+                        {"id": "doc:doc_1", "kind": "document"},
+                    ],
+                }
+            )
         else:
             self._send({"ready": True, "failed": []})
 
@@ -86,12 +100,18 @@ import api.session  # noqa: E402
 outcomes: dict = {}
 
 
+printed: dict = {}
+
+
 def attempt(label, fn):
+    out = io.StringIO()
     try:
-        fn()
+        with contextlib.redirect_stdout(out):
+            fn()
         outcomes[label] = "ok"
     except BaseException as exc:  # noqa: BLE001 - the probe reports every outcome
         outcomes[label] = f"{type(exc).__name__}: {exc}"
+    printed[label] = out.getvalue()
 
 
 async def main():
@@ -105,6 +125,8 @@ async def main():
     attempt("wait_unrecognised", lambda: client.wait_for(42))
     attempt("wait_failed", lambda: client.wait_for("img_failed"))
     attempt("wait_failed_and_pending", lambda: client.wait_for(["img_pending", "img_failed"]))
+    attempt("wait_ready_plain", lambda: client.wait_for("img_plain"))
+    attempt("wait_ready_with_facts", lambda: client.wait_for(["artifact:img_described", "vid_1", "doc_1", "job:j_done"]))
     try:
         await api.session.echo(text=5)
         outcomes["argument_error"] = "ok"
@@ -115,4 +137,4 @@ async def main():
 
 
 asyncio.run(main())
-print(json.dumps({"requests": seen, "outcomes": outcomes}))
+print(json.dumps({"requests": seen, "outcomes": outcomes, "printed": printed}))
