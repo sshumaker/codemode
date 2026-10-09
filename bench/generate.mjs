@@ -2953,7 +2953,19 @@ export function generate(
 	});
 	if (lineMap) files["_linemap.json"] = `${JSON.stringify(lineMap, null, 1)}\n`;
 
-	return { toolDefs, tocLines, names, files, normalized, modules, callPaths: callPathMap(modules), moduleToc: renderModuleToc(modules) };
+	// What a layout-aware preamble (bench/prompts.mjs `q10`) reads to describe this tree.
+	const promptContext = {
+		toolCount: allTools.length,
+		serverCount: normalized.length,
+		moduleCount: modules.length,
+		apiLayout: layoutMode,
+		moduleIndex,
+		typedReturns,
+		validateArgs,
+		waitSurface,
+		waitCalls,
+	};
+	return { toolDefs, tocLines, names, files, normalized, modules, callPaths: callPathMap(modules), moduleToc: renderModuleToc(modules), promptContext };
 }
 
 /** One importable module: what `generate()` returns in `modules` and the root INDEX lists. */

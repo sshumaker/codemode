@@ -112,9 +112,10 @@ function buildPreamble() {
 	}
 	if (arm !== "codemode") return "";
 
-	const { tocLines, names, normalized } = loadGenerated(SCHEMAS, { servers: task.exposedServers });
+	const { tocLines, names, normalized, promptContext } = loadGenerated(SCHEMAS, { servers: task.exposedServers });
 	const catalogue = loadCatalogue(SCHEMAS, { servers: task.exposedServers });
 	const pointer = buildCodemodePreamble(promptName, {
+		...promptContext,
 		toolCount: tocLines.length,
 		serverCount: catalogue.length,
 	});

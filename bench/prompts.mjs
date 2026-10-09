@@ -762,7 +762,156 @@ export const VARIANTS = {
 				"is either satisfied by retrieved data or explicitly reported as unmet.",
 			].join("\n"),
 	},
+
+	/**
+	 * q10 — q8, described from the tree it ships with rather than from MCP-Bench's.
+	 *
+	 * q8's discovery lines name the per-method tree, the ipython tool and string
+	 * results, and its fan-out bound is phrased as scoring. A port running the
+	 * consolidated, typed tree had to rewrite those lines by pattern match (the product
+	 * `shared/codemode/compile.mjs`), so every q8 edit risked breaking it. q10 reads
+	 * the layout, the tool name and the result type from `generate()`'s
+	 * `promptContext` instead, and drops the scoring language.
+	 *
+	 * Added from the product preamble ((product source)
+	 * surface.py), each against a measured habit:
+	 *  - read ONE API's docs with `grep -n -A30 'def <api>('`: 72% of rounds `cat` a
+	 *    whole module (H54, generate.mjs renderRootIndex), ~16k tokens re-read on
+	 *    every later turn;
+	 *  - top-level `await`, not `asyncio.run`;
+	 *  - an ArgumentError already carries the fix (only when arguments are checked);
+	 *  - print slices, and a cell is a program: dependent calls chain in one cell;
+	 *  - asset ids and `wait_for`, only when the tree has the wait surface.
+	 *
+	 * Unmeasured as of its introduction; q8 stays the default until a run ranks it.
+	 */
+	q10: {
+		note: "q8 made layout- and tool-aware from generate()'s promptContext; adds the product preamble's measured cell habits",
+		build: (ctx) => q10(ctx),
+	},
 };
+
+/** The q10 preamble. `ctx` is generate()'s `promptContext` plus `toolName`. */
+function q10({
+	toolCount,
+	serverCount,
+	moduleCount = serverCount,
+	toolName = "ipython",
+	apiLayout = "per-method",
+	moduleIndex = false,
+	typedReturns = false,
+	validateArgs = false,
+	waitSurface = false,
+	waitCalls = null,
+}) {
+	const consolidated = apiLayout === "consolidated";
+	const unit = consolidated ? "module" : "package";
+	const find = [
+		["!cat api/INDEX.md", `every ${unit} and what it holds`],
+		["!grep -ril '<keyword>' api/", "search all API documentation"],
+		...(consolidated
+			? [
+					...(moduleIndex ? [["!head -60 api/<module>.py", "one module's APIs, one line each with its signature"]] : []),
+					["!grep -n -A30 'def <api>(' api/<module>.py", "one API's full docs"],
+				]
+			: [
+					["!cat api/<package>/INDEX.md", "one package's APIs"],
+					["!cat api/<package>/<api>.py", "one API's full docs"],
+				]),
+	];
+	const width = Math.max(...find.map(([cmd]) => cmd.length));
+	const sample = typedReturns ? "ids = [r.id for r in a.results][:15]" : "ids = [r['id'] for r in json.loads(a)['results']][:15]";
+	return [
+		"## Tools",
+		"",
+		`The \`api/\` directory in your working directory holds ${toolCount} async API function${toolCount === 1 ? "" : "s"}`,
+		`in ${moduleCount} ${unit}${moduleCount === 1 ? "" : "s"}, generated from their schemas.`,
+		"",
+		"Find one (a cell runs a shell command prefixed with `!`):",
+		...find.map(([cmd, what]) => `  ${cmd.padEnd(width)}   # ${what}`),
+		...(consolidated
+			? ["", "Read one API's block, not the whole module: a module holds many APIs, and", "everything you print is re-read on every later turn. A signature alone is not", "enough for a nested argument; read its block."]
+			: []),
+		"",
+		`Call them from the ${toolName} tool. \`await\` works at the top level of a cell —`,
+		"do not wrap calls in `asyncio.run(...)` or a helper function:",
+		`  import api.<${unit}>`,
+		`  result = await api.<${unit}>.<api>(...)`,
+		"",
+		typedReturns
+			? "Results are typed objects: fields are attributes (`r.results`), dict access works too, and `.raw` is the whole payload."
+			: "Results are the server's text, usually JSON: `json.loads` it before indexing.",
+		...(validateArgs
+			? ["", "An `ArgumentError` already contains the fix: it names the argument, its schema and,", "for a nested one, an example literal. Correct the call from the message rather than", "retrying variations blind."]
+			: []),
+		"",
+		"## The kernel is persistent",
+		"",
+		"Every cell runs in the SAME long-lived IPython session. Any top-level",
+		"variable you bind stays available in every later cell, for the whole task.",
+		"Data you have already fetched is still in memory — you never need to",
+		"fetch it twice.",
+		"",
+		"You will not remember across turns what you already have. So look:",
+		"",
+		"  %whos                        # every live variable, with its type and size",
+		"",
+		"## A cell is a program",
+		"",
+		"Put independent calls in ONE `asyncio.gather`, and chain the calls that depend",
+		"on them in the same cell: two calls in one cell cost one turn, in two cells two,",
+		"and each turn re-reads everything above it. Print slices and summaries, never",
+		"whole payloads.",
+		"",
+		`  import asyncio${typedReturns ? "" : ", json"}`,
+		`  a, b = await asyncio.gather(api.<${unit}>.search(q='x'), api.<other>.list())`,
+		`  ${sample}`,
+		`  details = await asyncio.gather(*[api.<${unit}>.get(id=i) for i in ids])`,
+		"  print(len(details), details[0])",
+		"",
+		"Keep the fan-out bounded: `gather` makes breadth cheap to write, not cheap to",
+		"run. Make the fewest calls that answer the question. Slice a list before",
+		"expanding it into calls — ten to twenty items is almost always enough — and",
+		"fetch more only if a first sample does not answer the question.",
+		...(waitSurface ? ["", ...waitBlock({ unit, typedReturns, readCall: waitCalls?.read ?? null })] : []),
+	].join("\n");
+}
+
+/** q10's asset-id and waiting section, for a tree that has the wait surface. */
+function waitBlock({ unit, typedReturns, readCall }) {
+	return [
+		"## Asset ids and waiting",
+		"",
+		"A call that makes something returns as soon as the work is submitted, with the",
+		typedReturns
+			? "output's asset id. Pass the result straight on: it works wherever an id is expected"
+			: "output's asset id in its result. Pass that id on wherever an id is expected",
+		"(`references=[img]`). A call that needs a finished input waits for it, or raises",
+		"`NotReady` naming what to wait for. Submit, then wait for everything in ONE call:",
+		"",
+		...(typedReturns
+			? [
+					"  import asyncio",
+					`  made = await asyncio.gather(*[api.<${unit}>.<make>(prompt=p) for p in prompts])`,
+					"  print(made)                      # every asset id, available at once",
+					"  await api.wait_for(made)         # one wait for everything",
+				]
+			: [
+					"  import asyncio, json",
+					`  made = await asyncio.gather(*[api.<${unit}>.<make>(prompt=p) for p in prompts])`,
+					"  ids = [json.loads(m)['<id field>'] for m in made]",
+					"  print(ids)                       # every asset id, available at once",
+					"  await api.wait_for(ids)          # one wait for everything",
+				]),
+		"",
+		"Time only passes when you LOOK at something. `wait_for` takes several ids at once,",
+		"waits in place up to about 100 s (most work finishes inside that), and prints each",
+		"asset's type and size once it is ready. Wait before you judge or describe an",
+		"output, and before you say it is done. If it is still not ready, the cell ends",
+		"there: call `wait_for` again, or end your turn and you are woken when it is ready.",
+		...(readCall ? ["", `To look at an asset, call \`${readCall}\` with its id.`] : []),
+	];
+}
 
 
 
