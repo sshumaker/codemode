@@ -665,5 +665,386 @@ class TestSchedulerKilledMidTurn(unittest.TestCase):
         self.assertTrue(box[0].endswith(".json.undelivered"), box)
 
 
+FIXTURE_AGENT = os.path.join(HERE, "fixtures", "fake_agent.py")
+
+# A turn that submits a real job into its session, records itself, then hangs: the
+# harness a session deadline has to stop and whose work it has to reap.
+DEADLINE_HARNESS = r"""
+import json, os, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import jobs as J
+log, mode = sys.argv[2], sys.argv[3]
+message = sys.argv[-1]
+with open(log, "a") as fh:
+    fh.write(json.dumps({"pid": os.getpid(), "message": message}) + "\n")
+store = J.JobStore(os.environ["HARNESS_JOB_DIR"], emit=lambda m: None)
+if store.get("work") is None:
+    store.submit("sleep 300", name="work", strict=False)
+if mode == "hang":
+    time.sleep(300)
+"""
+
+
+def _members_alive(target):
+    return J._members_alive(J._real_probe, target)
+
+
+def alive(ident):
+    """Is the process this {pid, pid_start} names still the one it was?"""
+    return J._vouch(J._real_probe, ident.get("pid"), ident.get("pid_start"))[0]
+
+
+class SessionTreeBase(unittest.TestCase):
+    """A session dir whose job dir holds real jobs and a real subagent."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="chaos-reap-")
+        self.sessions = os.path.join(self.root, "sessions")
+        self.session = os.path.join(self.sessions, "s")
+        self.job_dir = os.path.join(self.session, "jobs")
+        os.makedirs(self.job_dir)
+        self.write_spec({"argv": ["true"], "cwd": self.session})
+        self.store = J.JobStore(self.job_dir, cwd=self.session, emit=lambda m: None)
+        self.decoys = []
+        self._saved = {k: os.environ.get(k) for k in ("FAKE_TURNS", "FAKE_HANG")}
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        for ident in self.every_identity():
+            if alive(ident):
+                try:
+                    os.killpg(ident["pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+        # A leader that died on SIGTERM leaves its group behind; the wrapper shells
+        # name this test's directory, so their groups are findable even then.
+        ps = subprocess.run(["ps", "-axo", "pgid=,command="], capture_output=True, text=True).stdout
+        for line in ps.splitlines():
+            if self.root in line:
+                try:
+                    os.killpg(int(line.split()[0]), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+        for proc in self.decoys:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def write_spec(self, spec):
+        with open(os.path.join(self.session, S.SESSION_FILE), "w") as fh:
+            json.dump(spec, fh)
+
+    def submit(self, store, name, command="sleep 300", **kw):
+        store.submit(command, name=name, strict=False, **kw)
+        self.assertTrue(wait_until(lambda: (store._read(name) or {}).get("pid")))
+        return store._read(name)
+
+    def spawn_subagent(self, name="scout"):
+        """A real launcher and a real (fake) prime child, hung mid-run like a long turn."""
+        import subagents as SA
+        os.environ.update(FAKE_TURNS="1", FAKE_HANG="300")
+        spawner = SA.Subagents(self.store, env={"HARNESS_SUBAGENT_MODEL": "fake/model",
+                                                "HARNESS_SUBAGENT_CLI": FIXTURE_AGENT},
+                               node=sys.executable, python=sys.executable)
+        spawner.spawn("hang", name=name)
+        self.assertTrue(wait_until(lambda: J._subagent_child(self.store._read(name) or {})),
+                        "the launcher never recorded its child")
+        rec = self.store._read(name)
+        child = J._subagent_child(rec)
+        self.assertTrue(alive(child))
+        return rec, child
+
+    def every_identity(self):
+        out = []
+        for d in (self.job_dir, os.path.join(self.job_dir, "scout.d", "jobs")):
+            if os.path.isdir(d):
+                for rec in J.JobStore(d, emit=lambda m: None)._all():
+                    if rec.get("pid"):
+                        out.append({"pid": rec["pid"], "pid_start": rec.get("pid_start")})
+                    child = J._subagent_child(rec)
+                    if child:
+                        out.append(child)
+        return out
+
+    def decoy(self):
+        proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        self.decoys.append(proc)
+        return proc
+
+    def reap_evidence(self):
+        with open(os.path.join(self.session, S.REAP_FILE)) as fh:
+            return json.load(fh)
+
+
+class TestEndingASessionReapsItsTree(SessionTreeBase):
+    """Fix A: when a session ends, nothing it started keeps running."""
+
+    def test_jobs_subagents_their_children_and_their_jobs_all_stop(self):
+        build = self.submit(self.store, "build")
+        server = self.submit(self.store, "server", "python3 -m http.server 0")
+        sub, child = self.spawn_subagent()
+        # The subagent's own kernel started a job of its own, in its own job dir.
+        sub_store = J.JobStore(os.path.join(sub["meta"]["child_dir"], "jobs"), emit=lambda m: None)
+        grandchild = self.submit(sub_store, "fetch")
+        tree = [build, server, sub, grandchild]
+        self.assertTrue(all(alive(r) for r in tree))
+
+        S.end_session(self.session, "the user closed the tab")
+        S.scan_once(self.sessions, log=lambda m: None)
+
+        self.assertTrue(wait_until(lambda: not any(alive(r) for r in tree + [child]), timeout=5),
+                        "something the session started survived its end")
+        for store, name in ((self.store, "build"), (self.store, "server"),
+                            (self.store, "scout"), (sub_store, "fetch")):
+            rec = store._read(name)
+            self.assertEqual(rec["state"], "killed", name)
+            self.assertIn("reaped", rec["reason"])
+        end = S.read_end(self.session)
+        self.assertEqual((end["state"], end["kind"]), ("ended", "explicit"))
+        targets = self.reap_evidence()["passes"][0]["targets"]
+        roles = sorted((t["job"], t["role"]) for t in targets)
+        self.assertEqual(roles, [("build", "job"), ("fetch", "job"), ("scout", "subagent"),
+                                 ("scout", "subagent-agent"), ("server", "job")])
+        # The launcher's own SIGTERM handler may take its child down before the reaper
+        # gets to it; either way every target was stopped, none was skipped.
+        stopped = ("exited after SIGTERM", "SIGKILLed after the grace period")
+        self.assertTrue(all(t["outcome"] in stopped or (t["role"] == "subagent-agent" and t["outcome"] == "already gone")
+                            for t in targets), targets)
+
+    def test_sigterm_comes_first_and_sigkill_only_after_the_grace(self):
+        polite = self.submit(self.store, "polite")
+        stubborn = self.submit(self.store, "stubborn", "trap '' TERM; sleep 300 & wait; sleep 300")
+        time.sleep(0.2)  # let the trap be installed
+        run = J._reap(self.job_dir, reason="test", grace=1.0)
+        outcomes = {t["job"]: t["outcome"] for t in run["targets"]}
+        self.assertEqual(outcomes, {"polite": "exited after SIGTERM",
+                                    "stubborn": "SIGKILLed after the grace period"})
+        by_job = {t["job"]: t for t in run["targets"]}
+        self.assertEqual([s["signal"] for s in by_job["stubborn"]["signals"]], ["SIGTERM", "SIGKILL"])
+        # The stubborn job's leader shell died on SIGTERM; what ignored it lived on in
+        # the group, and only the member snapshot let the SIGKILL find it.
+        self.assertTrue(wait_until(lambda: not _members_alive(by_job["stubborn"]), timeout=5))
+        self.assertFalse(alive(polite) or alive(stubborn))
+
+    def test_a_reused_pid_is_never_signalled(self):
+        rec = self.submit(self.store, "stale")
+        os.killpg(rec["pid"], signal.SIGKILL)
+        stranger = self.decoy()
+        # The record now names a stranger. Its identity is one no live process has: ps
+        # start times are whole seconds, so a stranger started in the same second as
+        # the original would be indistinguishable (the scheme's resolution, not ours).
+        rec["pid"], rec["pid_start"] = stranger.pid, "Thu Jan  1 00:00:00 1970"
+        self.store._write(rec)
+        run = J._reap(self.job_dir, reason="test", grace=0.5)
+        self.assertIsNone(stranger.poll(), "the reaper signalled a process it could not vouch for")
+        self.assertIn("different process", run["targets"][0]["outcome"])
+        self.assertIn("NOT signalled", self.store._read("stale")["reason"])
+
+    def test_a_record_without_a_start_identity_is_not_signalled(self):
+        rec = self.submit(self.store, "unverifiable")
+        rec["pid_start"] = None
+        self.store._write(rec)
+        run = J._reap(self.job_dir, reason="test", grace=0.5)
+        self.assertIn("cannot be told from a reused pid", run["targets"][0]["outcome"])
+        self.assertTrue(alive({"pid": rec["pid"], "pid_start": J._real_probe(rec["pid"])[1]}))
+        os.killpg(rec["pid"], signal.SIGKILL)
+
+    def test_a_finalize_sigkilled_mid_reap_is_finished_by_the_next_and_harms_nothing(self):
+        stubborn = self.submit(self.store, "stubborn", "trap '' TERM; sleep 300 & wait; sleep 300")
+        time.sleep(0.2)
+        env = dict(os.environ, HARNESS_REAP_GRACE_SECONDS="60")
+        proc = subprocess.Popen([sys.executable, SCHEDULER, "--end", self.session, "operator"],
+                                cwd=HERE, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        reap_file = os.path.join(self.session, S.REAP_FILE)
+
+        def sent_term():
+            try:
+                with open(reap_file) as fh:
+                    return any(t.get("signals") for t in json.load(fh)["passes"][-1]["targets"])
+            except (OSError, ValueError, KeyError, IndexError):
+                return False
+
+        self.assertTrue(wait_until(sent_term, timeout=20), "the finalize never signalled")
+        os.killpg(proc.pid, signal.SIGKILL)  # mid-grace: SIGTERM sent, SIGKILL never will be
+        proc.wait()
+        self.assertEqual(S.read_end(self.session)["state"], "reaping")
+        interrupted = self.reap_evidence()["passes"][-1]["targets"][0]
+        # Its leader shell died on the SIGTERM; what ignored it is still in the group.
+        self.assertTrue(_members_alive(interrupted), "the stubborn job should still be ignoring its SIGTERM")
+        self.assertEqual(self.store._read("stubborn")["state"], "running")
+
+        # Before the re-run, a stranger takes over a pid the interrupted pass recorded:
+        # carried targets are re-vouched, never trusted.
+        stranger = self.decoy()
+        evidence = self.reap_evidence()
+        evidence["passes"][-1]["targets"].append(
+            {"role": "job", "job": "ghost", "job_dir": self.job_dir,
+             "pid": stranger.pid, "pid_start": "Thu Jan  1 00:00:00 1970"})
+        with open(reap_file, "w") as fh:
+            json.dump(evidence, fh)
+
+        env["HARNESS_REAP_GRACE_SECONDS"] = "0.5"
+        out = subprocess.run([sys.executable, SCHEDULER, "--end", self.session], cwd=HERE, env=env,
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        end = S.read_end(self.session)
+        self.assertEqual((end["state"], end["reason"], end["finalize_attempts"]), ("ended", "operator", 2))
+        self.assertTrue(wait_until(lambda: not _members_alive(interrupted), timeout=5),
+                        "the resumed reap left the stubborn job's group running")
+        self.assertIsNone(stranger.poll(), "the resumed reap signalled a reused pid")
+        passes = self.reap_evidence()["passes"]
+        self.assertEqual(len(passes), 2, "evidence of the interrupted pass was lost")
+        self.assertNotIn("finished_at", passes[0])
+        self.assertTrue(passes[1]["resumed_interrupted_pass"])
+        outcomes = {t["job"]: t["outcome"] for t in passes[1]["targets"]}
+        self.assertEqual(outcomes["stubborn"], "SIGKILLed after the grace period")
+        self.assertIn("different process", outcomes["ghost"])
+        self.assertEqual(self.store._read("stubborn")["state"], "killed")
+
+        again = subprocess.run([sys.executable, SCHEDULER, "--end", self.session], cwd=HERE, env=env,
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(len(self.reap_evidence()["passes"]), 2, "an ended session was reaped again")
+
+
+class TestKillReachesASubagentsChild(SessionTreeBase):
+    """The audit's claim, confirmed: jobs.kill stopped the launcher and left prime running."""
+
+    def test_kill_stops_the_child_prime_and_its_jobs(self):
+        sub, child = self.spawn_subagent()
+        sub_store = J.JobStore(os.path.join(sub["meta"]["child_dir"], "jobs"), emit=lambda m: None)
+        grandchild = self.submit(sub_store, "fetch")
+        self.assertTrue(self.store.kill("scout"))
+        self.assertTrue(wait_until(lambda: not alive(child), timeout=5),
+                        "the subagent's prime child outlived jobs.kill")
+        self.assertTrue(wait_until(lambda: not alive(grandchild), timeout=5))
+        reason = self.store._read("scout")["reason"]
+        self.assertIn("its agent process", reason)
+        self.assertIn("its own jobs were killed: fetch", reason)
+
+    def test_a_reused_child_pid_is_not_signalled_by_kill(self):
+        sub, child = self.spawn_subagent()
+        os.killpg(child["pid"], signal.SIGKILL)
+        stranger = self.decoy()
+        with open(os.path.join(sub["meta"]["child_dir"], J.SUBAGENT_CHILD_FILE), "w") as fh:
+            json.dump({"pid": stranger.pid, "pid_start": "Thu Jan  1 00:00:00 1970"}, fh)
+        self.store.kill("scout")
+        self.assertIsNone(stranger.poll(), "kill signalled a stranger holding the child's old pid")
+        self.assertIn("different process", self.store._read("scout")["reason"])
+
+
+class TestMaxRuntimeOnUnreadJobs(SessionTreeBase):
+    """The audit's claim, confirmed: max_runtime was enforced only when something read the job."""
+
+    def test_the_scheduler_enforces_max_runtime_on_a_job_nobody_reads(self):
+        rec = self.submit(self.store, "forgotten", max_runtime=1)
+        time.sleep(1.5)
+        self.assertTrue(alive(rec), "nothing read the record, so nothing should have stopped it yet")
+        self.assertEqual(J.JobStore(self.job_dir, emit=lambda m: None)._read("forgotten")["state"], "running")
+        S.scan_once(self.sessions, log=lambda m: None)
+        self.assertEqual(self.store._read("forgotten")["state"], "deadline")
+        self.assertTrue(wait_until(lambda: not alive(rec), timeout=5))
+
+    def test_it_reaches_the_jobs_of_a_subagent_too(self):
+        sub, _ = self.spawn_subagent()
+        sub_store = J.JobStore(os.path.join(sub["meta"]["child_dir"], "jobs"), emit=lambda m: None)
+        rec = self.submit(sub_store, "forgotten", max_runtime=1)
+        time.sleep(1.5)
+        S.scan_once(self.sessions, log=lambda m: None)
+        self.assertEqual(sub_store._read("forgotten")["state"], "deadline")
+        self.assertTrue(wait_until(lambda: not alive(rec), timeout=5))
+
+
+class TestSessionDeadlineForReal(SessionTreeBase):
+    """
+    A real scheduler, the real supervisor and a stand-in harness. The deadline bounds
+    a turn that would otherwise hang, the session ends, and the job that turn left
+    behind is reaped.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.log = os.path.join(self.root, "harness.log")
+        self.script = os.path.join(self.root, "harness.py")
+        with open(self.script, "w") as fh:
+            fh.write(DEADLINE_HARNESS)
+        self.procs = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+        for run in self.runs():
+            try:
+                os.kill(run["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+        super().tearDown()
+
+    def configure(self, mode, **fields):
+        self.write_spec(dict({"argv": [sys.executable, self.script, HERE, self.log, mode],
+                              "cwd": self.session}, **fields))
+
+    def runs(self):
+        try:
+            with open(self.log) as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        except OSError:
+            return []
+
+    def scheduler(self, **env):
+        proc = subprocess.Popen([sys.executable, SCHEDULER, self.sessions, "--interval", "0.1"],
+                                cwd=HERE, env=dict(os.environ, HARNESS_SUPERVISE_POLL_SECONDS="0.1",
+                                                   HARNESS_TURN_KILL_GRACE_SECONDS="1",
+                                                   HARNESS_REAP_GRACE_SECONDS="1", **env),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        self.procs.append(proc)
+        return proc
+
+    def test_a_hung_turn_is_stopped_at_the_grace_and_its_work_reaped(self):
+        self.configure("hang", deadline=time.time() + 1, deadline_grace_s=1)
+        S.post_user_message(self.session, "start the work")
+        self.scheduler()
+        self.assertTrue(wait_until(lambda: (S.read_end(self.session) or {}).get("state") == "ended",
+                                   timeout=30), f"the session never ended: {S.read_end(self.session)}")
+        runs = self.runs()
+        self.assertEqual(len(runs), 1, "a wrap-up was forced on a turn that spanned the deadline")
+        self.assertTrue(wait_until(lambda: J._real_probe(runs[0]["pid"])[0] == "dead", timeout=5),
+                        "the hung harness survived the deadline")
+        with open(os.path.join(self.session, S.TURN_FILE + ".last")) as fh:
+            last = json.load(fh)
+        self.assertIn("deadline", last["stopped"]["reason"])
+        work = self.store._read("work")
+        self.assertEqual(work["state"], "killed")
+        self.assertFalse(alive(work))
+
+    def test_a_waiting_session_is_woken_once_to_wrap_up_then_reaped(self):
+        self.configure("return", deadline=time.time() + 1)
+        self.submit(self.store, "work")
+        with open(os.path.join(self.session, S.WAKE_FILE), "w") as fh:
+            json.dump({"wake_at": time.time() + 9999, "watch": []}, fh)
+        self.scheduler()
+        self.assertTrue(wait_until(lambda: (S.read_end(self.session) or {}).get("state") == "ended",
+                                   timeout=30), f"the session never ended: {S.read_end(self.session)}")
+        time.sleep(0.5)
+        runs = self.runs()
+        self.assertEqual(len(runs), 1)
+        self.assertIn(S.WRAPUP_REASON, runs[0]["message"])
+        self.assertIn("this is the last turn", runs[0]["message"])
+        self.assertEqual(self.store._read("work")["state"], "killed")
+
+
 if __name__ == "__main__":
     unittest.main()

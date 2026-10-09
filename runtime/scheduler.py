@@ -14,7 +14,10 @@ A SESSION is a directory:
       session.json   how to invoke the harness: {"argv": [...], "cwd", "env"}
                      — written once by whoever creates the session. Optional
                      "transcript_dir" names where the harness keeps its session
-                     JSONL when it is not prime's default (see _transcript_dirs)
+                     JSONL when it is not prime's default (see _transcript_dirs).
+                     Optional end controls (see "the end of a session"):
+                     "deadline" (absolute epoch seconds), "deadline_grace_s"
+                     (default 300), "end_when_idle" (default false), "reap_grace_s"
       wake.json      the pending wake, written by the RUNTIME (jobs.wait) when a
                      turn ends waiting: {"wake_at": <epoch>, "watch": [names]}
                      — absence means the session is not waiting on anything
@@ -23,6 +26,8 @@ A SESSION is a directory:
       turn.json      the turn in flight (see "two-phase delivery" below)
       jobs/          the session's HARNESS_JOB_DIR
       lease/         single-writer lock while a harness is running
+      end.json       the session is ending/ended: how, why, what was settled
+      reap.json      evidence of every process the end signalled (or would not)
 
 The loop: a session wakes when its deadline passes OR any watched job stops
 being live — whichever comes first, exactly the `wake_after` contract. The
@@ -187,7 +192,10 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     one is re-woken, and one still in flight is a reason to try the lease, which
     the live turn's processes refuse. Otherwise a missing/unreadable wake.json is
     "not waiting", never a wake, and a present one is judged by `reason_for`.
+    A session that is ending or has ended (end.json) is never woken this way.
     """
+    if os.path.exists(os.path.join(session_dir, END_FILE)):
+        return None
     turn = _turn_reason(session_dir)
     users = pending_user_messages(session_dir)
     if users:
@@ -420,17 +428,21 @@ def _move_message(path: str, src_suffix: str, dst_suffix: str) -> None:
         pass
 
 
-def wake_message(reason: str, user_messages: Sequence[dict] = (), cancelled_wait: bool = False) -> str:
+def wake_message(reason: str, user_messages: Sequence[dict] = (), cancelled_wait: bool = False,
+                 closing: bool = False) -> str:
     """
     The opening message of a woken turn: why it started, then anything said to it.
 
     One format for every host that wakes a session — the scheduler, print mode's own
     wake, and RPC hosts that want to match — so a transcript reads the same
-    whichever woke it.
+    whichever woke it. `closing` is the session's last turn (its deadline): it says so
+    instead of "continue the task".
     """
     if not user_messages:
-        return f"[woken: {reason}] Check your jobs and continue the task."
+        return f"[woken: {reason}] {CLOSING_INSTRUCTION if closing else 'Check your jobs and continue the task.'}"
     lines = [f"[woken: {reason}]"]
+    if closing:
+        lines.append(f"[{CLOSING_INSTRUCTION}]")
     ids = [str(m["id"]) for m in user_messages if m.get("id")]
     if ids:
         # The ids are how a crash recovery tells, from the transcript, whether
@@ -778,7 +790,7 @@ def _spawn_supervised(argv: List[str], cwd: str, env: dict, session_dir: str) ->
     return proc.wait()
 
 
-def run_wake(session_dir: str, reason: str, *, runner=None) -> int:
+def run_wake(session_dir: str, reason: str, *, runner=None, closing: bool = False) -> int:
     """
     Invoke the session's harness once, to exit — with two-phase delivery.
 
@@ -829,7 +841,7 @@ def run_wake(session_dir: str, reason: str, *, runner=None) -> int:
     for msg in users:
         _move_message(msg["path"], "", ".delivering")
 
-    message = wake_message(reason, users, cancelled_wait=was_waiting and bool(users))
+    message = wake_message(reason, users, cancelled_wait=was_waiting and bool(users), closing=closing)
     argv = [sys.executable, os.path.abspath(__file__), "--supervise-turn", turn_path, run_id,
             "--", *spec["argv"], message]
     env = _turn_env(session_dir, spec)
@@ -844,6 +856,261 @@ def run_wake(session_dir: str, reason: str, *, runner=None) -> int:
     return code
 
 
+# -- the end of a session -------------------------------------------------------------
+#
+# A session ENDS — once, for good — in one of three ways:
+#
+#   deadline   session.json's "deadline" (absolute epoch seconds) passed. The agent is
+#              woken ONCE more to wrap up, and the session ends when that turn returns.
+#              A turn already in flight at the deadline is the last one instead: it is
+#              not interrupted with a wrap-up it could not receive, only bounded.
+#   explicit   the host asked: end_session() / `scheduler.py --end <session-dir>`.
+#   idle       opt-in, "end_when_idle": true — a turn returned without waiting and
+#              nothing is pending. Off by default on purpose: a session that is not
+#              waiting is still resumable by a user message, and a benchmark grades
+#              the server a finished agent deliberately left running. HOSTED-RUNTIME's
+#              "terminate and reap when the final message is a terminal answer" keys
+#              on a judgement the runtime cannot make from disk; a host that knows its
+#              sessions are one-shot says so here.
+#
+# Ending writes end.json, settles anything left in flight (a fired wake, undelivered
+# messages, a crashed turn — renamed, never deleted), and reaps the tree: every job and
+# subagent process group the session's job dir owns, SIGTERM then SIGKILL, each pid
+# vouched for by its start identity (jobs._reap). reap.json is the evidence. Every step
+# is a rename or a re-checkable signal, so a finalize SIGKILLed anywhere is finished by
+# the next scheduler to hold the lease. An ended session is never woken again.
+#
+# ABANDONMENT (MAX_CRASH_RECOVERIES crashed turns, or MAX_SPAWN_FAILURES failed spawns,
+# in a row) reaps the tree the same way but does NOT end the session: no agent is left
+# to care about what it started, yet a new message is a new conversation and still
+# wakes it (#24's contract). The reap is owed until turn.json.abandoned says
+# "reaped_at", so a scheduler killed between the abandonment and the reap still does it.
+#
+# Every turn is also bounded by the session's end: the turn supervisor stops its harness
+# (SIGTERM, then SIGKILL) at deadline + deadline_grace_s, or an explicit end's
+# requested_at + deadline_grace_s. Nothing of a session outlives its deadline by more
+# than the grace, a scan interval and the kill grace.
+
+END_FILE = "end.json"
+REAP_FILE = "reap.json"
+DEFAULT_DEADLINE_GRACE_SECONDS = 300.0
+WRAPUP_REASON = "session deadline reached — finish up; this is the last turn"
+CLOSING_INSTRUCTION = (
+    "Wrap up now: say what is done and what is not. The session ends when this turn "
+    "does, and any job or subagent still running is stopped."
+)
+SUPERVISE_POLL_SECONDS = float(os.environ.get("HARNESS_SUPERVISE_POLL_SECONDS", "0.5"))
+TURN_KILL_GRACE_SECONDS = float(os.environ.get("HARNESS_TURN_KILL_GRACE_SECONDS", "10"))
+
+
+def _read_json_file(path: str) -> Optional[dict]:
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_spec(session_dir: str) -> dict:
+    return _read_json_file(os.path.join(session_dir, SESSION_FILE)) or {}
+
+
+def session_deadline(spec: dict) -> Optional[float]:
+    try:
+        return float(spec["deadline"]) if spec.get("deadline") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def deadline_grace(spec: dict) -> float:
+    try:
+        return float(spec.get("deadline_grace_s", DEFAULT_DEADLINE_GRACE_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_DEADLINE_GRACE_SECONDS
+
+
+def read_end(session_dir: str) -> Optional[dict]:
+    return _read_json_file(os.path.join(session_dir, END_FILE))
+
+
+def is_ended(session_dir: str) -> bool:
+    return (read_end(session_dir) or {}).get("state") == "ended"
+
+
+def request_end(session_dir: str, kind: str, reason: str, state: str = "requested") -> dict:
+    """Record that the session is ending. The first decision stands: never overwritten."""
+    existing = read_end(session_dir)
+    if existing:
+        return existing
+    end = {"kind": kind, "reason": reason, "state": state, "requested_at": time.time()}
+    _write_json(os.path.join(session_dir, END_FILE), end)
+    return end
+
+
+def end_session(session_dir: str, reason: str = "ended by its host") -> dict:
+    """Ask for the session to end. The scheduler finalizes it as soon as no turn is live,
+    and a live turn is stopped by its supervisor deadline_grace_s after this."""
+    return request_end(session_dir, "explicit", reason)
+
+
+def _last_turn_spans(session_dir: str, deadline: float) -> bool:
+    """Was a turn in flight at the deadline — started before it, and ended (or died) after?"""
+    turn = _read_turn(session_dir)
+    if turn and turn.get("state") != "spawn-failed":
+        # Still recorded: in flight, or crashed and owed a re-wake. A crash is dated by
+        # the recovery that found it; a turn still in flight has not ended at all.
+        started = float((turn.get("crashed") or turn).get("started_at") or 0)
+        ended = turn.get("recovered_at") if turn.get("state") == "interrupted" else None
+        if started and started < deadline and (ended is None or float(ended) >= deadline):
+            return True
+    last = _read_json_file(_turn_path(session_dir) + ".last")
+    if last and last.get("state") != "never-started":
+        return float(last.get("started_at") or 0) < deadline <= float(last.get("ended_at") or 0)
+    return False
+
+
+def _is_idle(session_dir: str) -> bool:
+    return (not os.path.exists(os.path.join(session_dir, WAKE_FILE))
+            and not os.path.exists(_turn_path(session_dir))
+            and not pending_user_messages(session_dir)
+            and os.path.exists(_turn_path(session_dir) + ".last"))
+
+
+def end_due(session_dir: str, now: Callable[[], float] = time.time) -> Optional[tuple]:
+    """
+    ("end", kind, reason) when the session must be finalized now, ("wrapup", "deadline",
+    reason) when it is owed its one wrap-up turn first, or None. Derived from disk only.
+    A live turn is not judged here: the lease keeps the scheduler away from it, and its
+    supervisor bounds it.
+    """
+    end = read_end(session_dir)
+    if end:
+        if end.get("state") == "ended":
+            return None
+        return ("end", end.get("kind"), end.get("reason"))
+    spec = _read_spec(session_dir)
+    deadline = session_deadline(spec)
+    if deadline is not None and now() >= deadline:
+        if _last_turn_spans(session_dir, deadline):
+            return ("end", "deadline", "the deadline passed during a turn; that turn was the last")
+        if now() >= deadline + deadline_grace(spec):
+            return ("end", "deadline", "the deadline and its grace passed before a wrap-up turn could run")
+        return ("wrapup", "deadline", WRAPUP_REASON)
+    if spec.get("end_when_idle") and _is_idle(session_dir):
+        return ("end", "idle", "the agent ended its turn without waiting for anything")
+    return None
+
+
+def turn_hard_stop(session_dir: str) -> Optional[tuple]:
+    """(epoch, why) at which a turn of this session must be stopped, or None."""
+    spec = _read_spec(session_dir)
+    grace = deadline_grace(spec)
+    stops = []
+    deadline = session_deadline(spec)
+    if deadline is not None:
+        stops.append((deadline + grace, f"the session deadline passed and its {int(grace)}s grace ran out"))
+    end = read_end(session_dir)
+    if end and end.get("kind") != "deadline" and end.get("state") != "ended":
+        stops.append((float(end.get("requested_at") or 0) + grace,
+                      f"the session was ended ({end.get('reason')}) and its {int(grace)}s grace ran out"))
+    return min(stops) if stops else None
+
+
+def _settle_for_end(session_dir: str) -> List[str]:
+    """
+    Nothing pending may survive the end: a crashed turn's record, a wake, messages
+    nobody will read. Each is RENAMED to say so — evidence, never deleted.
+    """
+    notes = []
+    turn = _read_turn(session_dir)
+    if turn:
+        turn.update(ended_session=True, settled_at=time.time())
+        _write_json(_turn_path(session_dir) + ".ended", turn)
+        os.remove(_turn_path(session_dir))
+        notes.append(f"turn {turn.get('run_id')} ({turn.get('state')}) will not be re-run")
+    wake = os.path.join(session_dir, WAKE_FILE)
+    if os.path.exists(wake):
+        os.replace(wake, f"{wake}.ended")
+        notes.append("its pending wait was dropped")
+    box = os.path.join(session_dir, INBOX_DIR)
+    try:
+        names = sorted(os.listdir(box))
+    except OSError:
+        names = []
+    for name in names:
+        for suffix in (".json", ".json.delivering"):
+            if name.endswith(suffix) and not name.startswith("."):
+                _move_message(os.path.join(box, name[: -len(suffix)] + ".json"),
+                              suffix[len(".json"):], ".undelivered")
+                notes.append(f"message {name} was not delivered")
+    return notes
+
+
+def finalize_session(session_dir: str, kind: str, reason: str, *, probe=None,
+                     log: Callable[[str], None] = print) -> dict:
+    """
+    End the session: settle what is pending, reap its process tree, record it all.
+    Call only under the lease. Idempotent — an ended session is returned as is, and
+    one whose finalize was interrupted is finished from where the disk says it got.
+    """
+    end = read_end(session_dir) or {}
+    if end.get("state") == "ended":
+        return end
+    end.setdefault("kind", kind)
+    end.setdefault("reason", reason)
+    end.setdefault("requested_at", time.time())
+    end.update(state="reaping", finalize_attempts=int(end.get("finalize_attempts") or 0) + 1)
+    end_path = os.path.join(session_dir, END_FILE)
+    _write_json(end_path, end)
+    _recover_turn(session_dir, log)
+    settled = _settle_for_end(session_dir)
+    spec = _read_spec(session_dir)
+    run = J._reap(_job_dir(session_dir), reason=f"the session ended ({end['kind']}: {end['reason']})",
+                 evidence_path=os.path.join(session_dir, REAP_FILE), probe=probe,
+                 grace=spec.get("reap_grace_s"))
+    end.update(state="ended", ended_at=time.time(), settled=end.get("settled", []) + settled,
+               reaped=run["summary"], closed_jobs=run["closed"])
+    _write_json(end_path, end)
+    log(f"[scheduler] {os.path.basename(session_dir)}: ended ({end['kind']}: {end['reason']}); "
+        f"reaped {run['summary'] or 'nothing'}")
+    return end
+
+
+def _owed_abandonment_reap(session_dir: str) -> Optional[dict]:
+    abandoned = _read_json_file(_turn_path(session_dir) + ".abandoned")
+    if abandoned and not abandoned.get("reaped_at"):
+        return abandoned
+    return None
+
+
+def _reap_if_abandoned(session_dir: str, *, probe=None, log: Callable[[str], None] = print) -> None:
+    """Under the lease: an abandoned session's tree is reaped once; the session stays open."""
+    abandoned = _owed_abandonment_reap(session_dir)
+    if not abandoned:
+        return
+    why = ("its harness kept failing to start"
+           if int(abandoned.get("spawn_failures") or 0) >= MAX_SPAWN_FAILURES
+           else "its turns kept crashing")
+    run = J._reap(_job_dir(session_dir), reason=f"the session was abandoned ({why})",
+                  evidence_path=os.path.join(session_dir, REAP_FILE), probe=probe,
+                  grace=_read_spec(session_dir).get("reap_grace_s"))
+    abandoned.update(reaped_at=time.time(), reaped=run["summary"])
+    _write_json(_turn_path(session_dir) + ".abandoned", abandoned)
+    log(f"[scheduler] {os.path.basename(session_dir)}: abandoned; reaped {run['summary'] or 'nothing'}")
+
+
+def enforce_job_limits(session_dir: str, probe=None) -> None:
+    """
+    Refresh every job record the session owns, its subagents' included. A record is
+    only judged when something reads it, so a job nobody waits on or lists ran past its
+    max_runtime for as long as nobody looked; the scheduler looks every scan.
+    """
+    job_dir = _job_dir(session_dir)
+    if os.path.isdir(job_dir):
+        J._refresh_tree(job_dir, probe=probe)
+
+
 def scan_once(sessions_root: str, *, now=time.time, runner=None,
               probe=None, log: Callable[[str], None] = print) -> List[str]:
     """One pass over every session; returns the names of sessions woken."""
@@ -854,10 +1121,11 @@ def scan_once(sessions_root: str, *, now=time.time, runner=None,
         return woken
     for name in entries:
         session_dir = os.path.join(sessions_root, name)
-        if not os.path.isfile(os.path.join(session_dir, SESSION_FILE)):
+        if not os.path.isfile(os.path.join(session_dir, SESSION_FILE)) or is_ended(session_dir):
             continue
-        reason = wake_reason(session_dir, now)
-        if not reason:
+        enforce_job_limits(session_dir, probe)
+        if (not end_due(session_dir, now) and not wake_reason(session_dir, now)
+                and not _owed_abandonment_reap(session_dir)):
             continue
         lease = acquire_lease(session_dir, probe)
         if lease is None:
@@ -870,23 +1138,61 @@ def scan_once(sessions_root: str, *, now=time.time, runner=None,
             settled = _recover_turn(session_dir, log)
             if settled:
                 log(f"[scheduler] {name}: {settled}")
-            # Re-derive under the lease: the world may have moved between the
-            # unlocked check and now, and a consumed wake must not re-fire.
-            reason = wake_reason(session_dir, now)
-            if not reason:
-                continue
-            log(f"[scheduler] waking {name}: {reason}")
-            consume_messages(session_dir)
-            try:
-                code = run_wake(session_dir, reason, runner=runner)
-            except Exception as error:  # noqa: BLE001 - any spawn failure is bounded the same way
-                _record_spawn_failure(session_dir, error, log)
-                continue
-            log(f"[scheduler] {name} exited {code}")
-            woken.append(name)
+            _reap_if_abandoned(session_dir, probe=probe, log=log)
+            if _serve_session(session_dir, now=now, runner=runner, log=log):
+                woken.append(name)
+            _reap_if_abandoned(session_dir, probe=probe, log=log)
+            due = end_due(session_dir, now)
+            if due and due[0] == "end":
+                finalize_session(session_dir, due[1], due[2], probe=probe, log=log)
         finally:
             release_lease(lease)
     return woken
+
+
+def _serve_session(session_dir: str, *, now, runner, log: Callable[[str], None]) -> bool:
+    """
+    Under the lease: run the one turn this session is owed, if any — its wrap-up turn
+    when the deadline has passed, else the ordinary wake. True when a harness ran.
+    Re-derived here: the world may have moved since the unlocked check, and a
+    consumed wake must not re-fire.
+    """
+    name = os.path.basename(session_dir)
+    due = end_due(session_dir, now)
+    if due and due[0] == "end":
+        return False
+    closing = bool(due)
+    if closing:
+        # Recorded before the run, so the wrap-up is owed once: a scheduler that dies
+        # during it leaves a session that is finalized, not woken again.
+        request_end(session_dir, due[1], due[2], state="wrapping-up")
+        reason = due[2]
+    else:
+        reason = wake_reason(session_dir, now)
+        if not reason:
+            return False
+    log(f"[scheduler] waking {name}: {reason}")
+    consume_messages(session_dir)
+    try:
+        code = run_wake(session_dir, reason, runner=runner, closing=closing)
+    except Exception as error:  # noqa: BLE001 - any spawn failure is bounded the same way
+        _record_spawn_failure(session_dir, error, log)
+        return False
+    log(f"[scheduler] {name} exited {code}")
+    return True
+
+
+def _has_pending(session_dir: str, now: Callable[[], float] = time.time) -> bool:
+    """Is there anything left for a scheduler to do here — a wait, a turn, a message, an end?"""
+    if is_ended(session_dir):
+        return False
+    return bool(
+        os.path.exists(os.path.join(session_dir, WAKE_FILE))
+        or os.path.exists(os.path.join(session_dir, TURN_FILE))
+        or os.path.exists(os.path.join(session_dir, END_FILE))
+        or pending_user_messages(session_dir)
+        or end_due(session_dir, now)
+    )
 
 
 def drain(sessions_root: str, *, interval: float = 5.0, deadline: Optional[float] = None,
@@ -896,16 +1202,15 @@ def drain(sessions_root: str, *, interval: float = 5.0, deadline: Optional[float
     finite run (one terminal-bench task) wants. Returns False on deadline.
     A session whose harness writes a new wake.json keeps the drain alive, and so
     does a turn.json: a crashed turn owed a re-wake, or an orphaned one (its
-    scheduler died) still running.
+    scheduler died) still running. So does an end in progress; an ended session
+    is done whatever its inbox holds.
     """
     started = now()
     while True:
         scan_once(sessions_root, now=now, runner=runner, log=log)
         pending = [
             n for n in (os.listdir(sessions_root) if os.path.isdir(sessions_root) else [])
-            if os.path.exists(os.path.join(sessions_root, n, WAKE_FILE))
-            or os.path.exists(os.path.join(sessions_root, n, TURN_FILE))
-            or pending_user_messages(os.path.join(sessions_root, n))
+            if _has_pending(os.path.join(sessions_root, n), now)
         ]
         if not pending:
             log("[scheduler] nothing left waiting; drained")
@@ -975,6 +1280,11 @@ def _supervise_turn(turn_path: str, run_id: str, argv: List[str]) -> int:
 
     Stays in the scheduler's process group: killing the group (Ctrl-C, a
     supervisor's killpg) stops the turn with it, which recovery then handles.
+
+    It also bounds the turn by the session's end (turn_hard_stop): past the deadline's
+    grace, or an explicit end's, the harness is stopped — SIGTERM, then SIGKILL after
+    TURN_KILL_GRACE_SECONDS — and turn.json says why. That holds for an orphaned turn
+    too, whose scheduler is not there to do it.
     """
     if not _update_turn(turn_path, run_id, state="launching", supervisor=_self_identity()):
         # The run was settled without us — our scheduler died before we got here
@@ -994,9 +1304,45 @@ def _supervise_turn(turn_path: str, run_id: str, argv: List[str]) -> int:
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the child gets the terminal's own
     _update_turn(turn_path, run_id, state="running",
                  child={"pid": child.pid, "pid_start": J._real_probe(child.pid)[1]})
-    code = child.wait()
+    code = _wait_bounded(child, turn_path, run_id)
     _update_turn(turn_path, run_id, state="exited", exit_code=code, ended_at=time.time())
     return code if code >= 0 else 128 - code
+
+
+def _wait_bounded(child: "subprocess.Popen", turn_path: str, run_id: str) -> int:
+    """The child's exit code — or, past the session's hard stop, the code it was stopped with."""
+    session_dir = os.path.dirname(os.path.abspath(turn_path))
+    while True:
+        try:
+            return child.wait(timeout=SUPERVISE_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        stop = turn_hard_stop(session_dir)
+        if stop and time.time() >= stop[0]:
+            _update_turn(turn_path, run_id, stopped={"reason": stop[1], "at": time.time()})
+            child.terminate()
+            try:
+                return child.wait(timeout=TURN_KILL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                return child.wait()
+
+
+def _end_cli(session_dir: str, reason: str) -> None:
+    """
+    `scheduler.py --end <session-dir> [reason...]`: ask for the session to end, and end
+    it now if no turn holds it (else its supervisor stops the turn after the grace and
+    the next scan finishes the job). Prints end.json.
+    """
+    end_session(session_dir, reason)
+    lease = acquire_lease(session_dir)
+    if lease is not None:
+        try:
+            end = read_end(session_dir) or {}
+            finalize_session(session_dir, end.get("kind") or "explicit", end.get("reason") or reason)
+        finally:
+            release_lease(lease)
+    print(json.dumps(read_end(session_dir)))
 
 
 if __name__ == "__main__":
@@ -1010,6 +1356,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if "--user-wake" in _sys.argv:
         _user_wake_cli()
+        raise SystemExit(0)
+    if len(_sys.argv) > 2 and _sys.argv[1] == "--end":
+        _end_cli(_sys.argv[2], " ".join(_sys.argv[3:]) or "ended by its host")
         raise SystemExit(0)
 
     ap = argparse.ArgumentParser(description="wake scheduler over a sessions root")

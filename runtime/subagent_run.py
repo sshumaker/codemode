@@ -64,6 +64,38 @@ from agent_mailbox import Mailbox
 EXIT_TIMEOUT = 124
 EXIT_CAPPED = 3
 EXIT_LAUNCH_FAILED = 127
+EXIT_TERMINATED = 143
+
+# Read by jobs.subagent_child: the prime child is in a session of its own, so this
+# file is the only way anything but this process can find it to stop it.
+CHILD_FILE = "child.json"
+
+
+def _start_identity(pid: int) -> "str | None":
+    """jobs._real_probe's start identity, without importing jobs when it is not staged here."""
+    try:
+        from jobs import _real_probe
+    except ImportError:
+        try:
+            out = subprocess.run(["ps", "-p", str(pid), "-o", "state=,lstart="],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            return None
+        return out.partition(" ")[2].strip() or None
+    return _real_probe(pid)[1]
+
+
+def _record_child(child_dir: str, pid: int) -> None:
+    path = os.path.join(child_dir, CHILD_FILE)
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"pid": pid, "pid_start": _start_identity(pid), "launcher": os.getpid(),
+                       "at": time.time()}, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _emit(f"[subagent] could not record the child's identity ({exc}); "
+              "killing this job will not reach it")
 
 
 def _emit(line: str) -> None:
@@ -436,6 +468,7 @@ def main(argv: list) -> int:
         _emit(f"[subagent {name}] argv was: {spec['argv'][:2]}")
         return finish(EXIT_LAUNCH_FAILED)
 
+    _record_child(spec["child_dir"], child.pid)
     driver = RpcChild(child, Mailbox(spec["child_dir"]), name) if rpc else None
     if driver is not None:
         driver.start(spec["prompt"])
@@ -455,6 +488,14 @@ def main(argv: list) -> int:
         # Killing the child closes the pipe, so the read loop below ends on its own
         # — no exception has to be raised through it.
         kill_child(f"timeout after {spec['timeout']}s")
+
+    def on_term(signum, frame):
+        # A reaper's SIGTERM (the session ended) or a supervisor's: take the child
+        # with us, then fall out of the read loop and still write result and meta.
+        kill_child(f"terminated by {signal.Signals(signum).name}")
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_term)
 
     if spec.get("timeout"):
         try:
@@ -514,6 +555,8 @@ def main(argv: list) -> int:
 
     if stopped and "timeout" in stopped:
         return finish(EXIT_TIMEOUT)
+    if stopped and stopped.startswith("terminated"):
+        return finish(EXIT_TERMINATED)
     if stopped:
         return finish(EXIT_CAPPED)
     return finish(code)

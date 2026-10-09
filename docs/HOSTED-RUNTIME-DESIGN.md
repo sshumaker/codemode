@@ -522,6 +522,19 @@ Edge: the agent may stop because it is **finished** and doesn't care about a job
 it left running. Suspend only when its final message isn't a terminal answer;
 otherwise terminate and reap the tree.
 
+> **As built (`runtime/scheduler.py`, "the end of a session").** "Is this a terminal
+> answer?" is not decidable from disk, so the runtime does not guess. A session
+> **ends** on its `deadline` (one wrap-up wake, then the end), on an explicit
+> `end_session()` / `scheduler.py --end`, or — opt-in, `"end_when_idle": true` —
+> when a turn returns without waiting. Idle is not an end by default: a session that
+> stopped waiting is still resumable by a user message, and a benchmark grades the
+> server a finished agent deliberately left running. Ending reaps the tree with
+> `jobs._reap`: every job's process group and every subagent's prime child (its own
+> session) and their jobs, SIGTERM then SIGKILL, each pid vouched for by its start
+> identity, evidence in `reap.json`. Abandonment (#24's crash/spawn bounds) reaps the
+> tree too but leaves the session open to a new message. `jobs.kill` on a subagent
+> now reaches its prime child and the child's jobs, not only the launcher.
+
 ### Where the timeouts live
 
 §5's split, kept intact:

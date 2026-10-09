@@ -547,5 +547,194 @@ class TestTranscriptLocation(unittest.TestCase):
         self.assertEqual(S._transcript_dirs({"argv": argv, "transcript_dir": "/t"}, {}), ["/t"])
 
 
+class EndBase(TurnBase):
+    """Session-end tests run on the real clock: run_wake stamps turns with time.time()."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = time.time()
+
+    def clock(self):
+        return time.time()
+
+    def configure(self, d, **fields):
+        with open(os.path.join(d, S.SESSION_FILE)) as fh:
+            spec = json.load(fh)
+        spec.update(fields)
+        with open(os.path.join(d, S.SESSION_FILE), "w") as fh:
+            json.dump(spec, fh)
+
+    def end(self, d):
+        return S.read_end(d) or {}
+
+
+class TestSessionDeadline(EndBase):
+    """Fix B: a session.json deadline wakes the agent ONCE to wrap up, then ends it."""
+
+    def test_the_deadline_wakes_the_agent_once_to_wrap_up_then_ends_it(self):
+        d = self.session("a", wake_at=time.time() + 9999)
+        self.configure(d, deadline=time.time() - 1)
+        self.assertEqual(self.scan(), ["a"])
+        opening = self.runs[0]["argv"][-1]
+        self.assertTrue(opening.startswith(f"[woken: {S.WRAPUP_REASON}] {S.CLOSING_INSTRUCTION}"), opening)
+        end = self.end(d)
+        self.assertEqual((end["state"], end["kind"]), ("ended", "deadline"))
+        self.assertTrue(os.path.exists(os.path.join(d, S.REAP_FILE)), "no reap evidence")
+        self.assertFalse(os.path.exists(os.path.join(d, S.WAKE_FILE)), "the wait outlived the session")
+        for _ in range(3):
+            self.assertEqual(self.scan(), [])
+        self.assertEqual(len(self.runs), 1, "woken more than once for the deadline")
+
+    def test_the_wrap_up_carries_the_messages_that_were_waiting(self):
+        d = self.session("a")
+        self.configure(d, deadline=time.time() - 1)
+        S.post_user_message(d, "how far did you get?")
+        self.assertEqual(self.scan(), ["a"])
+        opening = self.runs[0]["argv"][-1]
+        self.assertIn(S.WRAPUP_REASON, opening)
+        self.assertIn(S.CLOSING_INSTRUCTION, opening)
+        self.assertIn("how far did you get?", opening)
+        self.assertTrue(self.inbox(d)[0].endswith(".json.delivered"), self.inbox(d))
+
+    def test_a_turn_in_flight_at_the_deadline_is_the_last_one(self):
+        d = self.session("a", wake_at=0)
+        self.configure(d, deadline=time.time() + 0.3)
+
+        def slow(argv, cwd=None, env=None):
+            self.runs.append({"argv": argv})
+            time.sleep(0.6)
+            return subprocess.CompletedProcess(argv, 0)
+
+        self.assertEqual(self.scan(slow), ["a"])
+        self.assertNotIn(S.WRAPUP_REASON, self.runs[0]["argv"][-1])
+        end = self.end(d)
+        self.assertEqual(end["state"], "ended")
+        self.assertIn("during a turn", end["reason"])
+        self.assertEqual(self.scan(), [])
+        self.assertEqual(len(self.runs), 1, "a wrap-up was forced on a session whose last turn spanned the deadline")
+
+    def test_past_the_grace_the_session_ends_without_a_wrap_up(self):
+        d = self.session("a", wake_at=0)
+        self.configure(d, deadline=time.time() - 50, deadline_grace_s=10)
+        self.assertEqual(self.scan(), [])
+        self.assertEqual(self.runs, [])
+        self.assertIn("grace passed", self.end(d)["reason"])
+
+    def test_a_future_deadline_changes_nothing(self):
+        d = self.session("a", wake_at=0)
+        self.configure(d, deadline=time.time() + 9999)
+        self.assertEqual(self.scan(), ["a"])
+        self.assertNotIn(S.WRAPUP_REASON, self.runs[0]["argv"][-1])
+        self.assertIsNone(S.read_end(d))
+
+    def test_a_scheduler_that_dies_in_the_wrap_up_ends_the_session_instead_of_rewaking(self):
+        d = self.session("a")
+        self.configure(d, deadline=time.time() - 1)
+        self.crash()
+        self.assertEqual(self.end(d)["state"], "wrapping-up")
+        self.assertEqual(self.scan(), [])
+        self.assertEqual(len(self.runs), 1, "the crashed wrap-up was re-woken")
+        self.assertEqual(self.end(d)["state"], "ended")
+        with open(os.path.join(d, S.TURN_FILE + ".ended")) as fh:
+            self.assertEqual(json.load(fh)["state"], "interrupted")
+
+    def test_an_ended_session_is_never_woken_and_never_holds_a_drain(self):
+        d = self.session("a")
+        self.configure(d, deadline=time.time() - 1)
+        self.scan()
+        S.post_user_message(d, "anyone there?")
+        self.assertIsNone(S.wake_reason(d))
+        self.assertEqual(self.scan(), [])
+        self.assertTrue(S.drain(self.root, interval=0.01, deadline=2, now=self.clock,
+                                runner=self.runner, log=lambda m: None))
+        self.assertEqual(len(self.runs), 1)
+
+    def test_a_drain_serves_a_deadline_that_passes_while_it_waits(self):
+        d = self.session("a", wake_at=time.time() + 9999)
+        self.configure(d, deadline=time.time() + 0.3)
+        self.assertTrue(S.drain(self.root, interval=0.05, deadline=10, now=self.clock,
+                                runner=self.runner, log=lambda m: None))
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn(S.WRAPUP_REASON, self.runs[0]["argv"][-1])
+        self.assertEqual(self.end(d)["state"], "ended")
+
+    def test_every_turn_is_bounded_by_the_deadline_and_its_grace(self):
+        d = self.session("a")
+        self.assertIsNone(S.turn_hard_stop(d))
+        self.configure(d, deadline=5000.0, deadline_grace_s=60)
+        self.assertEqual(S.turn_hard_stop(d)[0], 5060.0)
+        S.end_session(d, "operator")
+        with open(os.path.join(d, S.END_FILE)) as fh:
+            requested = json.load(fh)["requested_at"]
+        self.assertEqual(S.turn_hard_stop(d)[0], min(5060.0, requested + 60))
+
+
+class TestExplicitAndIdleEnd(EndBase):
+    def test_an_explicit_end_settles_everything_pending_without_deleting_it(self):
+        d = self.session("a", wake_at=time.time() + 9999)
+        S.post_user_message(d, "never read")
+        S.end_session(d, "the user closed the tab")
+        self.assertEqual(self.scan(), [])
+        self.assertEqual(self.runs, [])
+        end = self.end(d)
+        self.assertEqual((end["state"], end["kind"], end["reason"]), ("ended", "explicit", "the user closed the tab"))
+        self.assertTrue(os.path.exists(os.path.join(d, S.WAKE_FILE + ".ended")))
+        self.assertTrue(self.inbox(d)[0].endswith(".json.undelivered"), self.inbox(d))
+
+    def test_the_first_end_decision_stands(self):
+        d = self.session("a")
+        S.end_session(d, "first")
+        S.end_session(d, "second")
+        self.assertEqual(self.end(d)["reason"], "first")
+
+    def test_idle_is_not_an_end_unless_the_session_opts_in(self):
+        d = self.session("a", wake_at=0)
+        self.assertEqual(self.scan(), ["a"])
+        self.scan()
+        self.assertIsNone(S.read_end(d), "a session that stopped waiting was ended without opting in")
+
+    def test_end_when_idle_ends_after_a_turn_that_did_not_wait(self):
+        d = self.session("a", wake_at=0)
+        self.configure(d, end_when_idle=True)
+        self.assertEqual(self.scan(), ["a"])
+        end = self.end(d)
+        self.assertEqual((end["state"], end["kind"]), ("ended", "idle"))
+
+    def test_end_when_idle_leaves_a_session_that_waits_again_alone(self):
+        d = self.session("a", wake_at=0)
+        self.configure(d, end_when_idle=True)
+
+        def waits(argv, cwd=None, env=None):
+            self.runs.append({"argv": argv})
+            with open(env["HARNESS_WAKE_FILE"], "w") as fh:
+                json.dump({"wake_at": time.time() + 9999, "watch": []}, fh)
+            return subprocess.CompletedProcess(argv, 0)
+
+        self.assertEqual(self.scan(waits), ["a"])
+        self.assertIsNone(S.read_end(d))
+
+
+class TestAbandonmentReaps(EndBase):
+    def test_an_abandoned_session_is_reaped_once_but_still_answers_a_new_message(self):
+        d = self.session("a")
+        S.post_user_message(d, "never lands")
+        for _ in range(S.MAX_CRASH_RECOVERIES + 1):
+            self.crash()
+        self.scan()
+        with open(os.path.join(d, S.TURN_FILE + ".abandoned")) as fh:
+            abandoned = json.load(fh)
+        self.assertIn("reaped_at", abandoned)
+        with open(os.path.join(d, S.REAP_FILE)) as fh:
+            passes = json.load(fh)["passes"]
+        self.assertEqual(len(passes), 1)
+        self.assertIn("abandoned", passes[0]["reason"])
+        self.assertIsNone(S.read_end(d), "abandonment must not close the session")
+        self.scan()
+        with open(os.path.join(d, S.REAP_FILE)) as fh:
+            self.assertEqual(len(json.load(fh)["passes"]), 1, "reaped again for the same abandonment")
+        S.post_user_message(d, "try again")
+        self.assertEqual(self.scan(), ["a"])
+
+
 if __name__ == "__main__":
     unittest.main()

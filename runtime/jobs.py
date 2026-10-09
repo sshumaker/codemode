@@ -908,6 +908,58 @@ def _real_probe(pid: int):
     return ("alive", lstart.strip() or None)
 
 
+# Where a subagent's launcher records the prime child it started, inside the child's
+# own dir. The child runs in ITS OWN session (subagent_run.py, start_new_session), so
+# killing the launcher's process group never reaches it; this file is how anything
+# else — jobs.kill, max_runtime, the session reaper — finds it.
+SUBAGENT_CHILD_FILE = "child.json"
+# SIGTERM -> this long -> SIGKILL, when a session's tree is reaped.
+REAP_GRACE_SECONDS = float(os.environ.get("HARNESS_REAP_GRACE_SECONDS", "10"))
+
+
+def _vouch(probe: Callable[[int], tuple], pid: Optional[int], recorded: Optional[str]) -> Tuple[bool, str]:
+    """
+    (may this pid be signalled, why not). Strict: a record must carry the start
+    identity it was taken with, and the live process must still show it. A missing or
+    unreadable identity is "cannot vouch", never "probably fine" — a reused pid
+    signalled by mistake is an unrelated process group killed.
+    """
+    if not pid:
+        return False, "no pid recorded"
+    status, start = probe(pid)
+    if status == "dead":
+        return False, "already gone"
+    if not recorded:
+        return False, "no start identity was recorded, so it cannot be told from a reused pid; not signalled"
+    if not start:
+        return False, "its start identity could not be read; not signalled"
+    if start != recorded:
+        return False, "the pid now belongs to a different process; not signalled"
+    return True, ""
+
+
+def _subagent_child(rec: dict) -> Optional[dict]:
+    """The prime child a subagent's launcher recorded, or None."""
+    child_dir = (rec.get("meta") or {}).get("child_dir")
+    if rec.get("kind") != "subagent" or not child_dir:
+        return None
+    try:
+        with open(os.path.join(child_dir, SUBAGENT_CHILD_FILE)) as fh:
+            child = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return child if isinstance(child, dict) else None
+
+
+def _subagent_job_dir(rec: dict) -> Optional[str]:
+    """The subagent's own job dir (its kernel's jobs), when it is on this disk."""
+    child_dir = (rec.get("meta") or {}).get("child_dir")
+    if rec.get("kind") != "subagent" or not child_dir:
+        return None
+    path = os.path.join(child_dir, "jobs")
+    return path if os.path.isdir(path) else None
+
+
 class JobStore:
     """
     The whole surface. Clock, spawner and directory are injected so tests never
@@ -1339,11 +1391,48 @@ class JobStore:
             # Machine-readable: submit() refuses to reuse this name, because the
             # caveat above lives in a string nothing reads back (review, M5).
             rec["unconfirmed"] = True
+        if rec.get("kind") == "subagent":
+            reason += self._terminate_subagent_tree(rec)
         rec["state"] = state
         rec["reason"] = reason
         rec["finished_at"] = self._now()
         rec["output_tail"] = self._read_log(rec)[-4000:]
         self._write(rec)
+
+    def _terminate_subagent_tree(self, rec: dict) -> str:
+        """
+        The rest of a subagent: its prime child, and the jobs that child's kernel started.
+
+        Killing the job's process group reaches only the launcher. The child runs in a
+        session of its own (so a cap can kill it and its kernel together), and it exits
+        only on stdin EOF once idle — so it finished whatever turn it was in, spending
+        on, and its own jobs ran on after that. Returns what was done, for the reason.
+        """
+        notes = []
+        child = _subagent_child(rec)
+        if child:
+            ok, why = _vouch(self._probe, child.get("pid"), child.get("pid_start"))
+            if ok:
+                try:
+                    self._kill(child["pid"])
+                    notes.append(f"its agent process (pid {child['pid']}) was killed too")
+                except OSError:
+                    pass
+            elif why != "already gone":
+                notes.append(f"its agent process (pid {child.get('pid')}): {why}")
+        sub_dir = _subagent_job_dir(rec)
+        if sub_dir:
+            sub = JobStore(sub_dir, now=self._now, spawn=self._spawn, kill=self._kill,
+                           probe=self._probe, emit=lambda m: None)
+            stopped = []
+            for job in sub._all():
+                job = sub._refresh(job)
+                if job and job.get("state") in LIVE_STATES:
+                    sub._terminate(job, state="killed", reason="the subagent that started it was killed")
+                    stopped.append(job["name"])
+            if stopped:
+                notes.append(f"its own jobs were killed: {', '.join(stopped)}")
+        return "".join(f"; {n}" for n in notes)
 
     # -- surface ---------------------------------------------------------------
     def submit(
@@ -1856,6 +1945,255 @@ class JobStore:
                 bits.append(f"— {rec['reason']}")
             out.append("  ".join(bits))
         return "\n".join(out + external)
+
+
+# --------------------------------------------------------------------------------
+# reaping a whole tree: the session that owned it has ended
+# --------------------------------------------------------------------------------
+#
+# Every job is setsid-detached so it outlives the cell, the turn and the kernel. That
+# is the point while the session lives and a leak once it has ended: nothing else
+# ever stops them. `_reap` is the one place that does, for a job dir and everything
+# under it — each job's process group, each subagent's prime child (a session of its
+# own), and, recursively, the jobs each subagent's kernel started.
+#
+# It may be SIGKILLed at any point and re-run. The targets — pid AND start identity —
+# are written to the evidence file before anything is signalled, so a re-run carries
+# an interrupted pass's targets forward even when the records no longer name them,
+# and `_vouch` makes a second signal to a pid that has since been reused impossible.
+
+def _walk_tree(job_dir: str, probe, now, kill, seen: set) -> Iterable[Tuple["JobStore", dict]]:
+    real = os.path.realpath(job_dir)
+    if real in seen or not os.path.isdir(job_dir):
+        return
+    seen.add(real)
+    store = JobStore(job_dir, now=now, probe=probe, kill=kill, emit=lambda m: None)
+    for rec in store._all():
+        rec = store._refresh(rec) or rec
+        yield store, rec
+        sub = _subagent_job_dir(rec)
+        if sub:
+            yield from _walk_tree(sub, probe, now, kill, seen)
+
+
+def _refresh_tree(job_dir: str, probe: Optional[Callable[[int], tuple]] = None) -> List[dict]:
+    """Refresh every record under `job_dir`, subagents' job dirs included — which is what
+    enforces max_runtime and notices deaths for jobs nothing else is reading."""
+    return [rec for _, rec in _walk_tree(job_dir, probe or _real_probe, time.time, None, set())]
+
+
+def _reap_targets(job_dir: str, probe, now, kill) -> Tuple[List[dict], List[Tuple["JobStore", str]]]:
+    """(processes to signal, live job records to close) for a job dir and everything under it."""
+    targets, live = [], []
+    for store, rec in _walk_tree(job_dir, probe, now, kill, set()):
+        where = {"job": rec["name"], "job_dir": store.job_dir}
+        if rec.get("state") in LIVE_STATES:
+            live.append((store, rec["name"]))
+            if rec.get("pid"):
+                targets.append(dict(where, role=rec.get("kind") or "job",
+                                    pid=rec["pid"], pid_start=rec.get("pid_start")))
+        # Whatever the record says: a launcher that died leaves its child running.
+        child = _subagent_child(rec)
+        if child and child.get("pid"):
+            targets.append(dict(where, role="subagent-agent",
+                                pid=child["pid"], pid_start=child.get("pid_start")))
+    return targets, live
+
+
+def _read_evidence(path: Optional[str]) -> dict:
+    try:
+        with open(path or "") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_evidence(path: Optional[str], data: dict) -> None:
+    if not path:
+        return
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _reap(
+    job_dir: str,
+    *,
+    reason: str,
+    evidence_path: Optional[str] = None,
+    grace: Optional[float] = None,
+    probe: Optional[Callable[[int], tuple]] = None,
+    now: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    kill: Optional[Callable[[int], None]] = None,
+) -> dict:
+    """
+    Stop everything `job_dir` started: SIGTERM each vouched-for process group, give
+    them `grace` seconds, SIGKILL what is left, then close every still-live record as
+    `killed` with the reason. Returns this pass, which is also appended to
+    `evidence_path` ({"passes": [...]}, never truncated).
+    """
+    probe = probe or _real_probe
+    grace = REAP_GRACE_SECONDS if grace is None else float(grace)
+    evidence = _read_evidence(evidence_path)
+    passes = evidence.setdefault("passes", [])
+    carried = passes[-1].get("targets") or [] if passes and not passes[-1].get("finished_at") else []
+    fresh, live = _reap_targets(job_dir, probe, now, kill)
+    targets, keys = [], set()
+    for t in carried + fresh:
+        key = (t.get("pid"), t.get("pid_start"))
+        if key not in keys:
+            keys.add(key)
+            targets.append({k: t[k] for k in ("role", "job", "job_dir", "pid", "pid_start", "group", "members")
+                            if k in t})
+    run = {"reason": reason, "job_dir": job_dir, "started_at": now(), "grace": grace,
+           "resumed_interrupted_pass": bool(carried), "targets": targets}
+    passes.append(run)
+
+    def save() -> None:
+        _write_evidence(evidence_path, evidence)
+
+    save()
+    pending = [t for t in targets if _reap_term(t, probe, now, save)]
+    save()
+    stop_at = now() + grace
+    while any(_members_alive(probe, t) for t in pending) and now() < stop_at:
+        sleep(0.1)
+    for t in pending:
+        _reap_kill(t, probe, now)
+    save()
+
+    run["closed"] = _close_records(live, targets, reason, now)
+    run["finished_at"] = now()
+    run["summary"] = _reap_summary(targets)
+    save()
+    return run
+
+
+def _group_members(pgid: int) -> List[dict]:
+    """Every live process in a process group, with its start identity."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,pgid=,state=,lstart="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return []
+    members = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[1] == str(pgid) and not parts[2].startswith("Z"):
+            members.append({"pid": int(parts[0]), "pid_start": parts[3].strip()})
+    return members
+
+
+def _pgid(pid: int) -> Optional[int]:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _members_alive(probe, t: dict) -> List[dict]:
+    return [m for m in t.get("members") or [] if _vouch(probe, m.get("pid"), m.get("pid_start"))[0]]
+
+
+def _reap_term(t: dict, probe, now, save: Callable[[], None]) -> bool:
+    """
+    SIGTERM one target; True if it may need a SIGKILL after the grace.
+
+    The group's members are snapshotted — pid and start identity, saved — BEFORE the
+    signal. A leader that dies on SIGTERM leaves any member that ignored it running in
+    the group, and the members' own identities are what let the SIGKILL (or a re-run
+    of an interrupted reap) still reach them without trusting a bare number.
+    """
+    ok, why = _vouch(probe, t.get("pid"), t.get("pid_start"))
+    if not ok:
+        if _members_alive(probe, t):
+            t["outcome"] = f"leader {why}; members of its group remain"
+            return True
+        t["outcome"] = why
+        return False
+    t["group"] = _pgid(t["pid"]) == t["pid"]
+    members = t.get("members") or []
+    seen = {(m["pid"], m.get("pid_start")) for m in members}
+    snapshot = _group_members(t["pid"]) if t["group"] else []
+    for m in snapshot + [{"pid": t["pid"], "pid_start": t["pid_start"]}]:
+        if (m["pid"], m["pid_start"]) not in seen:
+            seen.add((m["pid"], m["pid_start"]))
+            members.append(m)
+    t["members"] = members
+    save()
+    try:
+        if t["group"]:
+            os.killpg(t["pid"], signal.SIGTERM)
+        else:
+            os.kill(t["pid"], signal.SIGTERM)
+    except OSError as exc:
+        t["outcome"] = f"SIGTERM failed: {exc}"
+        return bool(_members_alive(probe, t))
+    t["outcome"] = "sent SIGTERM"
+    t.setdefault("signals", []).append({"signal": "SIGTERM", "at": now()})
+    return True
+
+
+def _reap_kill(t: dict, probe, now) -> None:
+    """SIGKILL whatever of a target outlived the grace — only processes still vouched for."""
+    live = _members_alive(probe, t)
+    if not live:
+        if t.get("signals"):
+            t["outcome"] = "exited after SIGTERM"
+        return
+    # A pgid cannot be reused while the group exists, and a vouched member still in
+    # it proves the group is this one: killpg then also takes anything it forked since.
+    in_group = t.get("group") and any(_pgid(m["pid"]) == t["pid"] for m in live)
+    try:
+        if in_group:
+            os.killpg(t["pid"], signal.SIGKILL)
+        for m in live:
+            if not in_group or _pgid(m["pid"]) != t["pid"]:
+                os.kill(m["pid"], signal.SIGKILL)
+    except OSError as exc:
+        t["outcome"] = f"SIGKILL failed: {exc}"
+        return
+    t["outcome"] = "SIGKILLed after the grace period"
+    t.setdefault("signals", []).append({"signal": "SIGKILL", "at": now(), "pids": [m["pid"] for m in live]})
+
+
+def _close_records(live: List[Tuple["JobStore", str]], targets: List[dict], reason: str, now) -> List[str]:
+    """Every record that was live becomes `killed`, saying what was done to its processes."""
+    closed = []
+    for store, name in live:
+        rec = store._read(name)
+        if not rec or rec.get("state") not in LIVE_STATES:
+            continue
+        note = ""
+        unsignalled = [t["outcome"] for t in targets
+                       if t["job"] == name and t["job_dir"] == store.job_dir
+                       and not t.get("signals") and t.get("outcome") != "already gone"]
+        if unsignalled:
+            note = f"; NOT signalled: {'; '.join(unsignalled)}"
+        elif not rec.get("pid"):
+            note = ("; its request was cancelled before any broker claimed it, so nothing was started"
+                    if store._cancel_request(rec) else
+                    "; no pid was recorded, so nothing was signalled — if the work did start it is still running")
+        rec.update(state="killed", reason=f"reaped — {reason}{note}", finished_at=now(),
+                   output_tail=store._read_log(rec)[-4000:])
+        store._write(rec)
+        closed.append(os.path.join(store.job_dir, name))
+    return closed
+
+
+def _reap_summary(targets: List[dict]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for t in targets:
+        key = t.get("outcome") or "unknown"
+        if key.startswith("SIGTERM failed") or key.startswith("SIGKILL failed"):
+            key = "signal failed"
+        out[key] = out.get(key, 0) + 1
+    return out
 
 
 # --------------------------------------------------------------------------------

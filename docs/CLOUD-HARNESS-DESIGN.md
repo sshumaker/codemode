@@ -335,7 +335,12 @@ run every call; the turn still ends after it. Pinned in
   leaves its orphan running and no second harness starts), and a wake or
   message is delivered in two phases — in flight while the turn runs, done when
   it returns — so a crashed turn is re-woken once rather than silently consumed
-  (`runtime/scheduler.py`).
+  (`runtime/scheduler.py`). It also owns a session's end: an optional absolute
+  `deadline` in session.json wakes the agent once to wrap up and bounds every turn
+  at deadline + grace (enforced by the turn supervisor, so an orphaned turn is
+  bounded too); an ended session's process tree is reaped and never woken again.
+  Every scan refreshes the session's job records, so `max_runtime` binds a job
+  nobody is reading.
 - **Egress proxy** — credential injection, throttling, audit (already
   required by HOSTED-RUNTIME-DESIGN.md §4's shell-condition design).
 
