@@ -210,5 +210,342 @@ class TestCrashReplay(Base):
                          {"due": True, "undue": False})
 
 
+def dead_identity():
+    """A {pid, pid_start} that provably names no live process: started, reaped."""
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return {"pid": proc.pid, "pid_start": "Thu Jan  1 00:00:00 1970"}
+
+
+class Crash(BaseException):
+    """The scheduler dying mid-run: nothing after the runner executes."""
+
+
+class TurnBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.logs = []
+
+    def scan(self, runner=None):
+        return S.scan_once(self.root, now=self.clock, runner=runner or self.runner,
+                           log=self.logs.append)
+
+    def session(self, name, **kw):
+        d = super().session(name, **kw)
+        self.transcripts = os.path.join(self.root, f"{name}.transcripts")
+        os.makedirs(self.transcripts, exist_ok=True)
+        with open(os.path.join(d, S.SESSION_FILE)) as fh:
+            spec = json.load(fh)
+        spec["transcript_dir"] = self.transcripts
+        with open(os.path.join(d, S.SESSION_FILE), "w") as fh:
+            json.dump(spec, fh)
+        return d
+
+    def crashing_runner(self, *, child=None, transcript=False, waited=False):
+        """
+        A run that gets as far as a live harness, then its scheduler dies. The
+        harness is recorded (dead by the time anyone looks), optionally after
+        writing its opening message to the transcript or waiting again.
+        """
+
+        def run(argv, cwd=None, env=None):
+            self.runs.append({"argv": argv, "env": env})
+            turn_path, run_id = argv[3], argv[4]
+            S._update_turn(turn_path, run_id, state="running", child=child or dead_identity(),
+                           supervisor=dead_identity())
+            if transcript:
+                with open(os.path.join(self.transcripts, "s.jsonl"), "a") as fh:
+                    fh.write(json.dumps({"role": "user", "content": argv[-1]}) + "\n")
+            if waited:
+                with open(env["HARNESS_WAKE_FILE"], "w") as fh:
+                    json.dump({"wake_at": self.now + 500, "watch": []}, fh)
+            raise Crash()
+
+        return run
+
+    def crash(self, **kw):
+        with self.assertRaises(Crash):
+            self.scan(self.crashing_runner(**kw))
+
+    def inbox(self, d):
+        return sorted(os.listdir(os.path.join(d, S.INBOX_DIR)))
+
+
+class TestTheLeaseCoversTheAgent(TurnBase):
+    """Fix: a dead scheduler's lease is not stale while the agent it started runs."""
+
+    def stage_orphan(self, d, child):
+        lease = os.path.join(d, S.LEASE_DIR)
+        os.makedirs(lease)
+        with open(os.path.join(lease, "owner.json"), "w") as fh:
+            json.dump(dead_identity(), fh)
+        wake = os.path.join(d, S.WAKE_FILE)
+        os.replace(wake, wake + ".fired")  # as the dead scheduler's phase one left it
+        S._write_json(os.path.join(d, S.TURN_FILE), {
+            "run_id": "r1", "state": "running", "reason": "x", "started_at": self.now, "wake_fired": True,
+            "messages": [], "child": child, "supervisor": dead_identity()})
+
+    def test_a_live_child_keeps_a_dead_schedulers_lease(self):
+        d = self.session("a", wake_at=900)
+        self.stage_orphan(d, S._self_identity())  # this process stands in for prime
+        self.assertEqual(self.scan(), [])
+        self.assertEqual(self.runs, [], "a second harness started beside a live one")
+        self.assertTrue(os.path.isdir(os.path.join(d, S.LEASE_DIR)), "the lease was reclaimed")
+        self.assertTrue(any("still running" in m for m in self.logs), self.logs)
+
+    def test_a_released_lease_does_not_free_a_session_whose_child_lives(self):
+        d = self.session("a", wake_at=900)
+        self.stage_orphan(d, S._self_identity())
+        S.release_lease(os.path.join(d, S.LEASE_DIR))
+        self.assertIsNone(S.acquire_lease(d))
+        self.assertFalse(os.path.exists(os.path.join(d, S.LEASE_DIR)), "a refused lease must not linger")
+
+    def test_a_reused_child_pid_does_not_hold_the_lease(self):
+        d = self.session("a", wake_at=900)
+        stranger = dict(S._self_identity(), pid_start="Thu Jan  1 00:00:00 1970")
+        self.stage_orphan(d, stranger)
+        self.assertEqual(self.scan(), ["a"])
+
+    def test_a_recorded_live_supervisor_holds_the_lease(self):
+        d = self.session("a", wake_at=900)
+        self.stage_orphan(d, dead_identity())
+        with open(os.path.join(d, S.LEASE_DIR, "supervisor.json"), "w") as fh:
+            json.dump(S._self_identity(), fh)
+        os.remove(os.path.join(d, S.TURN_FILE))
+        self.assertEqual(self.scan(), [])
+
+    def test_when_scheduler_and_child_are_both_gone_it_is_reclaimed(self):
+        d = self.session("a", wake_at=900)
+        self.stage_orphan(d, dead_identity())
+        self.assertEqual(self.scan(), ["a"])
+        self.assertIn("interrupted", self.runs[0]["argv"][-1])
+
+
+class TestTwoPhaseDelivery(TurnBase):
+    def test_messages_are_in_flight_during_the_run_and_delivered_after(self):
+        d = self.session("a", wake_at=900)
+        S.post_user_message(d, "hello")
+        seen = {}
+
+        def runner(argv, cwd=None, env=None):
+            seen["inbox"] = self.inbox(d)
+            with open(os.path.join(d, S.TURN_FILE)) as fh:
+                seen["turn"] = json.load(fh)
+            seen["fired"] = os.path.exists(os.path.join(d, "wake.json.fired"))
+            return subprocess.CompletedProcess(argv, 3)
+
+        self.assertEqual(self.scan(runner), ["a"])
+        self.assertTrue(seen["inbox"][0].endswith(".json.delivering"), seen)
+        self.assertEqual(seen["turn"]["state"], "starting")
+        self.assertTrue(seen["turn"]["wake_fired"])
+        self.assertTrue(seen["fired"])
+        self.assertTrue(self.inbox(d)[0].endswith(".json.delivered"))
+        self.assertFalse(os.path.exists(os.path.join(d, S.TURN_FILE)))
+        with open(os.path.join(d, S.TURN_FILE + ".last")) as fh:
+            last = json.load(fh)
+        self.assertEqual((last["state"], last["returncode"]), ("done", 3), "any exit is a finished turn")
+
+    def test_the_run_goes_through_the_supervisor(self):
+        self.session("a", wake_at=900)
+        self.scan()
+        argv = self.runs[0]["argv"]
+        self.assertEqual(argv[2], "--supervise-turn")
+        self.assertEqual(argv[5], "--")
+        self.assertEqual(argv[6:-1], ["harness", "--resume", "a.jsonl", "-p"])
+
+    def test_every_message_has_an_id_and_the_opening_message_carries_it(self):
+        d = self.session("a")
+        S.post_user_message(d, "one")
+        [msg] = S.pending_user_messages(d)
+        self.assertTrue(msg["id"].startswith("u-"))
+        self.scan()
+        self.assertIn(f"[message ids: {msg['id']}]", self.runs[0]["argv"][-1])
+
+    def test_a_message_queued_without_an_id_gets_its_file_name(self):
+        d = self.session("a")
+        box = os.path.join(d, S.INBOX_DIR)
+        os.makedirs(box)
+        with open(os.path.join(box, "1.5-legacy.json"), "w") as fh:
+            json.dump({"from": "user", "text": "old"}, fh)
+        [msg] = S.pending_user_messages(d)
+        self.assertEqual(msg["id"], "1.5-legacy")
+
+
+class TestCrashRecovery(TurnBase):
+    def test_a_lost_message_is_delivered_again_with_the_interruption(self):
+        d = self.session("a")
+        S.post_user_message(d, "please deploy")
+        self.crash()
+        self.assertEqual(len(self.runs), 1)
+        self.assertEqual(self.scan(), ["a"])
+        second = self.runs[1]["argv"][-1]
+        self.assertIn("interrupted (crash)", second)
+        self.assertIn("please deploy", second, "the message the crash swallowed was lost")
+        self.assertTrue(self.inbox(d)[0].endswith(".json.delivered"))
+        self.assertEqual(self.scan(), [], "recovered exactly once")
+        with open(os.path.join(d, S.TURN_FILE + ".last")) as fh:
+            self.assertEqual(json.load(fh)["state"], "done")
+
+    def test_a_message_the_transcript_has_is_not_injected_twice(self):
+        d = self.session("a")
+        S.post_user_message(d, "please deploy")
+        self.crash(transcript=True)
+        self.assertEqual(self.scan(), ["a"])
+        second = self.runs[1]["argv"][-1]
+        self.assertIn("interrupted (crash)", second)
+        self.assertIn("1 new message from user", self.runs[0]["argv"][-1])
+        self.assertNotIn("please deploy", second, "the resumed transcript already holds it")
+        self.assertIn("Check your jobs and continue", second)
+        self.assertTrue(self.inbox(d)[0].endswith(".json.delivered"))
+
+    def test_the_interrupted_wake_names_what_the_crashed_turn_was_for(self):
+        self.session("a", wake_at=900)
+        self.crash()
+        self.scan()
+        self.assertIn("it was woken for: the requested wait of 60s elapsed", self.runs[1]["argv"][-1])
+
+    def test_a_crashed_recovery_still_names_the_original_wake(self):
+        self.session("a", wake_at=900)
+        self.crash()
+        self.crash()
+        self.scan()
+        msg = self.runs[2]["argv"][-1]
+        self.assertIn("it was woken for: the requested wait of 60s elapsed", msg)
+        self.assertEqual(msg.count("interrupted"), 1, msg)
+
+    def test_a_turn_that_died_after_waiting_again_is_not_rewoken_early(self):
+        d = self.session("a", wake_at=900)
+        self.crash(waited=True)
+        self.assertEqual(self.scan(), [], "the new wait is not due; the crash cost nothing")
+        with open(os.path.join(d, S.TURN_FILE + ".last")) as fh:
+            self.assertEqual(json.load(fh)["state"], "ended-in-wait")
+        self.now += 600
+        self.assertEqual(self.scan(), ["a"])
+        self.assertNotIn("interrupted", self.runs[1]["argv"][-1])
+
+    def test_a_run_that_never_started_a_harness_fires_its_original_wake(self):
+        d = self.session("a", wake_at=900)
+        S.post_user_message(d, "hi")
+
+        def dies_before_spawning(argv, cwd=None, env=None):
+            raise Crash()
+
+        with self.assertRaises(Crash):
+            self.scan(dies_before_spawning)
+        self.assertTrue(os.path.exists(os.path.join(d, "wake.json.fired")))
+        self.assertEqual(self.scan(), ["a"])
+        msg = self.runs[0]["argv"][-1]
+        self.assertNotIn("interrupted", msg, "nothing ran, so nothing was interrupted")
+        self.assertIn("hi", msg)
+        self.assertIn("cancelled", msg, "the restored wait is cancelled by the message as before")
+
+    def test_an_exited_turn_whose_scheduler_died_is_just_finished(self):
+        d = self.session("a")
+        S.post_user_message(d, "hi")
+
+        def exits_then_scheduler_dies(argv, cwd=None, env=None):
+            S._update_turn(argv[3], argv[4], state="exited", exit_code=0, supervisor=dead_identity())
+            raise Crash()
+
+        with self.assertRaises(Crash):
+            self.scan(exits_then_scheduler_dies)
+        self.assertEqual(self.scan(), [], "a turn that returned is not a crash")
+        self.assertTrue(self.inbox(d)[0].endswith(".json.delivered"))
+        with open(os.path.join(d, S.TURN_FILE + ".last")) as fh:
+            last = json.load(fh)
+        self.assertEqual((last["state"], last["exit_code"], last["settled_by"]), ("done", 0, "recovery"))
+
+    def test_a_crash_loop_stops_after_the_bound_and_leaves_evidence(self):
+        d = self.session("a")
+        S.post_user_message(d, "never lands")
+        for _ in range(S.MAX_CRASH_RECOVERIES + 1):
+            self.crash()
+        self.assertEqual(len(self.runs), S.MAX_CRASH_RECOVERIES + 1)
+        self.assertEqual(self.scan(), [], "a crash-looping turn was re-woken past the bound")
+        self.assertFalse(os.path.exists(os.path.join(d, S.TURN_FILE)))
+        with open(os.path.join(d, S.TURN_FILE + ".abandoned")) as fh:
+            self.assertEqual(json.load(fh)["state"], "abandoned")
+        self.assertTrue(self.inbox(d)[0].endswith(".json.undelivered"))
+        self.assertTrue(any("not re-waking" in m for m in self.logs), self.logs)
+        # A new message is a new conversation: it wakes the session, counter reset.
+        S.post_user_message(d, "try again")
+        self.assertEqual(self.scan(), ["a"])
+
+    def test_a_clean_turn_resets_the_crash_count(self):
+        self.session("a", wake_at=900)
+        self.crash()
+        self.assertEqual(self.scan(), ["a"])  # the recovery run returns cleanly
+        self.now += 1
+        with open(os.path.join(self.root, "a", S.WAKE_FILE), "w") as fh:
+            json.dump({"wake_at": 0}, fh)
+        self.crash()
+        self.scan()
+        with open(os.path.join(self.root, "a", S.TURN_FILE + ".last")) as fh:
+            self.assertEqual(json.load(fh)["recoveries"], 1)
+
+    def test_drain_waits_on_a_turn_that_has_not_been_settled(self):
+        d = self.session("a")
+        S.post_user_message(d, "hi")
+        self.crash()
+        ok = S.drain(self.root, interval=0.01, deadline=5, now=self.clock,
+                     runner=self.runner, log=lambda m: None)
+        self.assertTrue(ok)
+        self.assertIn("interrupted", self.runs[-1]["argv"][-1])
+
+
+class TestSpawnFailures(TurnBase):
+    """A harness that cannot even be started is retried a bounded number of times, loudly."""
+
+    def broken(self, argv, cwd=None, env=None):
+        self.runs.append({"argv": argv})
+        raise FileNotFoundError(2, "No such file or directory", "harness")
+
+    def test_a_failed_spawn_puts_the_wake_and_message_back_and_says_why(self):
+        d = self.session("a", wake_at=900)
+        S.post_user_message(d, "hi")
+        self.assertEqual(self.scan(self.broken), [])
+        self.assertTrue(os.path.exists(os.path.join(d, S.WAKE_FILE)), "the wake was lost")
+        self.assertTrue(self.inbox(d)[0].endswith(".json"), self.inbox(d))
+        self.assertTrue(any("failed to start (attempt 1/3)" in m and "No such file" in m
+                            for m in self.logs), self.logs)
+        self.assertEqual(self.scan(), ["a"], "a later healthy spawn delivers both")
+        self.assertIn("hi", self.runs[-1]["argv"][-1])
+        self.assertFalse(os.path.exists(os.path.join(d, S.TURN_FILE)), "a clean run resets the count")
+
+    def test_repeated_spawn_failures_stop_after_the_bound_with_evidence(self):
+        d = self.session("a", wake_at=900)
+        S.post_user_message(d, "never lands")
+        for _ in range(S.MAX_SPAWN_FAILURES + 2):
+            self.scan(self.broken)
+        self.assertEqual(len(self.runs), S.MAX_SPAWN_FAILURES, "retried past the bound")
+        self.assertFalse(os.path.exists(os.path.join(d, S.TURN_FILE)))
+        with open(os.path.join(d, S.TURN_FILE + ".abandoned")) as fh:
+            ev = json.load(fh)
+        self.assertEqual((ev["state"], ev["spawn_failures"]), ("abandoned", S.MAX_SPAWN_FAILURES))
+        self.assertIn("No such file", ev["last_error"])
+        self.assertTrue(self.inbox(d)[0].endswith(".json.undelivered"), self.inbox(d))
+        self.assertTrue(any("NOT retrying" in m for m in self.logs), self.logs)
+        S.post_user_message(d, "try again")
+        self.assertEqual(self.scan(), ["a"], "a new message starts over")
+
+    def test_a_crash_owed_a_rewake_keeps_it_across_a_failed_spawn(self):
+        self.session("a", wake_at=900)
+        self.crash()
+        self.scan(self.broken)
+        self.assertEqual(self.scan(), ["a"])
+        self.assertIn("interrupted (crash)", self.runs[-1]["argv"][-1])
+
+
+class TestTranscriptLocation(unittest.TestCase):
+    def test_prime_precedence(self):
+        argv = ["prime", "-c", "--session-dir", "/x"]
+        self.assertEqual(S._transcript_dirs({"argv": argv}, {"PRIME_AGENT_SESSION_DIR": "/y"}), ["/x"])
+        self.assertEqual(S._transcript_dirs({"argv": []}, {"PRIME_AGENT_SESSION_DIR": "/y"}), ["/y"])
+        self.assertEqual(S._transcript_dirs({"argv": []}, {"PRIME_AGENT_CODING_AGENT_SESSION_DIR": "/l"}), ["/l"])
+        self.assertEqual(S._transcript_dirs({"argv": []}, {"PRIME_AGENT_CODING_AGENT_DIR": "/a"}), ["/a/sessions"])
+        self.assertEqual(S._transcript_dirs({"argv": []}, {"HOME": "/h"}), ["/h/.prime/agent/sessions"])
+        self.assertEqual(S._transcript_dirs({"argv": argv, "transcript_dir": "/t"}, {}), ["/t"])
+
+
 if __name__ == "__main__":
     unittest.main()

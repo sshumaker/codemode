@@ -25,6 +25,10 @@ import shutil
 import unittest
 
 import jobs as J
+import scheduler as S
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCHEDULER = os.path.join(HERE, "scheduler.py")
 
 
 def wait_until(predicate, timeout=20.0, interval=0.05):
@@ -485,6 +489,180 @@ class TestBoundedReads(ChaosBase):
         out = self.store.get("loud").output
         self.assertLess(len(out), 300_000, "output is not bounded")
         self.assertIn("earlier bytes in", out, "the truncation must name the full log")
+
+
+HARNESS = r"""
+import json, os, signal, sys, time
+log, transcripts, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+message = sys.argv[-1]
+first = not os.path.exists(log)
+if mode == "record-then-hang" and first:
+    # Before the log line: the test kills once it sees the line, and must find
+    # the transcript already written.
+    with open(os.path.join(transcripts, "session.jsonl"), "a") as fh:
+        fh.write(json.dumps({"type": "message", "role": "user", "content": message}) + "\n")
+with open(log, "a") as fh:
+    fh.write(json.dumps({"pid": os.getpid(), "message": message}) + "\n")
+if mode == "hold-first" and first:
+    while not os.path.exists(os.path.join(os.path.dirname(log), "release")):
+        time.sleep(0.05)
+elif mode in ("record-then-hang", "hang-first") and first:
+    time.sleep(300)
+elif mode == "kill-everything":
+    # The whole turn dies with its scheduler, every time: a crash loop.
+    os.killpg(os.getpgid(0), signal.SIGKILL)
+"""
+
+
+class TestSchedulerKilledMidTurn(unittest.TestCase):
+    """
+    The scheduler's own SIGKILL-replay, for the turn rather than the wait: a real
+    scheduler runs a real (stand-in) harness through the real supervisor, and is
+    SIGKILLed while the turn is live.
+
+    Two claims. A scheduler killed ALONE leaves its harness running, and no fresh
+    scheduler may start a second harness on that session until the first is gone.
+    A turn killed WITH its scheduler is not silently consumed: a fresh scheduler
+    re-wakes the session once, re-delivering the user's message only if the
+    transcript never received it — and stops re-waking a turn that keeps dying.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="chaos-sched-")
+        self.sessions = os.path.join(self.root, "sessions")
+        self.session = os.path.join(self.sessions, "s")
+        self.transcripts = os.path.join(self.root, "transcripts")
+        self.log = os.path.join(self.root, "harness.log")
+        os.makedirs(os.path.join(self.session, "jobs"))
+        os.makedirs(self.transcripts)
+        self.script = os.path.join(self.root, "harness.py")
+        with open(self.script, "w") as fh:
+            fh.write(HARNESS)
+        self.procs = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+        for run in self.harness_runs():
+            try:
+                os.kill(run["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def configure(self, mode):
+        with open(os.path.join(self.session, S.SESSION_FILE), "w") as fh:
+            json.dump({"argv": [sys.executable, self.script, self.log, self.transcripts, mode],
+                       "cwd": self.session, "transcript_dir": self.transcripts}, fh)
+
+    def scheduler(self):
+        """A real scheduler in its own process group, so the test can kill it alone or whole."""
+        proc = subprocess.Popen([sys.executable, SCHEDULER, self.sessions, "--interval", "0.1"],
+                                cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        self.procs.append(proc)
+        return proc
+
+    def once(self):
+        """A fresh scheduler, one pass: what a restarted cron/drain does first."""
+        out = subprocess.run([sys.executable, SCHEDULER, self.sessions, "--once"],
+                             cwd=HERE, capture_output=True, text=True, timeout=60,
+                             start_new_session=True)
+        return out.stdout + out.stderr
+
+    def harness_runs(self):
+        try:
+            with open(self.log) as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        except OSError:
+            return []
+
+    def turn(self):
+        return S._read_turn(self.session) or {}
+
+    def start_turn_and_kill(self, mode, whole_group):
+        self.configure(mode)
+        S.post_user_message(self.session, "please deploy to staging")
+        proc = self.scheduler()
+        # Both: "running" is recorded the moment the child exists, before it has
+        # done anything, and a kill landing there would test a different window.
+        self.assertTrue(wait_until(lambda: self.turn().get("state") == "running"
+                                   and len(self.harness_runs()) == 1, timeout=60),
+                        f"the turn never reached a live harness: {self.turn()}")
+        if whole_group:
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            os.kill(proc.pid, signal.SIGKILL)
+        proc.wait()
+        return proc
+
+    # -- fix 1: the lease covers the agent ----------------------------------------------
+
+    def test_a_scheduler_killed_alone_never_lets_a_second_harness_start(self):
+        self.start_turn_and_kill("hold-first", whole_group=False)
+        child = self.turn()["child"]
+        self.assertTrue(S._identity_alive(child), "the harness should have outlived its scheduler")
+        for _ in range(3):
+            out = self.once()
+            self.assertIn("still running", out)
+        self.assertEqual(len(self.harness_runs()), 1, "a second harness ran beside the orphan")
+
+        open(os.path.join(self.root, "release"), "w").close()
+        self.assertTrue(wait_until(lambda: self.turn().get("state") == "exited", timeout=30),
+                        f"the supervisor did not record the orphan's exit: {self.turn()}")
+        self.assertTrue(wait_until(lambda: not S._identity_alive(self.turn().get("supervisor")), timeout=30))
+        self.once()
+        self.once()
+        self.assertEqual(len(self.harness_runs()), 1,
+                         "a turn that finished on its own was re-woken as if it crashed")
+        with open(os.path.join(self.session, S.TURN_FILE + ".last")) as fh:
+            last = json.load(fh)
+        self.assertEqual((last["state"], last["exit_code"]), ("done", 0))
+        box = os.listdir(os.path.join(self.session, S.INBOX_DIR))
+        self.assertTrue(box[0].endswith(".json.delivered"), box)
+
+    # -- fix 2: a crashed turn is recovered, not consumed -------------------------------
+
+    def test_a_turn_killed_before_its_transcript_got_the_message_redelivers_it(self):
+        self.start_turn_and_kill("hang-first", whole_group=True)
+        self.once()
+        runs = self.harness_runs()
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("interrupted (crash)", runs[1]["message"])
+        self.assertIn("please deploy to staging", runs[1]["message"],
+                      "the message the crash swallowed never reached a completed turn")
+        self.once()
+        self.assertEqual(len(self.harness_runs()), 2, "recovered more than once")
+
+    def test_a_turn_killed_after_its_transcript_got_the_message_does_not_repeat_it(self):
+        self.start_turn_and_kill("record-then-hang", whole_group=True)
+        self.once()
+        runs = self.harness_runs()
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("interrupted (crash)", runs[1]["message"])
+        self.assertNotIn("please deploy to staging", runs[1]["message"],
+                         "re-injected a message the resumed transcript already holds")
+        box = os.listdir(os.path.join(self.session, S.INBOX_DIR))
+        self.assertTrue(box[0].endswith(".json.delivered"), box)
+
+    def test_a_turn_that_always_takes_its_scheduler_down_is_abandoned(self):
+        self.configure("kill-everything")
+        S.post_user_message(self.session, "this turn crashes")
+        for _ in range(S.MAX_CRASH_RECOVERIES + 3):
+            self.once()
+        runs = self.harness_runs()
+        self.assertEqual(len(runs), 1 + S.MAX_CRASH_RECOVERIES,
+                         "the crash loop was not bounded")
+        self.assertTrue(all("this turn crashes" in r["message"] for r in runs),
+                        "a message no transcript received must ride every retry")
+        self.assertTrue(os.path.exists(os.path.join(self.session, S.TURN_FILE + ".abandoned")))
+        self.assertFalse(os.path.exists(os.path.join(self.session, S.TURN_FILE)))
+        box = os.listdir(os.path.join(self.session, S.INBOX_DIR))
+        self.assertTrue(box[0].endswith(".json.undelivered"), box)
 
 
 if __name__ == "__main__":

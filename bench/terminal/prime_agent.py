@@ -684,7 +684,10 @@ file you have already looked at.\
                 environment=self._env(), workdir=cwd, stream=True, demux=False,
             )
             self._consume(stream, raw, traj, summary)
-            r = self._exec(session, ["test", "-f", f"{SESSION_DIR}/wake.json"])
+            # turn.json too: a drain killed mid-turn leaves the wake already fired,
+            # and only a relaunched scheduler recovers the interrupted turn.
+            r = self._exec(session, ["test", "-f", f"{SESSION_DIR}/wake.json",
+                                     "-o", "-f", f"{SESSION_DIR}/turn.json"])
             if r.exit_code != 0:
                 break  # nothing left waiting: the drain finished its job
             relaunches += 1

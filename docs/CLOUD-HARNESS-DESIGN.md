@@ -330,7 +330,12 @@ run every call; the turn still ends after it. Pinned in
 - **Kernel** — per HOSTED-RUNTIME-DESIGN.md; prewarm pool per the cold-start
   measurements.
 - **Wake scheduler** — watches jobs manifests + deadlines + cron entries +
-  inbound messages; enforces the lease before invoking a harness.
+  inbound messages; enforces the lease before invoking a harness. The lease
+  covers the harness it started, not only itself (a scheduler killed mid-turn
+  leaves its orphan running and no second harness starts), and a wake or
+  message is delivered in two phases — in flight while the turn runs, done when
+  it returns — so a crashed turn is re-woken once rather than silently consumed
+  (`runtime/scheduler.py`).
 - **Egress proxy** — credential injection, throttling, audit (already
   required by HOSTED-RUNTIME-DESIGN.md §4's shell-condition design).
 
