@@ -121,7 +121,8 @@ describe("ipython tool over the remote kernel [fake]", () => {
 			await srv.stop();
 		}
 	});
-	it("a cell that made a tool call before its kernel died is reported, not run again", { timeout: 120_000 }, async () => {
+	/** One cell on a remote kernel, run with the real loop-side tunnel, whose kernel dies mid-cell. */
+	async function dyingRemoteCell(code) {
 		const { RemoteKernelLink } = await import(`${DIST}/core/kernel/remote/link.js`);
 		const { dispatchHostRequest } = await import(`${DIST}/core/kernel/remote/manager.js`);
 		const { RemotePathMap } = await import(`${DIST}/core/kernel/remote/pathmap.js`);
@@ -143,16 +144,9 @@ describe("ipython tool over the remote kernel [fake]", () => {
 		const tools = createAllToolDefinitions(local, {});
 		const text = (r) => r.content.map((c) => c.text ?? "").join("");
 		try {
-			const died = await tools.ipython.execute("died", {
-				code:
-					"import json, os, urllib.request\n" +
-					'body = json.dumps({"server": "fixture", "tool": "echo", "args": {"text": "charge"}}).encode()\n' +
-					'urllib.request.urlopen(urllib.request.Request(os.environ["HARNESS_MCP_PROXY"] + "/call", data=body, headers={"content-type": "application/json"})).read()\n' +
-					"os._exit(1)",
-			});
-			assert.equal(proxy.calls.length, 1, "the tool call was repeated on the fresh kernel");
-			assert.match(text(died), /after it had already made tool or host calls/);
-			assert.match(text(await tools.ipython.execute("next", { code: "print(6 * 7)" })), /42/);
+			const died = text(await tools.ipython.execute("died", { code }));
+			const next = text(await tools.ipython.execute("next", { code: "print(6 * 7)" }));
+			return { died, next, calls: [...proxy.calls] };
 		} finally {
 			await tools.ipython.dispose?.();
 			await link.close({ bye: true });
@@ -162,6 +156,29 @@ describe("ipython tool over the remote kernel [fake]", () => {
 			await proxy.close();
 			await srv.stop();
 		}
+	}
+
+	/** Python that defines `send()`: one raw request to the tool proxy, as any cell could make. */
+	const proxyCall = (tool, args) =>
+		"import json, os, urllib.request\n" +
+		`body = json.dumps({"server": "fixture", "tool": "${tool}", "args": ${JSON.stringify(args)}}).encode()\n` +
+		'send = lambda: urllib.request.urlopen(urllib.request.Request(os.environ["HARNESS_MCP_PROXY"] + "/call", data=body, headers={"content-type": "application/json"})).read()\n';
+
+	it("a cell that made a tool call before its kernel died is reported, not run again", { timeout: 120_000 }, async () => {
+		const { died, next, calls } = await dyingRemoteCell(`${proxyCall("echo", { text: "charge" })}send()\nos._exit(1)`);
+		assert.equal(calls.length, 1, `the tool call was repeated on the fresh kernel:\n${died}`);
+		assert.match(died, /after it had already made tool or host calls/);
+		assert.match(died, /\n {2}1\. tool fixture\.echo — completed: echo:\{"text":"charge"\}/);
+		assert.match(died, /every host request and every call to the tool proxy \(HARNESS_MCP_PROXY\) the cell made/);
+		assert.match(next, /42/);
+	});
+
+	it("a tunnelled call still open when the kernel died is UNKNOWN", { timeout: 120_000 }, async () => {
+		const { died, calls } = await dyingRemoteCell(
+			`${proxyCall("slow", { seconds: 10 })}import threading, time\nthreading.Thread(target=send, daemon=True).start()\ntime.sleep(1.5)\nos._exit(1)`,
+		);
+		assert.equal(calls.length, 1, `the held call did not reach the proxy exactly once:\n${died}`);
+		assert.match(died, /\n {2}1\. tool fixture\.slow — UNKNOWN — no answer came back/);
 	});
 });
 

@@ -1556,7 +1556,8 @@ sub(
 		"\t\t\t\t}\n" +
 		"\t\t\t\tcontinue;",
 	"a cell that started is not sent to the fresh kernel",
-	"result: cellDiedResult(progress)",
+	// A prefix: the call journal below adds an argument to this call.
+	"result: cellDiedResult(progress",
 );
 
 // A busy kernel with no UI never recovered. Upstream asks a person whether to wait
@@ -1638,6 +1639,136 @@ sub(
 	"a host reply that will not encode still answers the kernel",
 	"host reply could not be sent",
 );
+
+// --- kernel recovery: say which calls a dead cell made ------------------------
+//
+// A cell whose kernel died mid-run is reported, not sent again, and the model is
+// told to check what landed — without being told what the cell had sent. The host
+// performs or proxies those calls, so it can say. Each execution now carries a
+// call journal (scripts/patches/cell-calls.ts): every call in arrival order, with
+// (execution id, seq) for identity and an outcome — completed or failed when an
+// answer came back, UNKNOWN when none did before the kernel died.
+//
+// Three ways out of the kernel feed it:
+//   - host requests, journaled here around the handler;
+//   - the remote kernel's tool tunnel and host requests, journaled by the loop
+//     (scripts/patches/remote-kernel/manager.ts, tools.ts);
+//   - a LOCAL kernel's requests straight to HARNESS_MCP_PROXY, which the host never
+//     sees. The kernel appends each one to HARNESS_CALL_JOURNAL (a file in its own
+//     temp dir) before it leaves and again when its answer is in
+//     (scripts/patches/call-journal.py), and the host reads the file when the
+//     kernel dies. Set only under HARNESS_KERNEL_AUTORESTART=1, the one condition
+//     that reports dead cells, so a run without it executes the kernel it always did.
+// The report says which of those it saw. Files, subprocesses and other network
+// traffic a cell causes directly are not journaled, and the report says that too.
+//
+// The same file carries a "start" record written from IPython's pre_run_cell, before
+// any of the cell runs. Progress "started" came only from iopub's execute_input,
+// which a kernel that exits at once can fail to flush: under load a cell that had
+// already written a file was sent to the fresh kernel and wrote it again.
+log("\nkernel recovery: the call journal:");
+
+sub(
+	"core/kernel/index.ts",
+	"\n/** Comm target the kernel-side `rlm.host_request` shim opens for typed host requests. */",
+	`\n${patch("cell-calls.ts")}\n\n/** Comm target the kernel-side \`rlm.host_request\` shim opens for typed host requests. */`,
+	"an execution's calls are journaled",
+	"export class CallJournal",
+);
+sub(
+	"core/kernel/index.ts",
+	"\tprogress?: CellProgress;\n\tsettled: boolean;",
+	"\tprogress?: CellProgress;\n\tcalls?: CallJournal;\n\tsettled: boolean;",
+	"an execution carries its call journal",
+	"\tcalls?: CallJournal;\n",
+);
+sub(
+	"core/kernel/index.ts",
+	'\t\t\tstatus: "ok",\n\t\t\tsettled: false,\n\t\t\tresolve: result.resolve,',
+	'\t\t\tstatus: "ok",\n' +
+		"\t\t\tcalls: new CallJournal(requestMsgId, { kernelFile: this.options.env?.HARNESS_CALL_JOURNAL }),\n" +
+		"\t\t\tsettled: false,\n\t\t\tresolve: result.resolve,",
+	"each execution opens a journal",
+	"calls: new CallJournal(requestMsgId",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\tlet connection = makeConnection();\n\t\tthis.tempDir = connection.tempDir;\n",
+	"\t\tlet connection = makeConnection();\n\t\tthis.tempDir = connection.tempDir;\n" +
+		"\t\tthis.options.env = withCallJournal(this.options.env, connection.tempDir);\n",
+	"the kernel is told where to journal its proxy calls",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\t\t\tconnection = makeConnection();\n\t\t\t\tthis.tempDir = connection.tempDir;\n",
+	"\t\t\t\tconnection = makeConnection();\n\t\t\t\tthis.tempDir = connection.tempDir;\n" +
+		"\t\t\t\tthis.options.env = withCallJournal(this.options.env, connection.tempDir);\n",
+	"a direct spawn after a failed fork journals beside its own connection",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\treturn handler({ ...data, cellSourceCode });",
+	'\t\treturn journaled(this.activeExecution?.calls, "host", data.type, () => handler({ ...data, cellSourceCode }));',
+	"a host request is journaled with its outcome",
+	"journaled(this.activeExecution?.calls",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\texecution.reject(markCellProgress(error, execution.progress));",
+	"\t\texecution.reject(markCellProgress(markCellCalls(error, execution.calls), execution.progress));",
+	"a failed execution carries its journal",
+	"markCellCalls(error, execution.calls)",
+);
+sub(
+	"core/tools/ipython.ts",
+	"    if _prime_agent_os.environ.get(\"HARNESS_RLM\") == \"1\":\n        rlm = _PrimeAgentMissingRlm()\n`.trim();",
+	"    if _prime_agent_os.environ.get(\"HARNESS_RLM\") == \"1\":\n        rlm = _PrimeAgentMissingRlm()\n" +
+		`${callJournalPy()}\n\`.trim();`,
+	"a local kernel journals its proxy calls",
+	"def _harness_install_call_journal():",
+);
+sub(
+	"core/tools/ipython.ts",
+	"import {\n\ttype CellProgress,\n\tcellProgress,\n",
+	"import {\n\ttype CallJournal,\n\tcellCallJournal,\n\ttype CellProgress,\n\tcellProgress,\n\tdescribeCellDeath,\n",
+	"ipython.ts imports the call journal",
+	"\tcellCallJournal,\n",
+);
+sub(
+	"core/tools/ipython.ts",
+	"function cellDiedResult(progress: CellProgress): ExecuteResult {",
+	"function cellDiedResult(progress: CellProgress, calls?: CallJournal): ExecuteResult {",
+	"the died-mid-run result takes the journal",
+	"calls?: CallJournal): ExecuteResult",
+);
+sub(
+	"core/tools/ipython.ts",
+	"\t\tstderr: `This cell did not finish: the kernel process died ${after}. It was not run again, because what it already did may have taken effect. Check what landed before repeating any of it.`,",
+	"\t\tstderr: describeCellDeath(\n" +
+		"\t\t\t`This cell did not finish: the kernel process died ${after}. It was not run again, because what it already did may have taken effect.`,\n" +
+		"\t\t\tcalls,\n" +
+		"\t\t),",
+	"the died-mid-run result lists the calls",
+	"stderr: describeCellDeath(",
+);
+sub(
+	"core/tools/ipython.ts",
+	"result: cellDiedResult(progress) };",
+	"result: cellDiedResult(progress, cellCallJournal(error)) };",
+	"the dead cell's journal reaches its result",
+	"cellDiedResult(progress, cellCallJournal(error))",
+);
+
+/**
+ * The kernel-side journal, spliced into the bootstrap — a TypeScript template literal,
+ * where a backslash, a backtick or `${` would be read by TypeScript rather than
+ * Python (the mangling CLAUDE.md records). Refused rather than escaped.
+ */
+function callJournalPy() {
+	const body = readFileSync(join(ROOT, "scripts/patches/call-journal.py"), "utf8").trimEnd();
+	if (/[\\`]|\$\{/.test(body)) throw new Error("call-journal.py: no backslash, backtick or ${ — it is spliced into a template literal");
+	return body;
+}
 
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.

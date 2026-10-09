@@ -17,6 +17,8 @@
 import { randomUUID } from "node:crypto";
 import type { KernelPythonSkill } from "../bootstrap.js";
 import {
+	CallJournal,
+	type CallPath,
 	type CellProgress,
 	type ExecuteOptions,
 	type ExecuteResult,
@@ -25,6 +27,8 @@ import {
 	KernelManager,
 	type KernelManagerOptions,
 	type KernelStartOptions,
+	journaled,
+	markCellCalls,
 	markCellProgress,
 } from "../index.js";
 import type { RestoreResult, SnapshotResult } from "../state-snapshot.js";
@@ -51,11 +55,14 @@ export interface RemoteTiming {
 }
 
 const hostHandlerRegistry = new Map<string, HostRequestHandlers>();
-const kernelsThatCalled = new Set<string>();
+/** The running cell's call journal, per kernel: every call that crosses the link lands here. */
+const kernelJournals = new Map<string, CallJournal>();
 
-/** A cell on `kernel` reached outside the sandbox: if it dies now, it may already have acted. */
-export function noteKernelCall(kernel: string): void {
-	kernelsThatCalled.add(kernel);
+/** A cell on `kernel` reached outside the sandbox: journal it, so a death can say what it already did. */
+export function beginKernelCall(kernel: string, path: CallPath, name: string): ReturnType<CallJournal["begin"]> {
+	const journal = kernelJournals.get(kernel);
+	if (journal) return journal.begin(path, name);
+	return () => undefined;
 }
 
 /** The link's host-request handler: route each request to the kernel that made it. */
@@ -66,8 +73,7 @@ export async function dispatchHostRequest(
 	const type = typeof payload.type === "string" ? payload.type : "";
 	const handler = hostHandlerRegistry.get(kernel)?.[type];
 	if (!handler) throw new Error(`host request type "${type}" is not available in this session`);
-	noteKernelCall(kernel);
-	return handler(payload);
+	return journaled(kernelJournals.get(kernel), "host", type, () => handler(payload));
 }
 
 function mapError(error: unknown): Error {
@@ -83,6 +89,7 @@ export class RemoteKernelManager extends KernelManager {
 	private readonly remote: RemoteKernelManagerOptions;
 	private running = false;
 	private shutDown = false;
+	private executions = 0;
 	private releaseHold?: () => void;
 	private unsubscribe?: () => void;
 	posture?: ServerPosture;
@@ -164,7 +171,9 @@ export class RemoteKernelManager extends KernelManager {
 		if (this.shutDown) throw new Error("Kernel has been shut down");
 		const t0 = performance.now();
 		let id: number | undefined;
-		kernelsThatCalled.delete(this.kernelId);
+		// Every call this cell sends crosses the link, so the loop's journal is complete for them.
+		const calls = new CallJournal(`${this.kernelId}#${++this.executions}`, { tunnelled: true });
+		kernelJournals.set(this.kernelId, calls);
 		// The server says how far the cell got when its kernel died; a lost link cannot,
 		// so what this side saw of the cell counts too.
 		let progress: CellProgress | undefined;
@@ -201,8 +210,7 @@ export class RemoteKernelManager extends KernelManager {
 			this.lastTiming = { clientMs: performance.now() - t0, serverMs: result.durationMs };
 			return result;
 		} catch (error) {
-			if (kernelsThatCalled.has(this.kernelId)) progress = "called";
-			throw markCellProgress(mapError(error), progress);
+			throw markCellProgress(markCellCalls(mapError(error), calls), progress);
 		} finally {
 			opts.signal?.removeEventListener("abort", onAbort);
 		}
@@ -269,7 +277,7 @@ export class RemoteKernelManager extends KernelManager {
 		this.shutDown = true;
 		this.running = false;
 		hostHandlerRegistry.delete(this.kernelId);
-		kernelsThatCalled.delete(this.kernelId);
+		kernelJournals.delete(this.kernelId);
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.releaseHold?.();

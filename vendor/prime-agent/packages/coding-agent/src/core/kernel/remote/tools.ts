@@ -10,10 +10,10 @@ import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { PassThrough, type Readable } from "node:stream";
-import type { KernelManagerOptions } from "../index.js";
+import { type CallOutcome, type KernelManagerOptions, summarizeCallResult } from "../index.js";
 import { isRemoteKernelEnabled, type RemoteKernelConfig, remoteKernelConfigFromEnv } from "./config.js";
 import { RemoteKernelLink } from "./link.js";
-import { dispatchHostRequest, noteKernelCall, RemoteKernelManager } from "./manager.js";
+import { beginKernelCall, dispatchHostRequest, RemoteKernelManager } from "./manager.js";
 import { RemotePathMap } from "./pathmap.js";
 import type { PathMapping, ServerMessage } from "./protocol.js";
 
@@ -108,13 +108,13 @@ export function forwardToolCall(
 	signal: AbortSignal,
 ): Promise<{ status: number; headers: Record<string, string>; body: string }> {
 	if (!config.toolProxy) return Promise.reject(new Error("no HARNESS_MCP_PROXY on the loop"));
-	noteKernelCall(message.kernel);
+	const body = Buffer.from(message.body, "base64");
+	const settle = beginKernelCall(message.kernel, "tool", tunnelledCallName(message.method, message.path, body));
 	const base = new URL(config.toolProxy);
 	const target = new URL(base.pathname.replace(/\/$/, "") + message.path, base);
 	const headers: Record<string, string> = { ...message.headers };
 	delete headers["x-egress-token"];
 	if (config.egressToken) headers["x-egress-token"] = config.egressToken;
-	const body = Buffer.from(message.body, "base64");
 	if (body.length > 0) headers["content-length"] = String(body.length);
 	const send = target.protocol === "https:" ? httpsRequest : httpRequest;
 	return new Promise((resolve, reject) => {
@@ -130,9 +130,14 @@ export function forwardToolCall(
 					if (typeof v === "string" && k !== "transfer-encoding" && k !== "connection" && k !== "content-length")
 						out[k] = v;
 				}
-				resolve({ status: res.statusCode ?? 502, headers: out, body: Buffer.concat(chunks).toString("base64") });
+				const answer = Buffer.concat(chunks);
+				settle(...tunnelledCallOutcome(res.statusCode ?? 502, answer));
+				resolve({ status: res.statusCode ?? 502, headers: out, body: answer.toString("base64") });
 			});
-			res.on("error", reject);
+			res.on("error", (error) => {
+				settle("unknown", `the answer broke off: ${error.message}`);
+				reject(error);
+			});
 		});
 		const deadline = setTimeout(
 			() => req.destroy(new Error(`no answer in ${config.toolTimeoutMs}ms`)),
@@ -142,10 +147,42 @@ export function forwardToolCall(
 		signal.addEventListener("abort", () => req.destroy(new Error("cancelled by the kernel")), { once: true });
 		req.on("error", (error) => {
 			clearTimeout(deadline);
+			// Refused never reached the proxy; anything else may have, with the answer lost.
+			const refused = (error as NodeJS.ErrnoException).code === "ECONNREFUSED";
+			settle(refused ? "failed" : "unknown", error.message);
 			reject(error);
 		});
 		req.end(body);
 	});
+}
+
+/** A tunnelled request, named for the journal: `server.tool` for a tool call, else method and path. */
+function tunnelledCallName(method: string, path: string, body: Buffer): string {
+	try {
+		const payload = JSON.parse(body.toString("utf8"));
+		if (payload && typeof payload.server === "string" && typeof payload.tool === "string") {
+			return `${payload.server}.${payload.tool}`;
+		}
+	} catch {
+		// not a tool call
+	}
+	return `${method} ${path}`;
+}
+
+/** What a proxy answer says about the call: the proxy's `{ok, text|error}` when it sent one. */
+function tunnelledCallOutcome(status: number, answer: Buffer): [CallOutcome, string] {
+	if (status >= 400) return ["failed", `HTTP ${status}`];
+	try {
+		const body = JSON.parse(answer.toString("utf8"));
+		if (body && typeof body === "object" && "ok" in body) {
+			return body.ok
+				? ["completed", summarizeCallResult(body.text ?? "")]
+				: ["failed", String(body.error ?? "error")];
+		}
+	} catch {
+		// not JSON: the status is all there is
+	}
+	return ["completed", summarizeCallResult(answer.toString("utf8"))];
 }
 
 /** What the file tools need from a child process; ChildProcess and RemoteToolChild both satisfy it. */
