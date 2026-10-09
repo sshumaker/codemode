@@ -30,6 +30,10 @@
  *    annotation (`refKinds`) names an asset kind, IS an asset ref. A class whose fields
  *    carry asset refs gets `.ids`, `.id`, `__str__` (the id), `__iter__` and
  *    `__len__`, which is what lets a result be passed straight back;
+ *  - a string with `contentEncoding: "base64"` (or `format: "byte"` / `"binary"`) is
+ *    bytes on the wire: its class gets a `<field>_bytes` property that decodes it
+ *    (`data_b64` -> `data_bytes`), plus `.bytes` when it is the class's only such
+ *    field, and a `__str__` / `__repr__` that print its size rather than its text;
  *  - a tool with NO outputSchema gets the untyped base `ToolResult` (parsed JSON
  *    behind `.raw`, dict access still works). `generate()` refuses such a
  *    catalogue unless told to allow it, because a missing schema is a missing
@@ -69,6 +73,19 @@ function refCategory(node) {
 		return REF_CATEGORY_ORDER.find((c) => found.has(c)) ?? null;
 	}
 	return refPolicy.formats.get(node.format) ?? null;
+}
+
+/**
+ * How a string schema node encodes bytes, or null when it holds text.
+ *
+ * JSON Schema says it with `contentEncoding`; OpenAPI says it with `format: "byte"`
+ * (base64) or `format: "binary"`, which a JSON payload can only carry as base64 too.
+ */
+function binaryEncoding(node) {
+	const encoding = typeof node?.contentEncoding === "string" ? node.contentEncoding.toLowerCase() : null;
+	if (encoding === "base64" || encoding === "base64url") return encoding;
+	if (node?.format === "byte" || node?.format === "binary") return "base64";
+	return null;
 }
 
 /** The fallback class every untyped tool returns. Also the base of every typed one. */
@@ -132,20 +149,22 @@ function fieldType(node, { name, defs, classes, prefix }) {
 		// A ref that is one of several variants is still a ref for coercion purposes.
 		const ref = parts.find((p) => p.ref)?.ref ?? null;
 		const cls = parts.length === 1 ? parts[0].cls : null;
-		return { py: nullable ? `${py} | None` : py, ref, cls, listOf: parts.length === 1 ? parts[0].listOf : undefined, mapOf: parts.length === 1 ? parts[0].mapOf : undefined };
+		// pydantic puts a field's extra keywords beside the `anyOf`, not inside the arm.
+		const binary = parts.length === 1 && parts[0].py === "str" ? (binaryEncoding(node) ?? parts[0].binary) : null;
+		return { py: nullable ? `${py} | None` : py, ref, cls, binary, listOf: parts.length === 1 ? parts[0].listOf : undefined, mapOf: parts.length === 1 ? parts[0].mapOf : undefined };
 	}
 	if (Array.isArray(node.type)) {
 		const nonNull = node.type.filter((t) => t !== "null");
 		const parts = nonNull.map((t) => fieldType({ ...node, type: t }, { name, defs, classes, prefix }));
 		const py = [...new Set(parts.map((p) => p.py))].join(" | ") || "Any";
-		return { py: node.type.includes("null") ? `${py} | None` : py, ref: parts.find((p) => p.ref)?.ref ?? null, cls: null };
+		return { py: node.type.includes("null") ? `${py} | None` : py, ref: parts.find((p) => p.ref)?.ref ?? null, cls: null, binary: parts.length === 1 ? parts[0].binary : null };
 	}
 	if (node.type === "string") {
 		const ref = refCategory(node);
 		if (Array.isArray(node.enum) && node.enum.every((e) => typeof e === "string")) {
 			return { py: `Literal[${node.enum.map((e) => JSON.stringify(e)).join(", ")}]`, ref, cls: null };
 		}
-		return { py: "str", ref, cls: null };
+		return { py: "str", ref, cls: null, binary: binaryEncoding(node) };
 	}
 	if (node.type === "array") {
 		const item = fieldType(node.items, { name: `${name}Item`, defs, classes, prefix });
@@ -193,6 +212,7 @@ function ensureClass(name, node, { defs, classes, prefix }) {
 			cls: t.cls,
 			listOf: t.listOf,
 			mapOf: t.mapOf,
+			binary: t.binary ?? null,
 			description: (fnode && fnode.description) || "",
 		});
 	}
@@ -419,6 +439,25 @@ function assetFields(entry) {
 	return { scalar, many };
 }
 
+/**
+ * The base64 fields of a class, each with the accessor that decodes it:
+ * `<field>_bytes`, with a trailing `_b64` / `_base64` dropped from the field name
+ * (`data_b64` -> `data_bytes`). A class with exactly one such field also gets
+ * `.bytes`, its payload. An accessor whose name a payload field already holds is
+ * not rendered.
+ */
+function binaryFields(entry) {
+	const fields = entry.fields.filter((f) => f.binary && !f.listOf && !f.mapOf);
+	const taken = new Set([...entry.fields.map((f) => f.pyName), ...BASE_ATTRS]);
+	const out = fields.map((f) => {
+		const stem = f.pyName.replace(/_(b64|base64)$/, "");
+		const accessor = `${stem || f.pyName}_bytes`;
+		return { field: f, accessor: taken.has(accessor) ? null : accessor };
+	});
+	const payload = out.length === 1 && !taken.has("bytes") ? out[0] : null;
+	return { fields: out, payload };
+}
+
 /** The job-ref fields of a class: what `wait_for(result)` waits on when it carries no asset. */
 function jobFields(entry) {
 	return entry.fields.filter((f) => f.ref === "job" && (f.listOf || f.mapOf || f.py.startsWith("str")));
@@ -440,9 +479,10 @@ function docLines(text, indent) {
  * during discovery (h64, pos 31: 1,800 lines, ~40k tokens), so every class is
  * its docstring, its fields, and three spec tuples the base class interprets.
  */
-function renderClass(entry, later) {
+function renderClass(entry, later, extension = null) {
 	if (entry.union) return renderUnionClass(entry, later);
 	const { scalar, many } = assetFields(entry);
+	const binary = binaryFields(entry);
 	const req = entry.fields.filter((f) => f.required);
 	const opt = entry.fields.filter((f) => !f.required);
 	const lines = ["@dataclass(frozen=True, kw_only=True, repr=False)", `class ${entry.name}(ToolResult):`];
@@ -451,11 +491,13 @@ function renderClass(entry, later) {
 	// field is documented here only when the schema SAYS something about it (a
 	// description or a ref kind). The model reads this file whole during discovery
 	// (h64: 300k tokens on one job); every repeated line is paid on every turn.
-	const documented = entry.fields.filter((f) => f.description || f.ref);
+	const decodedAs = new Map(binary.fields.map(({ field, accessor }) => [field, accessor ?? (binary.payload?.field === field ? "bytes" : null)]));
+	const documented = entry.fields.filter((f) => f.description || f.ref || decodedAs.has(f));
 	if (documented.length) {
 		doc.push("");
 		for (const f of documented) {
-			const kind = f.ref ? `[${f.ref} ref] ` : "";
+			const decoded = decodedAs.get(f);
+			const kind = f.ref ? `[${f.ref} ref] ` : decodedAs.has(f) ? `[${f.binary}${decoded ? `; decoded as .${decoded}` : ""}] ` : "";
 			doc.push(`${f.pyName}: ${kind}${f.description || ""}`.trimEnd());
 		}
 	}
@@ -491,12 +533,44 @@ function renderClass(entry, later) {
 	// Only a class whose PURPOSE is producing assets stringifies to the id. A read
 	// result carries an asset_id too, and `print(read_result)` printing eight
 	// characters instead of the record cost three cells per trace (h64, pos 3, 12).
+	const plainStr = binary.fields.length ? "_str_without_binary(self)" : "super().__str__()";
 	if (many.length) {
-		lines.push("", "    def __str__(self) -> str:", "        refs = self._asset_refs()", "        return refs[0] if refs else super().__str__()", "", "    def __iter__(self):", "        return iter(Asset(id=i) for i in self._asset_refs())", "", "    def __len__(self) -> int:", "        return len(self._asset_refs())");
+		lines.push("", "    def __str__(self) -> str:", "        refs = self._asset_refs()", `        return refs[0] if refs else ${plainStr}`, "", "    def __iter__(self):", "        return iter(Asset(id=i) for i in self._asset_refs())", "", "    def __len__(self) -> int:", "        return len(self._asset_refs())");
 	}
 	const flag = entry.fields.find((f) => f.py === "bool" && ["completed", "success", "ok", "done"].includes(f.name));
 	if (flag) lines.push("", "    def __bool__(self) -> bool:", `        return bool(self.${flag.pyName})`);
+	if (binary.fields.length) lines.push(...renderBinaryMembers(binary, { hasStr: many.length > 0 }));
+	if (extension) lines.push("", ...extensionLines(extension));
 	return lines.join("\n");
+}
+
+/**
+ * The decoded accessors of a class with base64 fields, and a `__str__` / `__repr__`
+ * that show each such field's size instead of its text: the inherited ones would
+ * print the whole payload, and everything printed is re-read on every later turn.
+ */
+function renderBinaryMembers({ fields, payload }, { hasStr }) {
+	const lines = ["", `    _BINARY_FIELDS = (${fields.map(({ field }) => `(${pyStr(field.name)}, ${pyStr(field.pyName)}, ${pyStr(field.binary)})`).join(", ")},)`];
+	for (const { field, accessor } of fields) {
+		if (!accessor) continue;
+		lines.push("", "    @property", `    def ${accessor}(self) -> bytes | None:`, `        """\`${field.pyName}\`, decoded from ${field.binary}. None when the payload has none."""`, `        return _decode_binary(self.${field.pyName}, ${pyStr(field.binary)})`);
+	}
+	if (payload) {
+		const read = payload.accessor ? `self.${payload.accessor}` : `_decode_binary(self.${payload.field.pyName}, ${pyStr(payload.field.binary)})`;
+		lines.push("", "    @property", "    def bytes(self) -> bytes | None:", `        """The payload's bytes: \`${payload.field.pyName}\`, decoded."""`, `        return ${read}`);
+	}
+	if (!hasStr) lines.push("", "    def __str__(self) -> str:", "        return _str_without_binary(self)");
+	lines.push("", "    def __repr__(self) -> str:", "        return _repr_without_binary(self)");
+	return lines;
+}
+
+/** A class extension's members, as class-body lines. Written unindented by the caller. */
+function extensionLines(extension) {
+	const text = Array.isArray(extension) ? extension.join("\n") : String(extension);
+	return text
+		.replace(/^\n+|\s+$/g, "")
+		.split("\n")
+		.map((l) => (l.trim() ? `    ${l}` : ""));
 }
 
 /**
@@ -550,13 +624,46 @@ function renderUnionClass(entry, later) {
  * `_types.py`: the base classes, every generated class, the registry `wrap`
  * dispatches on, and the argument coercion `_client` applies before a call.
  */
+/** Module helpers for classes with base64 fields; rendered only when one exists. */
+const BINARY_HELPERS = `
+
+def _decode_binary(value: str | None, encoding: str) -> bytes | None:
+    if value is None:
+        return None
+    if encoding == "base64url":
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    return base64.b64decode(value)
+
+
+def _binary_size(value: str) -> str:
+    return f"<{len(value.rstrip('=')) * 3 // 4} bytes>"
+
+
+def _repr_without_binary(result: ToolResult) -> str:
+    binary = {f for _k, f, _e in type(result)._BINARY_FIELDS}
+    shown = []
+    for _k, f, _c, _how in type(result)._SPEC:
+        v = getattr(result, f, None)
+        if v is not None:
+            shown.append(f"{f}={_binary_size(v)}" if f in binary and isinstance(v, str) else f"{f}={v!r}")
+    return f"{type(result).__name__}({', '.join(shown)})"
+
+
+def _str_without_binary(result: ToolResult) -> str:
+    raw = result.raw
+    if isinstance(raw, dict):
+        keys = {k for k, _f, _e in type(result)._BINARY_FIELDS}
+        raw = {k: _binary_size(v) if k in keys and isinstance(v, str) else v for k, v in raw.items()}
+    return raw if isinstance(raw, str) else json.dumps(raw, default=str)
+`;
+
 /** The docstring's worked example when the caller names none: shape, not product. */
 export const DEFAULT_TYPES_EXAMPLE = Object.freeze([
 	"first = await api.<module>.<tool_that_makes_something>(...)",
 	"await api.<module>.<tool_that_takes_it>(..., references=[first])",
 ]);
 
-export function renderOutputTypes({ classes }, { example = null, resultCall = "result" } = {}) {
+export function renderOutputTypes({ classes }, { example = null, resultCall = "result", extensions = null } = {}) {
 	const exampleLines = (example ?? DEFAULT_TYPES_EXAMPLE).map((l) => `    ${l}`).join("\n");
 	// Dependency order: a class's _SPEC names its nested classes at class-body
 	// time, so those must already exist. Post-order over the `cls` references.
@@ -575,6 +682,7 @@ export function renderOutputTypes({ classes }, { example = null, resultCall = "r
 		generated.push(c);
 	};
 	all.forEach(visit);
+	const hasBinary = generated.some((c) => binaryFields(c).fields.length > 0);
 	const head = `"""Typed results for this API. Generated from each tool's outputSchema — do not edit.
 
 Every API function returns an instance of one of these classes instead of the
@@ -589,7 +697,7 @@ ${exampleLines}
 
 from __future__ import annotations
 
-import json
+${hasBinary ? "import base64\n" : ""}import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -730,9 +838,9 @@ class ToolResult:
 
 
 AssetLike = Asset | ToolResult
-`;
+${hasBinary ? BINARY_HELPERS : ""}`;
 	const later = deferredAttrs();
-	const body = generated.map((c) => renderClass(c, later.defining(c.name))).join("\n\n\n") + later.render();
+	const body = generated.map((c) => renderClass(c, later.defining(c.name), extensions?.[c.name] ?? null)).join("\n\n\n") + later.render();
 	const registry = `
 
 # Class by name — what \`_client.call\` resolves the wrapper's promised type against.

@@ -2696,6 +2696,11 @@ export function generate(
 		refKinds = null,
 		// Types module docstring example: lines of Python, or null for the neutral one.
 		typesExample = null,
+		// Extra members for generated result classes: { <ClassName>: <class-body Python> },
+		// written unindented and appended last, so a member here overrides a generated
+		// one. A name this catalogue does not generate is skipped: one option set serves
+		// many catalogues.
+		classExtensions = null,
 		// The wait surface (see renderWaitSurface): "auto" renders it when some tool
 		// declares `launches` or `awaitsInputs`; true/false force it.
 		waitSurface = "auto",
@@ -2850,7 +2855,7 @@ export function generate(
 	// hit in the agent's `grep -ril` and one more thing to read.
 	// The typed result surface. Its own module so `_client` imports it and any
 	// cell can too: `from api._types import Asset` is a thing a person would try.
-	if (typedReturns) files["_types.py"] = renderOutputTypes(returnShapes, { example: typesExample, resultCall: waitCalls?.result }) + (inputShapes ? renderInputTypes(inputShapes) : "");
+	if (typedReturns) files["_types.py"] = renderOutputTypes(returnShapes, { example: typesExample, resultCall: waitCalls?.result, extensions: classExtensions }) + (inputShapes ? renderInputTypes(inputShapes) : "");
 	if (validateArgs) {
 		const modules = layoutMode === "consolidated" ? categoryModuleMap(normalized, claimed) : null;
 		files["_schemas.json"] = renderSchemas(normalized, { waitSurface, modules });
