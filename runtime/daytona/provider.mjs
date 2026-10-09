@@ -36,6 +36,13 @@ export function isNotFound(err) {
 const APP_LABEL = "assistant-workspace";
 export const KERNEL_PORT = 8765;
 const SERVER_LOG = "kernel-server.log";
+/** How long a kernel server gets to exit on SIGTERM before SIGKILL, and again after it. */
+const SERVER_STOP_GRACE_S = 5;
+
+/** Mirrors tokenFingerprint in scripts/patches/remote-kernel/server.ts. */
+export function tokenFingerprint(token) {
+	return createHash("sha256").update(token).digest("hex").slice(0, 16);
+}
 
 function sh(value) {
 	return `'${String(value).replaceAll("'", `'\\''`)}'`;
@@ -122,13 +129,16 @@ export class DaytonaKernelProvider {
 			});
 		this.labels = { app: APP_LABEL, ...(options.labels ?? {}) };
 		this.autoStopMinutes = options.autoStopMinutes ?? 15;
-		this.autoDeleteMinutes = options.autoDeleteMinutes ?? -1;
+		this.autoDeleteMinutes = options.autoDeleteMinutes ?? 1440;
 		this.snapshot = options.snapshot;
 		this.log = options.log ?? (() => {});
 		this.resources = options.resources;
 		this.bundle = undefined;
 		this.locks = new Map();
 		this.bound = new Map();
+		// pgrep/pkill patterns; the bracket keeps the pattern from matching the shell running it.
+		this.serverMatch = "[k]ernel-server.mjs";
+		this.kernelMatch = "[i]pykernel_launcher";
 	}
 
 	/** Release the Daytona client (its event socket keeps a process alive otherwise). */
@@ -275,13 +285,14 @@ export class DaytonaKernelProvider {
 	}
 
 	/**
-	 * Is the kernel server `info` describes up, on the same bundle, with egress locked?
+	 * Is the kernel server `info` describes up, on the same bundle and token, with egress locked?
 	 * Asked from outside, through the preview proxy: one HTTPS round trip, no sandbox
 	 * command. A warm pool uses it at claim time instead of a full ensure(), which
 	 * re-runs every setup step (lock check, server health from inside, one probe per
 	 * mount) and measured 1.5-8 s on a sandbox that was already ready. Resolves to the
 	 * server's health, or undefined for anything else (down, a restarted sandbox's
-	 * new preview token, a timeout): the caller then falls back to ensure().
+	 * new preview token, a server relaunched with a new token, a timeout): the caller
+	 * then falls back to ensure().
 	 * @param {import("./provider.d.ts").KernelConnectionInfo} info
 	 */
 	async verify(info, { timeoutMs = 5000 } = {}) {
@@ -292,7 +303,8 @@ export class DaytonaKernelProvider {
 			});
 			if (!res.ok) return undefined;
 			const health = await res.json();
-			return health?.ok && health.version === info.version && health.posture?.egress === "blocked" ? health : undefined;
+			const current = health?.ok && health.version === info.version && health.tokenId === tokenFingerprint(info.token);
+			return current && health.posture?.egress === "blocked" ? health : undefined;
 		} catch {
 			return undefined;
 		}
@@ -397,21 +409,43 @@ export class DaytonaKernelProvider {
 		return text.startsWith("{") ? JSON.parse(text) : undefined;
 	}
 
-	async readServerState(sb, layout) {
-		try {
-			return JSON.parse((await sb.fs.downloadFile(`${layout.root}/state/server.json`)).toString());
-		} catch {
-			return undefined;
+	/**
+	 * server.json, or undefined when there is none (or it is unreadable as JSON). A
+	 * failed read is retried and then thrown: undefined makes ensureServer() relaunch,
+	 * and a transient download error must not kill a healthy server.
+	 */
+	async readServerState(sb, layout, attempts = 3) {
+		for (let i = 1; ; i++) {
+			let raw;
+			try {
+				raw = await sb.fs.downloadFile(`${layout.root}/state/server.json`);
+			} catch (err) {
+				if (isNotFound(err)) return undefined;
+				if (i >= attempts) throw err;
+				await new Promise((r) => setTimeout(r, 500 * i));
+				continue;
+			}
+			try {
+				return JSON.parse(raw.toString());
+			} catch {
+				return undefined;
+			}
 		}
 	}
 
 	async ensureServer(sb, layout, version, reprobe) {
 		const state = await this.readServerState(sb, layout);
 		let health = await this.health(sb, reprobe);
-		if (!(health?.ok && health.version === version && state?.token)) {
+		const current = state?.token && health?.ok && health.version === version && health.tokenId === tokenFingerprint(state.token);
+		if (!current) {
 			const token = randomBytes(24).toString("base64url");
 			await this.launchServer(sb, layout, version, token);
-			health = await this.waitHealthy(sb, version);
+			try {
+				health = await this.waitHealthy(sb, version, token);
+			} catch (err) {
+				await this.stopServer(sb).catch(() => {});
+				throw err;
+			}
 			return this.checkPosture({ token, posture: health.posture });
 		}
 		return this.checkPosture({ token: state.token, posture: health.posture });
@@ -440,9 +474,10 @@ export class DaytonaKernelProvider {
 		const envStr = Object.entries(env)
 			.map(([k, v]) => `${k}=${sh(v)}`)
 			.join(" ");
+		await this.stopServer(sb);
 		await this.exec(
 			sb,
-			`pkill -f kernel-server.mjs || true; mkdir -p ${layout.root}/state ${layout.workDir}/inputs ${layout.workDir}/outputs; ` +
+			`mkdir -p ${layout.root}/state ${layout.workDir}/inputs ${layout.workDir}/outputs; ` +
 				`umask 077; printf '%s' ${sh(JSON.stringify({ token, version, port: KERNEL_PORT }))} > ${layout.root}/state/server.json`,
 		);
 		const session = `kernel-server-${Date.now()}`;
@@ -453,11 +488,32 @@ export class DaytonaKernelProvider {
 		});
 	}
 
-	async waitHealthy(sb, version, timeoutMs = 30_000) {
+	/**
+	 * Stop every kernel server in the sandbox and wait until none is left: SIGTERM, a
+	 * grace period, then SIGKILL. A SIGKILLed server cannot shut its kernels down, so
+	 * those go too. Returning before the old server exits let the new one lose the
+	 * port to it, and the old one then answered health checks for the new launch.
+	 */
+	async stopServer(sb) {
+		const server = sh(this.serverMatch);
+		const gone = (what) =>
+			`i=0; while pgrep -f ${what} >/dev/null && [ $i -lt ${SERVER_STOP_GRACE_S * 10} ]; do sleep 0.1; i=$((i+1)); done`;
+		await this.exec(
+			sb,
+			`pkill -TERM -f ${server}; ${gone(server)}; ` +
+				`if pgrep -f ${server} >/dev/null; then pkill -KILL -f ${server}; pkill -KILL -f ${sh(this.kernelMatch)}; ${gone(server)}; fi; ` +
+				`if pgrep -f ${server} >/dev/null; then echo "a kernel server survived SIGKILL"; exit 1; fi`,
+			SERVER_STOP_GRACE_S * 3 + 30,
+		);
+	}
+
+	/** Wait for the server launched with `token`; any other one answering is the old server. */
+	async waitHealthy(sb, version, token, timeoutMs = 30_000) {
 		const deadline = Date.now() + timeoutMs;
+		const id = tokenFingerprint(token);
 		while (Date.now() < deadline) {
 			const h = await this.health(sb).catch(() => undefined);
-			if (h?.ok && h.version === version) return h;
+			if (h?.ok && h.version === version && h.tokenId === id) return h;
 			await new Promise((r) => setTimeout(r, 300));
 		}
 		throw new Error(`kernel server did not come up; log tail:\n${await this.serverLog(sb).catch(() => "?")}`);
@@ -499,15 +555,42 @@ export class DaytonaKernelProvider {
 		});
 	}
 
-	/** Delete the conversation's sandbox and everything in it. */
+	/**
+	 * Delete every sandbox carrying the conversation's labels, not just the first: a
+	 * lagging search can let ensure() create a second one. Idempotent: a sandbox that
+	 * is already gone counts as deleted.
+	 */
 	destroy(conversationId) {
 		return this.withLock(conversationId, async () => {
-			const sb = await this.find(conversationId);
-			if (!sb) return { destroyed: false };
-			await retryConflict(() => sb.delete(120, true));
-			this.bound.delete(String(conversationId));
-			return { destroyed: true, sandboxId: sb.id };
+			const id = String(conversationId);
+			const ids = new Set();
+			const known = this.bound.get(id);
+			if (known) ids.add(known);
+			for await (const sb of this.daytona.list({ labels: { ...this.labels, conversation: id } })) {
+				if (!DEAD_STATES.has(sb.state)) ids.add(sb.id);
+			}
+			const deleted = [];
+			for (const sandboxId of ids) {
+				if (await this.deleteSandbox(sandboxId)) deleted.push(sandboxId);
+			}
+			this.bound.delete(id);
+			return deleted.length ? { destroyed: true, sandboxId: deleted[0], sandboxIds: deleted } : { destroyed: false };
 		});
+	}
+
+	/** Delete one sandbox by id. False when it was already gone. */
+	async deleteSandbox(sandboxId) {
+		try {
+			await retryConflict(async () => {
+				const sb = await this.daytona.get(sandboxId);
+				if (!sb || DEAD_STATES.has(sb.state)) throw Object.assign(new Error(`${sandboxId} not found`), { statusCode: 404 });
+				await sb.delete(120, true);
+			});
+			return true;
+		} catch (err) {
+			if (isNotFound(err)) return false;
+			throw err;
+		}
 	}
 
 	/** Keep an active conversation's sandbox from auto-stopping. */
@@ -581,14 +664,18 @@ export class DaytonaKernelProvider {
 	 */
 	async reap({ knownConversationIds, waitMs = 120_000 } = {}) {
 		const orphans = await this.listOrphans({ knownConversationIds });
+		// One sandbox that will not delete must not leave the rest standing; it is
+		// reported on its entry and left out of the wait.
 		for (const o of orphans) {
 			if (o.state === "destroying" || o.state === "destroyed") continue;
-			await retryConflict(async () => {
-				const sb = await this.daytona.get(o.sandboxId);
-				await sb.delete(120, true);
-			});
+			try {
+				await this.deleteSandbox(o.sandboxId);
+			} catch (err) {
+				o.error = err?.message ?? String(err);
+				this.log(`reap ${o.sandboxId}: ${o.error}`);
+			}
 		}
-		const ids = new Set(orphans.map((o) => o.sandboxId));
+		const ids = new Set(orphans.filter((o) => !o.error).map((o) => o.sandboxId));
 		const deadline = Date.now() + waitMs;
 		while (Date.now() < deadline) {
 			const still = (await this.listOrphans()).filter((o) => ids.has(o.sandboxId) && o.state !== "destroyed");

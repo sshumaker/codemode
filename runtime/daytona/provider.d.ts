@@ -14,7 +14,7 @@ export interface DaytonaKernelProviderOptions {
 	labels?: Record<string, string>;
 	/** Daytona's own safety net if stop() is never called. Default 15. */
 	autoStopMinutes?: number;
-	/** Delete this long after stopping; -1 (default) keeps stopped sandboxes. */
+	/** Delete this long after stopping; default 1440 (24 h); -1 keeps stopped sandboxes. */
 	autoDeleteMinutes?: number;
 	/** Snapshot to create from; default harness-assistant-kernel-<bundle version>, else the newest one, else the stock image. */
 	snapshot?: string;
@@ -71,6 +71,8 @@ export interface Orphan {
 	conversationId: string;
 	state: string;
 	lastActivityAt?: string;
+	/** Set by reap() when this sandbox could not be deleted; the others were still reaped. */
+	error?: string;
 }
 
 export declare class DaytonaKernelProvider {
@@ -86,14 +88,15 @@ export declare class DaytonaKernelProvider {
 	/** Record that a sandbox was just relabelled to this conversation, so find() fetches it by id. */
 	bind(conversationId: string, sandboxId: string): void;
 	stop(conversationId: string): Promise<{ stopped: boolean; sandboxId?: string; state?: string }>;
-	destroy(conversationId: string): Promise<{ destroyed: boolean; sandboxId?: string }>;
+	/** Deletes every sandbox labelled for the conversation; one already gone counts as deleted. */
+	destroy(conversationId: string): Promise<{ destroyed: boolean; sandboxId?: string; sandboxIds?: string[] }>;
 	touch(conversationId: string): Promise<void>;
 	/** refreshActivity() every intervalMs (default 60 s) until the returned function is called. */
 	keepAlive(conversationId: string, opts?: { intervalMs?: number }): () => void;
 	/** Every regular file under dir (default "outputs"), recursively: {path relative to the work dir, size, mtimeMs}. */
 	listTree(conversationId: string, dir?: string): Promise<{ path: string; size: number; mtimeMs: number }[]>;
 	listOrphans(opts?: { knownConversationIds?: Iterable<string>; includeDestroyed?: boolean }): Promise<Orphan[]>;
-	/** Deletes every orphan and waits (up to waitMs, default 120 s) until Daytona stops listing them. */
+	/** Deletes every orphan and waits (up to waitMs, default 120 s) until Daytona stops listing them. A failed delete is recorded on its entry's `error`, not thrown. */
 	reap(opts?: { knownConversationIds?: Iterable<string>; waitMs?: number }): Promise<Orphan[]>;
 	uploadFile(conversationId: string, path: string, data: Buffer | string): Promise<string>;
 	listFiles(conversationId: string, dir?: string): Promise<SandboxFile[]>;

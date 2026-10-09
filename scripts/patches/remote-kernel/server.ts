@@ -14,7 +14,7 @@
  * and the loop adds the egress token on its side.
  */
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
@@ -166,6 +166,14 @@ export function kernelEnvFor(
 	delete env.HARNESS_EGRESS_TOKEN;
 	env.HARNESS_MCP_PROXY = toolProxyUrl;
 	return { env, dropped };
+}
+
+/**
+ * Names a token without revealing it, so /healthz can say which launch is answering.
+ * runtime/daytona/provider.mjs computes the same to tell its own server from an old one.
+ */
+export function tokenFingerprint(token: string): string {
+	return createHash("sha256").update(token).digest("hex").slice(0, 16);
 }
 
 export function toWireError(error: unknown): WireError {
@@ -375,6 +383,7 @@ export class KernelServer {
 				JSON.stringify({
 					ok: true,
 					version: this.config.version,
+					tokenId: this.config.token ? tokenFingerprint(this.config.token) : undefined,
 					sessions: this.sessions.size,
 					kernels: this.kernels.size,
 					posture,

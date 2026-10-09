@@ -230,7 +230,8 @@ describe("daytona provider verify", () => {
 	it("asks the server's /healthz through the preview proxy with the preview header, and checks version and egress", async () => {
 		const { createServer } = await import("node:http");
 		const { DaytonaKernelProvider } = await import("../../daytona/provider.mjs");
-		let health = { ok: true, version: "v1", posture: { egress: "blocked" } };
+		const { tokenFingerprint } = await import("../../daytona/provider.mjs");
+		let health = { ok: true, version: "v1", tokenId: tokenFingerprint("tok"), posture: { egress: "blocked" } };
 		let seen;
 		const srv = createServer((req, res) => {
 			seen = { url: req.url, preview: req.headers["x-daytona-preview-token"] };
@@ -243,12 +244,13 @@ describe("daytona provider verify", () => {
 		await new Promise((r) => srv.listen(0, "127.0.0.1", r));
 		const url = `ws://127.0.0.1:${srv.address().port}`;
 		const p = new DaytonaKernelProvider({ daytona: {} });
-		const info = { url, headers: { "x-daytona-preview-token": "pt" }, version: "v1" };
+		const info = { url, headers: { "x-daytona-preview-token": "pt" }, version: "v1", token: "tok" };
 		try {
 			assert.equal((await p.verify(info))?.version, "v1");
 			assert.deepEqual(seen, { url: "/healthz", preview: "pt" });
 			assert.equal(await p.verify({ ...info, headers: { "x-daytona-preview-token": "stale" } }), undefined, "a stale preview token");
 			assert.equal(await p.verify({ ...info, version: "v2" }), undefined, "another bundle");
+			assert.equal(await p.verify({ ...info, token: "relaunched" }), undefined, "a server relaunched with another token");
 			health = { ...health, posture: { egress: "open" } };
 			assert.equal(await p.verify(info), undefined, "egress not locked");
 		} finally {
@@ -366,6 +368,203 @@ describe("provider: sandboxes deleted under it", () => {
 		};
 		await assert.rejects(p.ensure("conv-2"), /quota exceeded/);
 		assert.equal(calls, 1);
+	});
+});
+
+describe("provider: the kernel server's lifecycle", () => {
+	let provider;
+	before(async () => {
+		provider = await import("../../daytona/provider.mjs");
+	});
+	const layout = () => {
+		const root = mkdtempSync(join(tmpdir(), "rk-layout-"));
+		return { home: root, root, workDir: join(root, "work") };
+	};
+	const healthy = (token, extra = {}) => ({
+		ok: true,
+		version: "v1",
+		tokenId: provider.tokenFingerprint(token),
+		posture: { egress: "blocked" },
+		...extra,
+	});
+
+	it("a restart waits for the old server to exit, SIGKILLing one that ignores SIGTERM", { timeout: 60_000 }, async () => {
+		const { spawn, spawnSync } = await import("node:child_process");
+		const tag = `krtest-${process.pid}-${Date.now()}`;
+		// Ignores SIGTERM, like a server stuck in a kernel shutdown.
+		const old = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1e3)", "kernel-server.mjs", tag], {
+			stdio: "ignore",
+		});
+		const exited = new Promise((resolve) => old.once("exit", (code, signal) => resolve(signal)));
+		await new Promise((r) => setTimeout(r, 300));
+		let oldAliveAtLaunch;
+		const sb = {
+			process: {
+				executeCommand: async (command) => {
+					const r = spawnSync("sh", ["-c", command], { encoding: "utf8" });
+					return { exitCode: r.status, result: `${r.stdout}${r.stderr}` };
+				},
+				createSession: async () => {},
+				executeSessionCommand: async () => {
+					// spawnSync held the event loop; let it reap a child that already exited.
+					await new Promise((r) => setTimeout(r, 200));
+					oldAliveAtLaunch = old.exitCode === null && old.signalCode === null;
+				},
+			},
+		};
+		const p = new provider.DaytonaKernelProvider({ daytona: {} });
+		p.serverMatch = `[k]ernel-server.mjs ${tag}`;
+		p.kernelMatch = `[k]ernel-of-${tag}`;
+		try {
+			await p.launchServer(sb, layout(), "v1", "tok");
+			assert.equal(oldAliveAtLaunch, false, "the new server was launched while the old one still held the port");
+			assert.equal(await exited, "SIGKILL");
+		} finally {
+			old.kill("SIGKILL");
+		}
+	});
+
+	it("waitHealthy accepts only the server launched with the new token", async () => {
+		const p = new provider.DaytonaKernelProvider({ daytona: {} });
+		const answers = [healthy("old"), healthy("old"), healthy("new")];
+		p.health = async () => answers.shift() ?? healthy("new");
+		const h = await p.waitHealthy({}, "v1", "new", 5000);
+		assert.equal(h.tokenId, provider.tokenFingerprint("new"));
+		assert.equal(answers.length, 0, "it settled for the old server");
+	});
+
+	it("a server that never comes up is stopped, not left running", async () => {
+		const p = new provider.DaytonaKernelProvider({ daytona: {} });
+		let stopped = 0;
+		p.readServerState = async () => undefined;
+		p.health = async () => undefined;
+		p.launchServer = async () => {};
+		p.waitHealthy = async () => {
+			throw new Error("kernel server did not come up");
+		};
+		p.stopServer = async () => {
+			stopped++;
+		};
+		await assert.rejects(p.ensureServer({}, layout(), "v1", false), /did not come up/);
+		assert.equal(stopped, 1);
+	});
+
+	it("a transient read of server.json does not relaunch a healthy server", async () => {
+		const p = new provider.DaytonaKernelProvider({ daytona: {} });
+		let reads = 0;
+		const sb = {
+			fs: {
+				downloadFile: async () => {
+					if (++reads === 1) throw new Error("socket hang up");
+					return Buffer.from(JSON.stringify({ token: "tok", version: "v1" }));
+				},
+			},
+		};
+		let launched = 0;
+		p.health = async () => healthy("tok");
+		p.launchServer = async () => {
+			launched++;
+		};
+		p.waitHealthy = async (_sb, _v, token) => healthy(token);
+		const server = await p.ensureServer(sb, layout(), "v1", false);
+		assert.equal(launched, 0, "a healthy server was relaunched over a failed read");
+		assert.equal(server.token, "tok");
+	});
+
+	it("server.json that keeps failing to read is an error, and a missing one relaunches", async () => {
+		const p = new provider.DaytonaKernelProvider({ daytona: {} });
+		let launched = 0;
+		p.health = async () => healthy("tok");
+		p.launchServer = async () => {
+			launched++;
+		};
+		p.waitHealthy = async (_sb, _v, token) => healthy(token);
+		const failing = { fs: { downloadFile: async () => Promise.reject(new Error("socket hang up")) } };
+		await assert.rejects(p.ensureServer(failing, layout(), "v1", false), /socket hang up/);
+		assert.equal(launched, 0);
+		const missing = { fs: { downloadFile: async () => Promise.reject(Object.assign(new Error("not found"), { statusCode: 404 })) } };
+		await p.ensureServer(missing, layout(), "v1", false);
+		assert.equal(launched, 1);
+	});
+
+	it("a server answering with another launch's token is relaunched", async () => {
+		const p = new provider.DaytonaKernelProvider({ daytona: {} });
+		let launched = 0;
+		const sb = { fs: { downloadFile: async () => Buffer.from(JSON.stringify({ token: "tok" })) } };
+		p.health = async () => healthy("someone-else");
+		p.launchServer = async () => {
+			launched++;
+		};
+		p.waitHealthy = async (_sb, _v, token) => healthy(token);
+		const server = await p.ensureServer(sb, layout(), "v1", false);
+		assert.equal(launched, 1);
+		assert.notEqual(server.token, "tok");
+	});
+});
+
+describe("provider: cleanup", () => {
+	let DaytonaKernelProvider;
+	before(async () => {
+		({ DaytonaKernelProvider } = await import("../../daytona/provider.mjs"));
+	});
+	const notFound = () => Object.assign(new Error("Sandbox not found"), { name: "DaytonaNotFoundError", statusCode: 404 });
+
+	it("a created sandbox is deleted a day after it stops unless told otherwise", async () => {
+		const daytona = { snapshot: { list: async () => ({ items: [], totalPages: 1 }) }, create: async (params) => params };
+		assert.equal((await new DaytonaKernelProvider({ daytona }).create("c", "v1")).autoDeleteInterval, 1440);
+		assert.equal((await new DaytonaKernelProvider({ daytona, autoDeleteMinutes: -1 }).create("c", "v1")).autoDeleteInterval, -1);
+	});
+
+	it("reap() keeps going past a sandbox that will not delete, and counts one already gone as done", async () => {
+		const labels = { app: "assistant-workspace" };
+		const listed = ["sb-500", "sb-404", "sb-ok"].map((id) => ({ id, state: "stopped", labels: { ...labels, conversation: id } }));
+		const deleted = [];
+		const daytona = {
+			async *list() {
+				for (const sb of listed) yield sb;
+			},
+			async get(id) {
+				if (id === "sb-404") throw notFound();
+				return {
+					id,
+					state: "stopped",
+					delete: async () => {
+						if (id === "sb-500") throw Object.assign(new Error("internal error"), { statusCode: 500 });
+						deleted.push(id);
+					},
+				};
+			},
+		};
+		const reaped = await new DaytonaKernelProvider({ daytona }).reap({ knownConversationIds: [], waitMs: 0 });
+		assert.deepEqual(deleted, ["sb-ok"]);
+		assert.deepEqual(
+			reaped.map((o) => [o.sandboxId, o.error]),
+			[["sb-500", "internal error"], ["sb-404", undefined], ["sb-ok", undefined]],
+		);
+	});
+
+	it("destroy() deletes every sandbox for the conversation, and a repeat is a no-op", async () => {
+		const sandboxes = new Map(
+			["sb-a", "sb-b"].map((id) => [id, { id, state: "stopped", labels: { app: "assistant-workspace", conversation: "conv-1" } }]),
+		);
+		const daytona = {
+			async *list({ labels }) {
+				for (const sb of sandboxes.values()) if (sb.labels.conversation === labels.conversation) yield sb;
+			},
+			async get(id) {
+				const sb = sandboxes.get(id);
+				if (!sb) throw notFound();
+				return { ...sb, delete: async () => sandboxes.delete(id) };
+			},
+		};
+		const p = new DaytonaKernelProvider({ daytona });
+		const first = await p.destroy("conv-1");
+		assert.equal(first.destroyed, true);
+		assert.deepEqual(first.sandboxIds, ["sb-a", "sb-b"]);
+		assert.equal(sandboxes.size, 0);
+		assert.deepEqual(await p.destroy("conv-1"), { destroyed: false });
+		p.bind("conv-1", "sb-gone");
+		assert.deepEqual(await p.destroy("conv-1"), { destroyed: false }, "a bound sandbox already deleted is not an error");
 	});
 });
 

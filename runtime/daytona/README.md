@@ -25,6 +25,7 @@ const kernels = new DaytonaKernelProvider({
   // apiKey/apiUrl/target default to DAYTONA_API_KEY / DAYTONA_API_URL / DAYTONA_TARGET
   labels: { env: "prod" },        // optional; {app: "assistant-workspace"} is always added
   autoStopMinutes: 15,            // Daytona's safety net if stop() is never called
+  autoDeleteMinutes: 1440,        // delete a stopped sandbox after 24 h (the default); -1 keeps it
 });
 ```
 
@@ -32,12 +33,12 @@ const kernels = new DaytonaKernelProvider({
 | --- | --- | --- |
 | `ensure(conversationId, { mounts? })` | `KernelConnectionInfo` | Find the sandbox labelled `app=assistant-workspace, conversation=<id>`, or create it (name `aw-<id>-<hash>`); start it if stopped; install the runtime if the sandbox does not hold the current bundle version; lock egress (`networkBlockAll`); start or verify the kernel server; upload each mount once per content hash; return how to connect. Refuses (throws) unless the server's own probe says egress is blocked. Calls for one conversation are serialised. |
 | `stop(conversationId)` | `{stopped, sandboxId?}` | On idle. SIGTERMs the kernel server first so kernels flush their namespace snapshots, then stops the sandbox. Files, the venv and snapshots persist. |
-| `destroy(conversationId)` | `{destroyed, sandboxId?}` | On conversation delete. |
+| `destroy(conversationId)` | `{destroyed, sandboxId?, sandboxIds?}` | On conversation delete. Deletes every sandbox labelled for the conversation; one already gone counts as deleted, so a repeat call is safe. |
 | `touch(conversationId)` | — | one `refreshActivity()`. |
 | `keepAlive(conversationId, { intervalMs = 60000 })` | `release()` | `refreshActivity()` on an interval. **Hold it while prime is alive.** Traffic on the kernel's WebSocket does not count as Daytona activity: a sandbox with `autoStopInterval: 1` and a heartbeating kernel link was `stopping` at 60 s; the same sandbox under `keepAlive` stayed `started` for 180 s and stopped ~90 s after release. |
 | `listTree(conversationId, dir = "outputs")` | `{path, size, mtimeMs}[]` | every regular file under `dir`, recursively, in one sandbox call; `path` is relative to the work dir. |
 | `listOrphans({ knownConversationIds? })` | `Orphan[]` | Sandboxes with this provider's labels whose conversation is not in the set (all of them if no set). |
-| `reap({ knownConversationIds? })` | `Orphan[]` deleted | Delete every orphan. |
+| `reap({ knownConversationIds? })` | `Orphan[]` deleted | Delete every orphan. One that fails to delete gets `error` on its entry; the rest are still deleted. |
 | `uploadFile(conversationId, path, data)` | sandbox path | `path` relative to the work dir, e.g. `inputs/report.pdf`. Anything escaping the work dir is refused. |
 | `listFiles(conversationId, dir = "outputs")` | `SandboxFile[]` | `{name, path, relPath, isDir, size, modTime}`. |
 | `readFile(conversationId, path)` | `Buffer` | e.g. `outputs/chart.png`. |
