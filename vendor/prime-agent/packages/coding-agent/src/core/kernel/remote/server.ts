@@ -25,7 +25,7 @@ import { basename, dirname, join } from "node:path";
 import { type RawData, type WebSocket, WebSocketServer } from "ws";
 import { ensureTool } from "../../../utils/tools-manager.js";
 import { getKernelVenvDir, type KernelPythonSkill } from "../bootstrap.js";
-import { type HostRequestHandlers, KernelBusyAfterInterruptError, KernelManager } from "../index.js";
+import { cellProgress, type HostRequestHandlers, KernelBusyAfterInterruptError, KernelManager } from "../index.js";
 import { manifestPathIn, snapshotPathIn } from "../state-snapshot.js";
 import { ReliableChannel } from "./channel.js";
 import {
@@ -176,7 +176,8 @@ export function toWireError(error: unknown): WireError {
 	else if (/^Kernel exited/.test(message)) code = "kernel_died";
 	else if (/Kernel has been shut down/.test(message)) code = "kernel_shutdown";
 	else if (error instanceof RemoteRequestError) code = error.code;
-	return { code, name, message };
+	const progress = cellProgress(error);
+	return progress ? { code, name, message, progress } : { code, name, message };
 }
 
 export class RemoteRequestError extends Error {

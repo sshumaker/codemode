@@ -80,6 +80,7 @@ export class RemoteKernelError extends Error {
 		readonly code: WireError["code"],
 		message: string,
 		name = "RemoteKernelError",
+		readonly progress?: WireError["progress"],
 	) {
 		super(message);
 		this.name = name;
@@ -415,7 +416,10 @@ export class RemoteKernelLink {
 				this.pending.delete(message.id);
 				p.onResult?.(message.isRunning);
 				if (message.ok) p.resolve(message.value);
-				else p.reject(new RemoteKernelError(message.error.code, message.error.message, message.error.name));
+				else
+					p.reject(
+						new RemoteKernelError(message.error.code, message.error.message, message.error.name, message.error.progress),
+					);
 				return;
 			}
 			case "stream":

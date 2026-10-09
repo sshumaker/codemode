@@ -13,7 +13,7 @@ import { PassThrough, type Readable } from "node:stream";
 import type { KernelManagerOptions } from "../index.js";
 import { isRemoteKernelEnabled, type RemoteKernelConfig, remoteKernelConfigFromEnv } from "./config.js";
 import { RemoteKernelLink } from "./link.js";
-import { dispatchHostRequest, RemoteKernelManager } from "./manager.js";
+import { dispatchHostRequest, noteKernelCall, RemoteKernelManager } from "./manager.js";
 import { RemotePathMap } from "./pathmap.js";
 import type { PathMapping, ServerMessage } from "./protocol.js";
 
@@ -108,6 +108,7 @@ export function forwardToolCall(
 	signal: AbortSignal,
 ): Promise<{ status: number; headers: Record<string, string>; body: string }> {
 	if (!config.toolProxy) return Promise.reject(new Error("no HARNESS_MCP_PROXY on the loop"));
+	noteKernelCall(message.kernel);
 	const base = new URL(config.toolProxy);
 	const target = new URL(base.pathname.replace(/\/$/, "") + message.path, base);
 	const headers: Record<string, string> = { ...message.headers };

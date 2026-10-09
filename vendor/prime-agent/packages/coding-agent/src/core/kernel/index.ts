@@ -97,6 +97,29 @@ export class KernelBusyAfterInterruptError extends Error {
 	}
 }
 
+/**
+ * How far a cell got before its kernel died. "started" once the kernel picked it up
+ * (execute_input or busy for its request); "called" once it also reached outside the
+ * kernel — a host request, or a tool call through the remote tunnel.
+ *
+ * Carried on the error that fails the execution, so the auto-restart path in
+ * ipython.ts can tell a cell that never ran (safe to send again) from one that may
+ * already have acted (sending it again would act twice). See scripts/neutralize-prime.mjs.
+ */
+export type CellProgress = "started" | "called";
+
+export function markCellProgress<E extends Error>(error: E, progress: CellProgress | undefined): E {
+	if (!progress) return error;
+	const prior = (error as { cellProgress?: CellProgress }).cellProgress;
+	(error as { cellProgress?: CellProgress }).cellProgress = prior === "called" ? prior : progress;
+	return error;
+}
+
+export function cellProgress(error: unknown): CellProgress | undefined {
+	const progress = (error as { cellProgress?: unknown } | undefined)?.cellProgress;
+	return progress === "started" || progress === "called" ? progress : undefined;
+}
+
 /** Comm target the kernel-side `rlm.host_request` shim opens for typed host requests. */
 export const HOST_COMM_TARGET = "host.request";
 
@@ -402,6 +425,7 @@ interface ActiveExecution {
 	wait?: Record<string, unknown>;
 	error?: ExecuteResult["error"];
 	status: ExecuteResult["status"];
+	progress?: CellProgress;
 	settled: boolean;
 	resolve: (result: ExecuteResult) => void;
 	reject: (error: Error) => void;
@@ -1155,6 +1179,7 @@ export class KernelManager {
 		}
 
 		const t = incoming.header.msg_type;
+		if (t === "execute_input" || t === "status") execution.progress ??= "started";
 		if (execution.settled && (t === "display_data" || t === "update_display_data")) {
 			const content = incoming.content as { data?: Record<string, unknown> };
 			if (this.dispatchLateSentAgentMessage(parentMessageId, content.data?.[AGENT_MESSAGE_DISPLAY_MIME])) {
@@ -1294,7 +1319,7 @@ export class KernelManager {
 			return;
 		}
 		this.activeExecution = undefined;
-		execution.reject(error);
+		execution.reject(markCellProgress(error, execution.progress));
 		this.notifyActiveExecutionIdle();
 	}
 
@@ -1436,6 +1461,7 @@ export class KernelManager {
 		// Tag the request with the cell that triggered it. A blocking call is still
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
+		if (this.activeExecution) this.activeExecution.progress = "called";
 		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
 		return handler({ ...data, cellSourceCode });
 	}
@@ -1599,7 +1625,11 @@ export class KernelManager {
 		if (!cfg) return null;
 		const code = buildRestoreCode(cfg.path);
 		try {
-			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true });
+			const r = await this.enqueueExecute(code, {
+				maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS,
+				internal: true,
+				signal: AbortSignal.timeout(Number(process.env.HARNESS_SNAPSHOT_RESTORE_TIMEOUT_MS) || 120_000),
+			});
 			if (r.status !== "ok") {
 				this.appendKernelDiagnostic(`state restore failed: ${r.error?.evalue ?? r.stderr}`);
 				return null;

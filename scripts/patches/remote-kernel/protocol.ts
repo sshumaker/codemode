@@ -18,7 +18,7 @@
  * `reqId` chosen by the server and are answered with the matching `*_response`.
  */
 import type { KernelPythonSkill } from "../bootstrap.js";
-import type { ExecuteResult, KernelSentAgentMessage } from "../index.js";
+import type { CellProgress, ExecuteResult, KernelSentAgentMessage } from "../index.js";
 
 export const PROTOCOL_VERSION = 2;
 
@@ -37,6 +37,8 @@ export interface WireError {
 	code: WireErrorCode;
 	name: string;
 	message: string;
+	/** How far the cell got before the kernel died, when the failure ended one. */
+	progress?: CellProgress;
 }
 
 /** What the sandbox side says about its own boundary, reported once per socket. */

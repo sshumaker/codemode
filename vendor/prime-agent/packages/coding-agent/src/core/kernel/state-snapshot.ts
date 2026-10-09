@@ -158,8 +158,12 @@ def _prime_agent_restore_state():
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "dill unavailable: " + _b.str(_err)}))
         return
 
+    # Load from a side name: a payload that kills the kernel must not do it again
+    # on the next boot. It goes back only once every name has been revived.
+    aside = ${pyStr(inPath)} + ".restoring"
     try:
-        with _b.open(${pyStr(inPath)}, "rb") as fh:
+        os.replace(${pyStr(inPath)}, aside)
+        with _b.open(aside, "rb") as fh:
             payload = dill.load(fh)
     except _b.Exception as _err:
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "load failed: " + _b.str(_err)}))
@@ -183,6 +187,10 @@ def _prime_agent_restore_state():
             restored.append(name)
         except _b.Exception as _err:
             failed.append({"name": name, "reason": _b.type(_err).__name__ + ": " + _b.str(_err)[:200]})
+    try:
+        os.replace(aside, ${pyStr(inPath)})
+    except _b.Exception:
+        pass
     _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": _b.sorted(restored), "failed": failed}))
 
 

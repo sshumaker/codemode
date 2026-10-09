@@ -1469,6 +1469,162 @@ sub(
 	'modelId.includes("opus-5-5")',
 );
 
+// --- kernel recovery: never repeat a cell, never wedge -----------------------
+//
+// Three ways the kernel's own recovery made a run worse than the failure it
+// recovered from.
+//
+// A dead kernel re-ran the cell. The auto-restart above sent the same cell to the
+// fresh kernel up to three times, so a cell that had written a file or called a
+// tool before the kernel died did it again, with nothing in the result to say so.
+// The execution now records how far the cell got (scripts/patches/cell-progress.ts):
+// a cell the kernel never picked up is still sent again, one that started is
+// reported as died-mid-run and left for the model to judge.
+log("\nkernel recovery:");
+
+sub(
+	"core/kernel/index.ts",
+	'\t\tthis.name = "KernelBusyAfterInterruptError";\n\t}\n}\n',
+	`\t\tthis.name = "KernelBusyAfterInterruptError";\n\t}\n}\n\n${patch("cell-progress.ts")}\n`,
+	"cell progress travels on the error that fails an execution",
+	"function markCellProgress",
+);
+sub(
+	"core/kernel/index.ts",
+	"\tsettled: boolean;\n\tresolve: (result: ExecuteResult) => void;",
+	"\tprogress?: CellProgress;\n\tsettled: boolean;\n\tresolve: (result: ExecuteResult) => void;",
+	"an execution records how far its cell got",
+	"\tprogress?: CellProgress;\n",
+);
+sub(
+	"core/kernel/index.ts",
+	'\t\tconst t = incoming.header.msg_type;\n\t\tif (execution.settled && (t === "display_data"',
+	'\t\tconst t = incoming.header.msg_type;\n' +
+		'\t\tif (t === "execute_input" || t === "status") execution.progress ??= "started";\n' +
+		'\t\tif (execution.settled && (t === "display_data"',
+	"the kernel picking a cell up marks it started",
+	'execution.progress ??= "started"',
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\tconst cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;",
+	'\t\tif (this.activeExecution) this.activeExecution.progress = "called";\n' +
+		"\t\tconst cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;",
+	"a host request marks the running cell as having called out",
+	'this.activeExecution.progress = "called"',
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\tthis.activeExecution = undefined;\n\t\texecution.reject(error);",
+	"\t\tthis.activeExecution = undefined;\n\t\texecution.reject(markCellProgress(error, execution.progress));",
+	"a failed execution says how far its cell got",
+	"execution.reject(markCellProgress(",
+);
+sub(
+	"core/tools/ipython.ts",
+	"import {\n\ttype ExecuteResult,\n\ttype HostRequestHandlers,",
+	"import {\n\ttype CellProgress,\n\tcellProgress,\n\ttype ExecuteResult,\n\ttype HostRequestHandlers,",
+	"ipython.ts imports cell progress",
+	"\ttype CellProgress,\n\tcellProgress,\n",
+);
+sub(
+	"core/tools/ipython.ts",
+	"const KERNEL_RESTART_NOTICE = [",
+	"/** A cell whose kernel died after it started: reported, never sent again. */\n" +
+		"function cellDiedResult(progress: CellProgress): ExecuteResult {\n" +
+		'\tconst after = progress === "called" ? "after it had already made tool or host calls" : "after it had started running";\n' +
+		"\treturn {\n" +
+		'\t\tstdout: "",\n' +
+		"\t\tstderr: `This cell did not finish: the kernel process died ${after}. It was not run again, because what it already did may have taken effect. Check what landed before repeating any of it.`,\n" +
+		'\t\tstatus: "error",\n' +
+		"\t\tdurationMs: 0,\n" +
+		"\t};\n" +
+		"}\n" +
+		"const KERNEL_RESTART_NOTICE = [",
+	"the result a died-mid-run cell reports",
+	"function cellDiedResult(",
+);
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\t\tkernelRestarted = true;\n\t\t\t\tkernelDied = true;\n\t\t\t\tcontinue;",
+	"\t\t\t\tkernelRestarted = true;\n" +
+		"\t\t\t\tkernelDied = true;\n" +
+		"\t\t\t\tconst progress = cellProgress(error);\n" +
+		"\t\t\t\tif (progress) {\n" +
+		"\t\t\t\t\tawait provisioner.ensure(reportStartupProgress, signal);\n" +
+		"\t\t\t\t\treturn { kernelDied, kernelRestarted, result: cellDiedResult(progress) };\n" +
+		"\t\t\t\t}\n" +
+		"\t\t\t\tcontinue;",
+	"a cell that started is not sent to the fresh kernel",
+	"result: cellDiedResult(progress)",
+);
+
+// A busy kernel with no UI never recovered. Upstream asks a person whether to wait
+// or kill; print mode has no person, so it answered "cancel", and a cell that
+// ignored its interrupt failed every later cell for the rest of the run. Under the
+// same flag as the dead-kernel restart: one more round of interrupts, then restart.
+sub(
+	"core/tools/ipython.ts",
+	"\tlet kernelDied = false;\n\twhile (true) {",
+	"\tlet kernelDied = false;\n\tlet busyWithoutUi = 0;\n\twhile (true) {",
+	"count busy rounds nobody could answer",
+	"let busyWithoutUi = 0;",
+);
+sub(
+	"core/tools/ipython.ts",
+	"\t\t\tconst action = await chooseBusyKernelAction(ctx, signal);",
+	'\t\t\tconst action =\n' +
+		'\t\t\t\t!ctx?.hasUI && process.env.HARNESS_KERNEL_AUTORESTART === "1"\n' +
+		'\t\t\t\t\t? busyWithoutUi++ === 0\n' +
+		'\t\t\t\t\t\t? "wait"\n' +
+		'\t\t\t\t\t\t: "kill"\n' +
+		"\t\t\t\t\t: await chooseBusyKernelAction(ctx, signal);",
+	"with nobody to ask, a busy kernel is restarted after one more round",
+	"busyWithoutUi++ === 0",
+);
+
+// A bad snapshot blocked every restart. The restore runs during startup, so a
+// payload that crashed or hung the kernel did it again on every boot, and the
+// session never got a kernel back. The restore now loads from a side name and puts
+// the file back only once it has loaded, and gives up after
+// HARNESS_SNAPSHOT_RESTORE_TIMEOUT_MS (default 120s).
+sub(
+	"core/kernel/state-snapshot.ts",
+	'    try:\n        with _b.open(${pyStr(inPath)}, "rb") as fh:\n            payload = dill.load(fh)',
+	'    # Load from a side name: a payload that kills the kernel must not do it again\n' +
+		'    # on the next boot. It goes back only once every name has been revived.\n' +
+		'    aside = ${pyStr(inPath)} + ".restoring"\n' +
+		"    try:\n" +
+		"        os.replace(${pyStr(inPath)}, aside)\n" +
+		'        with _b.open(aside, "rb") as fh:\n' +
+		"            payload = dill.load(fh)",
+	"restore loads the snapshot from a side name",
+	'aside = ${pyStr(inPath)} + ".restoring"',
+);
+sub(
+	"core/kernel/state-snapshot.ts",
+	'    _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": _b.sorted(restored), "failed": failed}))',
+	"    try:\n" +
+		"        os.replace(aside, ${pyStr(inPath)})\n" +
+		"    except _b.Exception:\n" +
+		"        pass\n" +
+		'    _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": _b.sorted(restored), "failed": failed}))',
+	"a snapshot that restored is put back",
+	"os.replace(aside, ${pyStr(inPath)})",
+);
+sub(
+	"core/kernel/index.ts",
+	"\t\t\tconst r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true });\n\t\t\tif (r.status !== \"ok\") {\n\t\t\t\tthis.appendKernelDiagnostic(`state restore failed",
+	"\t\t\tconst r = await this.enqueueExecute(code, {\n" +
+		"\t\t\t\tmaxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS,\n" +
+		"\t\t\t\tinternal: true,\n" +
+		"\t\t\t\tsignal: AbortSignal.timeout(Number(process.env.HARNESS_SNAPSHOT_RESTORE_TIMEOUT_MS) || 120_000),\n" +
+		"\t\t\t});\n" +
+		"\t\t\tif (r.status !== \"ok\") {\n\t\t\t\tthis.appendKernelDiagnostic(`state restore failed",
+	"the snapshot restore has a deadline",
+	"HARNESS_SNAPSHOT_RESTORE_TIMEOUT_MS",
+);
+
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.
  *

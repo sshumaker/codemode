@@ -9,6 +9,8 @@ import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
 import {
+	type CellProgress,
+	cellProgress,
 	type ExecuteResult,
 	type HostRequestHandlers,
 	type KernelAttachment,
@@ -666,6 +668,16 @@ const KERNEL_DEATH_NOTICE = [
 	"The IPython kernel process died and a fresh one was started. Every variable, import and in-memory object defined before this point is gone; recreate anything you still need. Nothing outside the process was lost: your files and this working directory are intact on disk, and background jobs kept running — `jobs.manifest()` lists them, `jobs.get('<name>')` reaches one.",
 	"</ipython_kernel_restarted>",
 ].join("\n");
+/** A cell whose kernel died after it started: reported, never sent again. */
+function cellDiedResult(progress: CellProgress): ExecuteResult {
+	const after = progress === "called" ? "after it had already made tool or host calls" : "after it had started running";
+	return {
+		stdout: "",
+		stderr: `This cell did not finish: the kernel process died ${after}. It was not run again, because what it already did may have taken effect. Check what landed before repeating any of it.`,
+		status: "error",
+		durationMs: 0,
+	};
+}
 const KERNEL_RESTART_NOTICE = [
 	"<ipython_kernel_reset>",
 	"The IPython kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.",
@@ -1105,6 +1117,7 @@ async function executeWithBusyKernelChoice(
 	// Bounded: a kernel that dies on every boot must fail the call, not spin.
 	let deadKernelRestarts = 0;
 	let kernelDied = false;
+	let busyWithoutUi = 0;
 	while (true) {
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
@@ -1134,12 +1147,22 @@ async function executeWithBusyKernelChoice(
 				await provisioner.kill();
 				kernelRestarted = true;
 				kernelDied = true;
+				const progress = cellProgress(error);
+				if (progress) {
+					await provisioner.ensure(reportStartupProgress, signal);
+					return { kernelDied, kernelRestarted, result: cellDiedResult(progress) };
+				}
 				continue;
 			}
 			if (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {
 				throw error;
 			}
-			const action = await chooseBusyKernelAction(ctx, signal);
+			const action =
+				!ctx?.hasUI && process.env.HARNESS_KERNEL_AUTORESTART === "1"
+					? busyWithoutUi++ === 0
+						? "wait"
+						: "kill"
+					: await chooseBusyKernelAction(ctx, signal);
 			if (action === "wait") {
 				onWorkingMessage("Waiting for IPython kernel...");
 				continue;

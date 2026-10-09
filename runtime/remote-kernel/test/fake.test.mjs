@@ -121,6 +121,48 @@ describe("ipython tool over the remote kernel [fake]", () => {
 			await srv.stop();
 		}
 	});
+	it("a cell that made a tool call before its kernel died is reported, not run again", { timeout: 120_000 }, async () => {
+		const { RemoteKernelLink } = await import(`${DIST}/core/kernel/remote/link.js`);
+		const { dispatchHostRequest } = await import(`${DIST}/core/kernel/remote/manager.js`);
+		const { RemotePathMap } = await import(`${DIST}/core/kernel/remote/pathmap.js`);
+		const { forwardToolCall, setRemoteRuntimeForTest } = await import(`${DIST}/core/kernel/remote/tools.js`);
+		const { createAllToolDefinitions } = await import(`${DIST}/core/tools/index.js`);
+		const srv = await startFakeServer();
+		const proxy = await startFixtureProxy();
+		const link = new RemoteKernelLink({ connection: () => ({ url: srv.url, token: srv.token }), pingIntervalMs: 2000, deadAfterMs: 10_000 });
+		link.handlers.hostRequest = dispatchHostRequest;
+		link.handlers.httpRequest = (m, signal) => forwardToolCall({ toolProxy: proxy.url, toolTimeoutMs: 60_000 }, m, signal);
+		const local = mkdtempSync(join(tmpdir(), "rk-died-"));
+		const saved = { ...process.env };
+		process.env.HARNESS_REMOTE_KERNEL_URL = srv.url;
+		process.env.HARNESS_KERNEL_AUTORESTART = "1";
+		setRemoteRuntimeForTest(
+			{ config: { remoteCwd: srv.cwd }, link, pathMap: () => new RemotePathMap([{ local, remote: srv.cwd }]) },
+			local,
+		);
+		const tools = createAllToolDefinitions(local, {});
+		const text = (r) => r.content.map((c) => c.text ?? "").join("");
+		try {
+			const died = await tools.ipython.execute("died", {
+				code:
+					"import json, os, urllib.request\n" +
+					'body = json.dumps({"server": "fixture", "tool": "echo", "args": {"text": "charge"}}).encode()\n' +
+					'urllib.request.urlopen(urllib.request.Request(os.environ["HARNESS_MCP_PROXY"] + "/call", data=body, headers={"content-type": "application/json"})).read()\n' +
+					"os._exit(1)",
+			});
+			assert.equal(proxy.calls.length, 1, "the tool call was repeated on the fresh kernel");
+			assert.match(text(died), /after it had already made tool or host calls/);
+			assert.match(text(await tools.ipython.execute("next", { code: "print(6 * 7)" })), /42/);
+		} finally {
+			await tools.ipython.dispose?.();
+			await link.close({ bye: true });
+			setRemoteRuntimeForTest(undefined);
+			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+			Object.assign(process.env, saved);
+			await proxy.close();
+			await srv.stop();
+		}
+	});
 });
 
 // jobs.wait ends the TURN (bench/test/wait-ends-turn.test.mjs pins it locally). The

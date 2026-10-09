@@ -17,6 +17,7 @@
 import { randomUUID } from "node:crypto";
 import type { KernelPythonSkill } from "../bootstrap.js";
 import {
+	type CellProgress,
 	type ExecuteOptions,
 	type ExecuteResult,
 	type HostRequestHandlers,
@@ -24,6 +25,7 @@ import {
 	KernelManager,
 	type KernelManagerOptions,
 	type KernelStartOptions,
+	markCellProgress,
 } from "../index.js";
 import type { RestoreResult, SnapshotResult } from "../state-snapshot.js";
 import { forwardedKernelEnv } from "./config.js";
@@ -49,6 +51,12 @@ export interface RemoteTiming {
 }
 
 const hostHandlerRegistry = new Map<string, HostRequestHandlers>();
+const kernelsThatCalled = new Set<string>();
+
+/** A cell on `kernel` reached outside the sandbox: if it dies now, it may already have acted. */
+export function noteKernelCall(kernel: string): void {
+	kernelsThatCalled.add(kernel);
+}
 
 /** The link's host-request handler: route each request to the kernel that made it. */
 export async function dispatchHostRequest(
@@ -58,6 +66,7 @@ export async function dispatchHostRequest(
 	const type = typeof payload.type === "string" ? payload.type : "";
 	const handler = hostHandlerRegistry.get(kernel)?.[type];
 	if (!handler) throw new Error(`host request type "${type}" is not available in this session`);
+	noteKernelCall(kernel);
 	return handler(payload);
 }
 
@@ -65,6 +74,7 @@ function mapError(error: unknown): Error {
 	if (error instanceof RemoteKernelError && error.code === "busy_after_interrupt") {
 		return new KernelBusyAfterInterruptError();
 	}
+	if (error instanceof RemoteKernelError) return markCellProgress(error, error.progress);
 	return error instanceof Error ? error : new Error(String(error));
 }
 
@@ -154,6 +164,14 @@ export class RemoteKernelManager extends KernelManager {
 		if (this.shutDown) throw new Error("Kernel has been shut down");
 		const t0 = performance.now();
 		let id: number | undefined;
+		kernelsThatCalled.delete(this.kernelId);
+		// The server says how far the cell got when its kernel died; a lost link cannot,
+		// so what this side saw of the cell counts too.
+		let progress: CellProgress | undefined;
+		const onStream: ExecuteOptions["onStream"] = (chunk, name) => {
+			progress = "started";
+			opts.onStream?.(chunk, name);
+		};
 		const onAbort = () => {
 			if (id !== undefined) this.link.post({ op: "abort", id });
 		};
@@ -169,7 +187,7 @@ export class RemoteKernelManager extends KernelManager {
 					wantLate: Boolean(opts.onLateSentAgentMessage),
 				}),
 				{
-					onStream: opts.onStream,
+					onStream,
 					onLate: opts.onLateSentAgentMessage,
 					onResult: (running) => {
 						if (running !== undefined) this.running = running;
@@ -183,7 +201,8 @@ export class RemoteKernelManager extends KernelManager {
 			this.lastTiming = { clientMs: performance.now() - t0, serverMs: result.durationMs };
 			return result;
 		} catch (error) {
-			throw mapError(error);
+			if (kernelsThatCalled.has(this.kernelId)) progress = "called";
+			throw markCellProgress(mapError(error), progress);
 		} finally {
 			opts.signal?.removeEventListener("abort", onAbort);
 		}
@@ -250,6 +269,7 @@ export class RemoteKernelManager extends KernelManager {
 		this.shutDown = true;
 		this.running = false;
 		hostHandlerRegistry.delete(this.kernelId);
+		kernelsThatCalled.delete(this.kernelId);
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.releaseHold?.();
