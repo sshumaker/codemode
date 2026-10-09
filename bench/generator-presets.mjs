@@ -56,3 +56,22 @@ export const PRODUCT_PORT_OPTIONS = Object.freeze({
 	moduleIndex: true,
 	serverAlias: false,
 });
+
+/**
+ * A product SDK's port: PRODUCT_PORT_OPTIONS' ref and bridge vocabulary, with the
+ * per-build choices made and nothing that names an experiment-lab tool. The SDK's
+ * catalogue has no `api.assets.read`, `api.review.result` or `create_image_*`, so
+ * the wait surface and `_types.py` teach with the neutral placeholders instead.
+ * A server whose module a category already has renders as `<server>_connector`.
+ */
+export const SDK_PORT_OPTIONS = Object.freeze({
+	...PRODUCT_PORT_OPTIONS,
+	apiLayout: "consolidated",
+	validateArgs: true,
+	typedReturns: true,
+	allowUntyped: true,
+	waitBridge: false,
+	typesExample: null,
+	waitCalls: null,
+	serverModuleSuffix: "connector",
+});

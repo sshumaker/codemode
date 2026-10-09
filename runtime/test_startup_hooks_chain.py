@@ -19,6 +19,7 @@ Also covers HARNESS_API_PREBIND: `api.<module>` resolves before any import, and
 survives `%reset -f`.
 """
 
+import json
 import os
 import sys
 import textwrap
@@ -27,12 +28,10 @@ from pathlib import Path
 import pytest
 
 RUNTIME = Path(__file__).resolve().parent
-HOOKS = ["eperm_correction.py", "api_layout_correction.py", "api_prebind.py", "api_signature_correction.py", "api_doc_expansion.py"]
-FLAGS = {
-    "HARNESS_API_LAYOUT_CORRECTION": "1",
-    "HARNESS_API_PREBIND": "1",
-    "HARNESS_API_SIGNATURE_CORRECTION": "1",
-}
+# The same manifest a port installs from (bench/startup-hooks.mjs).
+_MANIFEST = json.loads((RUNTIME / "startup_hooks.json").read_text())
+HOOKS = _MANIFEST["order"]
+FLAGS = _MANIFEST["env"]
 
 pytest.importorskip("IPython")
 

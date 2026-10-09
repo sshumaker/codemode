@@ -283,9 +283,14 @@ export function normalizeTool(tool) {
 	// Required parameters must precede optional ones in a Python signature.
 	params.sort((a, b) => Number(b.required) - Number(a.required));
 
+	// A catalogue may name the Python function apart from the wire tool: `pyName`
+	// (or `call_name`, the product catalogue's spelling) wins over the derived name,
+	// and `_call` still sends `name`.
+	const override = tool.pyName ?? tool.py_name ?? tool.call_name;
 	return {
 		name: tool.name,
-		pyName: tool.launches ? `spawn_${pyIdent(tool.name).replace(/_tool$/, "")}` : pyIdent(tool.name),
+		pyName: override ? pyIdent(String(override)) : tool.launches ? `spawn_${pyIdent(tool.name).replace(/_tool$/, "")}` : pyIdent(tool.name),
+		renamed: Boolean(override),
 		description: (tool.description ?? "").trim(),
 		// Optional, and optional per TOOL rather than per server: the registry knows
 		// which of its actions are image work and which are video work, and a
@@ -713,8 +718,10 @@ export function renderSchemas(normalized, { waitSurface = false, modules = null 
 	const tools = {};
 	const examples = {};
 	const time = {};
+	const functions = {};
 	for (const { server, pyServer, tools: list } of normalized) {
 		packages[server] = pyServer ?? pyPackage(server);
+		for (const t of list) if (t.renamed) (functions[server] ??= {})[t.name] = t.pyName;
 		tools[server] = Object.fromEntries(list.map((t) => [t.name, stripProse(t.schema)]));
 		// W130: the time facts, per tool, for the forwarder (which tools need finished
 		// inputs; which are launches). Same source as the wrappers' docstrings.
@@ -740,6 +747,8 @@ export function renderSchemas(normalized, { waitSurface = false, modules = null 
 	// Only a tree with category modules carries it: there the server's package is not
 	// where the function lives, so an error naming it names a call that was never made.
 	if (modules && Object.keys(modules).length > 0) table.modules = modules;
+	// Only a catalogue that names functions apart from their tools carries it.
+	if (Object.keys(functions).length > 0) table.functions = functions;
 	return `${JSON.stringify(table, null, 1)}\n`;
 }
 
@@ -776,7 +785,7 @@ export function categoryModuleMap(normalized, claimed) {
  * Stdlib only, like the rest of the transport: the kernel is a bare uv-managed
  * environment and an ImportError would silently disable the whole arm.
  */
-function renderValidator() {
+function renderValidator({ renamed = false } = {}) {
 	return `
 _SCHEMAS_PATH = os.path.join(os.path.dirname(__file__), "_schemas.json")
 _SCHEMAS: dict | None = None
@@ -957,7 +966,7 @@ def _validate(server: str, tool: str, args: dict) -> None:
     # be pasted back into a cell.
     # In a category layout the function lives in its category's module, not the server's.
     module = ((_table().get("modules") or {}).get(server) or {}).get(tool)
-    call = f"api.{module or (_table().get('packages') or {}).get(server, server)}.{tool}"
+    call = f"api.{module or (_table().get('packages') or {}).get(server, server)}.{${renamed ? `((_table().get('functions') or {}).get(server) or {}).get(tool, tool)` : "tool"}}"
 
     for name in schema.get("required", []):
         if name not in args:
@@ -1945,6 +1954,8 @@ export function renderClient({
 	bridgeHeader = DEFAULT_BRIDGE_HEADER,
 	bridgeHeaderNote = null,
 	waitCalls = null,
+	// Some tool's Python name was set apart from its wire name: errors look it up.
+	renamed = false,
 } = {}) {
 	const mode = docsGateMode(docsGate);
 	if (readGate && mode !== "off") {
@@ -2203,7 +2214,7 @@ def _read_first(server: str, tool: str, path: str) -> None:
 `;
 
 	const gate = readGate ? readFirst : mode === "redirect" ? redirect : mode === "inline" ? inline : "";
-	const validator = validateArgs ? renderValidator() : "";
+	const validator = validateArgs ? renderValidator({ renamed }) : "";
 	// Rendered only for the helpers the catalogue actually needs — an unused helper
 	// in the tree is one more thing in the agent's `grep -ril` and one more line of
 	// difference between two trees that are supposed to be identical.
@@ -2716,6 +2727,9 @@ export function generate(
 		// operation families in the root index's "what it holds" column, and the
 		// `head -60` pointer at that header.
 		moduleIndex = false,
+		// Consolidated: a server module whose name a category module already has is
+		// renamed `<server>_<suffix>`. null refuses the catalogue instead.
+		serverModuleSuffix = "server",
 	} = {},
 ) {
 	const gateMode = docsGateMode(docsGate);
@@ -2757,6 +2771,7 @@ export function generate(
 			if (n > 0) t.pyName = `${t.pyName}_${n + 1}`;
 		}
 	}
+	if (layoutMode === "consolidated") separateServerModules(normalized, { serverAlias, suffix: serverModuleSuffix });
 
 	// Which coercion helpers this catalogue needs. Computed from the normalized
 	// tools rather than passed in as a flag: an adapter is a property of the
@@ -2846,7 +2861,7 @@ export function generate(
 		// Throws on read-gate + docs-gate and on read-gate + per-method, before a
 		// single file is written. A tree that half-satisfies a label is the failure
 		// mode this project keeps rediscovering.
-		"_client.py": renderClient({ docsGate: gateMode, readGate, validateArgs, adapters, nullable, waitBridge: waitBridge && hasWaitTool, apiLayout: layoutMode, typedReturns, returnShapes, waitSurface, bridgeHeader, bridgeHeaderNote, waitCalls }),
+		"_client.py": renderClient({ docsGate: gateMode, readGate, validateArgs, adapters, nullable, waitBridge: waitBridge && hasWaitTool, apiLayout: layoutMode, typedReturns, returnShapes, waitSurface, bridgeHeader, bridgeHeaderNote, waitCalls, renamed: allTools.some((t) => t.renamed) }),
 	};
 	// Only when the gate is on: the map is the gate's evidence, and an unused span
 	// table in the tree is one more hit in the agent's `grep -ril`.
@@ -2888,9 +2903,9 @@ export function generate(
 					readGate,
 					waitBridge,
 				});
-				files[`${group.module}.py`] = part.text;
+				emitModule(files, group.module, part.text);
 				if (lineMap) lineMap[group.module] = part.lineMap;
-				modules.push({ module: group.module, server, category: group.category, count: group.tools.length, names: group.tools.map((t) => t.pyName) });
+				modules.push(moduleEntry(group.module, server, group.category, group.tools));
 			}
 			// The server module: the ungrouped tools in full, plus an alias for the
 			// grouped ones so a call written before the split keeps working.
@@ -2900,22 +2915,21 @@ export function generate(
 					? renderAppModuleParts(rest, { server, pkg: pyServer, docsGate: gateMode, readGate, waitBridge, typedReturns, returnShapes, constraintNotes, moduleIndex })
 					: null;
 			if (groups.length === 0) {
-				files[`${pyServer}.py`] = part.text;
+				emitModule(files, pyServer, part.text);
 				if (lineMap) lineMap[pyServer] = part.lineMap;
-				modules.push({ module: pyServer, server, category: null, count: tools.length, names: tools.map((t) => t.pyName) });
+				modules.push(moduleEntry(pyServer, server, null, tools));
 			} else if (serverAlias || rest.length > 0) {
 				// W130: with `serverAlias: false` (the codemode bundle's default) the server
 				// module is emitted only if it still DEFINES something (ungrouped tools). The
 				// pure re-export alias showed every tool again under the server's name —
 				// `dir(api.agent_tools)` in 7 of 12 h65 traces — undoing the split.
-				files[`${pyServer}.py`] = renderServerAlias(server, pyServer, groups, part?.text ?? "");
+				emitModule(files, pyServer, renderServerAlias(server, pyServer, groups, part?.text ?? ""));
 				if (lineMap && part) lineMap[pyServer] = part.lineMap;
-				if (rest.length > 0) {
-					modules.push({ module: pyServer, server, category: null, count: rest.length, names: rest.map((t) => t.pyName) });
-				}
+				if (rest.length > 0) modules.push(moduleEntry(pyServer, server, null, rest));
 			}
 			continue;
 		}
+		modules.push(moduleEntry(pyServer, server, null, tools));
 		files[`${pyServer}/INDEX.md`] = renderServerIndex(tools, { server, pkg: pyServer, docsGate: gateMode, waitBridge });
 		files[`${pyServer}/__init__.py`] = renderServerInit(tools, { server });
 		// The redirect target. Both live modes render it: `redirect` sends the agent
@@ -2939,5 +2953,59 @@ export function generate(
 	});
 	if (lineMap) files["_linemap.json"] = `${JSON.stringify(lineMap, null, 1)}\n`;
 
-	return { toolDefs, tocLines, names, files, normalized };
+	return { toolDefs, tocLines, names, files, normalized, modules, callPaths: callPathMap(modules), moduleToc: renderModuleToc(modules) };
+}
+
+/** One importable module: what `generate()` returns in `modules` and the root INDEX lists. */
+function moduleEntry(module, server, category, tools) {
+	return { module, server, category, count: tools.length, names: tools.map((t) => t.pyName), tools: tools.map((t) => t.name) };
+}
+
+/** `{"api.<module>.<function>": {server, tool}}`: the call a cell types, and what goes on the wire. */
+export function callPathMap(modules) {
+	const out = {};
+	for (const m of modules) m.names.forEach((fn, i) => (out[`api.${m.module}.${fn}`] = { server: m.server, tool: m.tools[i] }));
+	return out;
+}
+
+/** One line per module: its import path, tool count and the families of tools in it. */
+export function renderModuleToc(modules) {
+	const sorted = [...modules].sort((a, b) => (a.module < b.module ? -1 : a.module > b.module ? 1 : 0));
+	const width = Math.max(0, ...sorted.map((m) => `api.${m.module}`.length));
+	return sorted.map((m) => {
+		const count = `${m.count} tool${m.count === 1 ? "" : "s"}`;
+		return `  ${`api.${m.module}`.padEnd(width)}  ${count.padStart(8)} — ${operationFamilies(m.names)}`;
+	});
+}
+
+/** Write `api/<module>.py`, refusing to overwrite one already emitted. */
+function emitModule(files, module, text) {
+	const path = `${module}.py`;
+	if (path in files) throw new Error(`two modules render to api/${path}; rename a server or a category`);
+	files[path] = text;
+}
+
+/**
+ * Consolidated layout: rename a server whose own module would land on a category
+ * module's file. A server and a category are named independently (a connector
+ * called `notion` beside a category `notion`), and without this the second write
+ * replaced the first. The rename is `<server>_<suffix>`, numbered if that is taken;
+ * only the Python package moves, `_call` still sends the server's own name.
+ */
+export function separateServerModules(normalized, { serverAlias = true, suffix = "server" } = {}) {
+	const claimed = claimedCategories(normalized);
+	const layouts = normalized.map((s) => ({ s, ...categoryModules(s.tools, s.pyServer, claimed) }));
+	const categories = new Set(layouts.flatMap((l) => l.groups.map((g) => g.module)));
+	const taken = new Set([...categories, ...normalized.map((s) => s.pyServer)]);
+	for (const { s, groups, ungrouped } of layouts) {
+		const emitsServer = groups.length === 0 || serverAlias || ungrouped.length > 0;
+		if (!emitsServer || !categories.has(s.pyServer)) continue;
+		if (suffix === null) {
+			throw new Error(`server ${JSON.stringify(s.server)} and a category both render api/${s.pyServer}.py; set serverModuleSuffix to rename the server`);
+		}
+		let name = `${s.pyServer}_${pyPackage(suffix)}`;
+		for (let n = 2; taken.has(name); n++) name = `${s.pyServer}_${pyPackage(suffix)}_${n}`;
+		taken.add(name);
+		s.pyServer = name;
+	}
 }

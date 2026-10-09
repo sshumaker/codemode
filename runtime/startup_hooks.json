@@ -1,0 +1,14 @@
+{
+ "order": [
+  "eperm_correction.py",
+  "api_layout_correction.py",
+  "api_prebind.py",
+  "api_signature_correction.py",
+  "api_doc_expansion.py"
+ ],
+ "env": {
+  "HARNESS_API_LAYOUT_CORRECTION": "1",
+  "HARNESS_API_PREBIND": "1",
+  "HARNESS_API_SIGNATURE_CORRECTION": "1"
+ }
+}
