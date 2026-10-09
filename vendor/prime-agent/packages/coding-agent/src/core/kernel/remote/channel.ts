@@ -67,9 +67,11 @@ export class ReliableChannel<In, Out> {
 		return this.overflowed;
 	}
 
+	/** Throws, without using up a sequence number, when `message` cannot be encoded. */
 	send(message: Out): void {
-		const seq = ++this.outSeq;
+		const seq = this.outSeq + 1;
 		const raw = encodeFrame<Out>({ t: "d", seq, m: message });
+		this.outSeq = seq;
 		this.outbox.push({ seq, raw });
 		this.bufferedBytes += raw.length;
 		if (!this.sink && this.bufferedBytes > (this.options.maxBufferedBytes ?? 256 * 1024 * 1024)) {

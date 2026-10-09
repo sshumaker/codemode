@@ -35,6 +35,8 @@ import {
 	encodeFrame,
 	type Frame,
 	type KernelMethod,
+	isOversizedCall,
+	MAX_CALL_FRAME_CHARS,
 	PROTOCOL_VERSION,
 	type RemoteStartOptions,
 	type ServerMessage,
@@ -64,6 +66,8 @@ export interface KernelServerConfig {
 	allowOpenEgress?: string;
 	graceMs: number;
 	idleSocketMs: number;
+	/** Close a socket that has not sent hello within this long. */
+	helloTimeoutMs: number;
 	toolTimeoutMs: number;
 	version: string;
 	probeTargets: { host: string; port: number }[];
@@ -91,6 +95,7 @@ export function kernelServerConfigFromEnv(env: NodeJS.ProcessEnv = process.env):
 		allowOpenEgress: env.KERNEL_SERVER_ALLOW_OPEN_EGRESS || undefined,
 		graceMs: Number(env.KERNEL_SERVER_GRACE_MS ?? 5 * 60_000),
 		idleSocketMs: Number(env.KERNEL_SERVER_IDLE_SOCKET_MS ?? 45_000),
+		helloTimeoutMs: Number(env.KERNEL_SERVER_HELLO_TIMEOUT_MS ?? 10_000),
 		toolTimeoutMs: Number(env.KERNEL_SERVER_TOOL_TIMEOUT_MS ?? 20 * 60_000),
 		version: env.KERNEL_SERVER_VERSION ?? "dev",
 		probeTargets: env.KERNEL_SERVER_PROBE_TARGETS
@@ -397,6 +402,12 @@ export class KernelServer {
 
 	private onConnection(ws: WebSocket): void {
 		let session: ServerSession | undefined;
+		// A socket that never says hello holds a connection and is never reaped: idle
+		// reaping only sees sessions.
+		const helloTimer = setTimeout(() => {
+			if (!session) ws.close(4408, "no hello");
+		}, this.config.helloTimeoutMs);
+		helloTimer.unref();
 		ws.on("message", (raw: RawData) => {
 			let frame: Frame<ClientMessage>;
 			try {
@@ -407,6 +418,7 @@ export class KernelServer {
 				return;
 			}
 			if (!session) {
+				clearTimeout(helloTimer);
 				session = this.onHello(ws, frame);
 				return;
 			}
@@ -415,6 +427,7 @@ export class KernelServer {
 			this.onFrame(session, frame);
 		});
 		ws.on("close", () => {
+			clearTimeout(helloTimer);
 			if (session && session.socket === ws) this.onSocketGone(session);
 		});
 		ws.on("error", () => {});
@@ -760,8 +773,13 @@ export class KernelServer {
 						return;
 					}
 					const reqId = this.nextReqId++;
+					const message: ServerMessage = { op: "host_request", reqId, kernel: kernelId, payload };
+					if (isOversizedCall(message)) {
+						reject(new Error(`this host request is larger than ${MAX_CALL_FRAME_CHARS} characters; send less`));
+						return;
+					}
 					session.hostWaiters.set(reqId, { resolve, reject });
-					this.send(session, { op: "host_request", reqId, kernel: kernelId, payload });
+					this.send(session, message);
 				});
 		}
 		return handlers;
@@ -893,7 +911,11 @@ export class KernelServer {
 			return;
 		}
 		const chunks: Buffer[] = [];
-		for await (const chunk of req) chunks.push(chunk as Buffer);
+		let size = 0;
+		for await (const chunk of req) {
+			size += (chunk as Buffer).length;
+			if (size <= MAX_CALL_FRAME_CHARS) chunks.push(chunk as Buffer);
+		}
 		const headers: Record<string, string> = {};
 		for (const [name, value] of Object.entries(req.headers)) {
 			if (typeof value === "string" && name !== "x-egress-token" && name !== "host" && name !== "content-length") {
@@ -902,6 +924,21 @@ export class KernelServer {
 		}
 		const session = kernel.session;
 		const reqId = this.nextReqId++;
+		const message: ServerMessage = {
+			op: "http_request",
+			reqId,
+			kernel: kernel.id,
+			method: req.method ?? "GET",
+			path: match[2] ?? "/",
+			headers,
+			body: Buffer.concat(chunks).toString("base64"),
+		};
+		if (size > MAX_CALL_FRAME_CHARS || isOversizedCall(message)) {
+			// A tool error the cell can read, the shape the MCP proxy uses for one.
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ ok: false, error: `this call is larger than ${MAX_CALL_FRAME_CHARS} characters; send less` }));
+			return;
+		}
 		const timer = setTimeout(() => {
 			session.httpWaiters.get(reqId)?.reject(new Error(`no answer from the loop in ${this.config.toolTimeoutMs}ms`));
 			session.httpWaiters.delete(reqId);
@@ -916,15 +953,7 @@ export class KernelServer {
 			const answer = await new Promise<{ status: number; headers: Record<string, string>; body: string }>(
 				(resolve, reject) => {
 					session.httpWaiters.set(reqId, { resolve, reject });
-					this.send(session, {
-						op: "http_request",
-						reqId,
-						kernel: kernel.id,
-						method: req.method ?? "GET",
-						path: match[2] ?? "/",
-						headers,
-						body: Buffer.concat(chunks).toString("base64"),
-					});
+					this.send(session, message);
 				},
 			);
 			res.writeHead(answer.status, answer.headers);

@@ -30,6 +30,27 @@ const nonData = new Set<string>();
 /** What has already been shown to the model, for delta mode. */
 const shownNames = new Map<string, string>();
 let cellTurn = 0;
+/** Each of the maps above keeps at most this many names, newest first to survive. */
+const MAX_PROVENANCE_NAMES = 2000;
+/** Listing rows shown after a cell; the rest are counted, not listed. */
+const NAMESPACE_ROWS = 50;
+
+function remember<T>(map: Map<string, T>, key: string, value: T): void {
+	map.delete(key);
+	map.set(key, value);
+	while (map.size > MAX_PROVENANCE_NAMES) map.delete(map.keys().next().value as string);
+}
+
+function markNonData(name: string): void {
+	nonData.delete(name);
+	nonData.add(name);
+	while (nonData.size > MAX_PROVENANCE_NAMES) nonData.delete(nonData.values().next().value as string);
+}
+
+function capRows(rows: string[]): string[] {
+	if (rows.length <= NAMESPACE_ROWS) return rows;
+	return [...rows.slice(0, NAMESPACE_ROWS), `... and ${rows.length - NAMESPACE_ROWS} more (%whos lists everything)`];
+}
 
 function recordAssignments(code: string, cwd: string): void {
 	cellTurn += 1;
@@ -53,7 +74,7 @@ function recordAssignments(code: string, cwd: string): void {
 			for (const part of imp[1].split(",")) {
 				const alias = /\s+as\s+([A-Za-z_]\w*)\s*$/.exec(part);
 				const name = alias ? alias[1] : part.trim().split(".")[0].trim();
-				if (name) nonData.add(name);
+				if (name) markNonData(name);
 			}
 			continue;
 		}
@@ -61,34 +82,41 @@ function recordAssignments(code: string, cwd: string): void {
 		// Loop targets and context managers: `for x in …`, `with … as f:`
 		const loop = /^\s*(?:async\s+)?for\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+in\s/.exec(line);
 		if (loop) {
-			for (const n of loop[1].split(",")) nonData.add(n.trim());
+			for (const n of loop[1].split(",")) markNonData(n.trim());
 			continue;
 		}
-		for (const m of line.matchAll(/\bas\s+([A-Za-z_]\w*)/g)) nonData.add(m[1]);
+		for (const m of line.matchAll(/\bas\s+([A-Za-z_]\w*)/g)) markNonData(m[1]);
 
 		// Comprehension and lambda locals leak into the listing as bare names with
 		// no provenance, and they are never data the model needs reminding of.
 		for (const m of line.matchAll(/\bfor\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+in\b/g)) {
-			for (const n of m[1].split(",")) nonData.add(n.trim());
+			for (const n of m[1].split(",")) markNonData(n.trim());
 		}
 		for (const m of line.matchAll(/\blambda\s+([^:]+):/g)) {
 			for (const n of m[1].split(",")) {
 				const bare = n.trim().split("=")[0].trim();
-				if (/^[A-Za-z_]\w*$/.test(bare)) nonData.add(bare);
+				if (/^[A-Za-z_]\w*$/.test(bare)) markNonData(bare);
 			}
 		}
 		// Walrus targets are intermediates, not results: `if (m := re.search(…))`.
-		for (const m of line.matchAll(/([A-Za-z_]\w*)\s*:=/g)) nonData.add(m[1]);
+		for (const m of line.matchAll(/([A-Za-z_]\w*)\s*:=/g)) markNonData(m[1]);
 		// Function and class definitions.
 		const def = /^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/.exec(line);
-		if (def) nonData.add(def[1]);
+		if (def) markNonData(def[1]);
+
+		// Rebound where this cannot follow it — augmented assignment, or assignment
+		// inside a block — the name no longer holds what its recorded line says.
+		const aug = /^\s*([A-Za-z_]\w*)\s*(?:\*\*|\/\/|>>|<<|[-+*/%@&|^])=/.exec(line);
+		if (aug) assignedAt.delete(aug[1]);
+		const nested = /^\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)/.exec(line);
+		if (nested) for (const name of nested[1].split(",")) assignedAt.delete(name.trim());
 
 		// Top-level bindings only: no leading indentation, single or tuple target.
 		const m = /^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)/.exec(line);
 		if (!m) continue;
 		const rhs = line.slice(line.indexOf("=") + 1).trim().slice(0, 72) || "…";
 		for (const name of m[1].split(",").map((n) => n.trim())) {
-			assignedAt.set(name, { rhs, turn: cellTurn, line: i + 1 });
+			remember(assignedAt, name, { rhs, turn: cellTurn, line: i + 1 });
 			nonData.delete(name);
 		}
 	}

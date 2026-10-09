@@ -1428,6 +1428,10 @@ export class KernelManager {
 					this.appendKernelDiagnostic(
 						`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,
 					);
+					await this.sendCommMessage(commId, {
+						status: "error",
+						error: `host reply could not be sent: ${errorMessage(replyError)}`,
+					}).catch(() => undefined);
 				}
 			} catch (error) {
 				this.appendKernelDiagnostic(`host request failed for comm ${commId}: ${errorMessage(error)}`);

@@ -465,7 +465,13 @@ export class RemoteKernelLink {
 				error: error instanceof Error ? error.message : String(error),
 			};
 		}
-		this.post(reply);
+		try {
+			this.post(reply);
+		} catch (error) {
+			// The kernel is awaiting this reply; a value that will not encode must still answer it.
+			const reason = error instanceof Error ? error.message : String(error);
+			this.post({ op: "host_response", reqId: message.reqId, ok: false, error: `host reply could not be sent: ${reason}` });
+		}
 	}
 
 	private async answerHttpRequest(message: Extract<ServerMessage, { op: "http_request" }>): Promise<void> {

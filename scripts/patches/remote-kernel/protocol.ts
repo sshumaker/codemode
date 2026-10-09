@@ -211,6 +211,20 @@ export class ProtocolError extends Error {
 	}
 }
 
+/**
+ * A host request or tunnelled tool call is a few kilobytes; results are what carry
+ * volume. The server refuses to send a call frame larger than this, so the cell gets
+ * an error instead of a frame replayed on every reconnect, and the loop refuses to
+ * receive one. Mirrors the product's MAX_SMALL_FRAME_CHARS.
+ */
+export const MAX_CALL_FRAME_CHARS = 1024 * 1024;
+const CALL_OPS = new Set(["host_request", "http_request"]);
+
+/** Whether `message` would exceed MAX_CALL_FRAME_CHARS on the wire. */
+export function isOversizedCall(message: ServerMessage): boolean {
+	return encodeFrame({ t: "d", seq: Number.MAX_SAFE_INTEGER, m: message }).length > MAX_CALL_FRAME_CHARS;
+}
+
 const CONTROL_TYPES = new Set(["hello", "welcome", "reject", "ping", "pong", "ack", "bye"]);
 const CLIENT_OPS = new Set([
 	"start",
@@ -265,6 +279,9 @@ function decodeFrame<M>(raw: string | Buffer | ArrayBuffer | Buffer[], ops: Set<
 		if (!isSeq(parsed.seq) || parsed.seq < 1) throw new ProtocolError("data frame has no sequence number");
 		if (!isRecord(parsed.m) || typeof parsed.m.op !== "string" || !ops.has(parsed.m.op)) {
 			throw new ProtocolError(`data frame carries an unknown message: ${JSON.stringify(parsed.m).slice(0, 80)}`);
+		}
+		if (CALL_OPS.has(parsed.m.op) && text.length > MAX_CALL_FRAME_CHARS) {
+			throw new ProtocolError(`${parsed.m.op} frame of ${text.length} characters exceeds the ${MAX_CALL_FRAME_CHARS} cap`);
 		}
 		return parsed as DataFrame<M>;
 	}

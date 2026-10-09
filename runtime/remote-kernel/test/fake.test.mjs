@@ -225,6 +225,79 @@ describe("jobs.wait ends the turn over the remote kernel [fake]", () => {
 	});
 });
 
+// A call frame over 1 MB used to go on the channel, where a peer that refused it got
+// it replayed on every reconnect until the session was lost. The cell gets an error.
+describe("call frames [fake]", () => {
+	it("an oversized tool call or host request is an error in the cell, and the session carries on", { timeout: 120_000 }, async () => {
+		const { RemoteKernelLink } = await import(`${DIST}/core/kernel/remote/link.js`);
+		const { dispatchHostRequest, RemoteKernelManager } = await import(`${DIST}/core/kernel/remote/manager.js`);
+		const { RemotePathMap } = await import(`${DIST}/core/kernel/remote/pathmap.js`);
+		const { forwardToolCall } = await import(`${DIST}/core/kernel/remote/tools.js`);
+		const srv = await startFakeServer();
+		const proxy = await startFixtureProxy();
+		const link = new RemoteKernelLink({ connection: () => ({ url: srv.url, token: srv.token }), pingIntervalMs: 2000, deadAfterMs: 10_000 });
+		link.handlers.hostRequest = dispatchHostRequest;
+		link.handlers.httpRequest = (m, signal) => forwardToolCall({ toolProxy: proxy.url, toolTimeoutMs: 60_000 }, m, signal);
+		const hostCalls = [];
+		const km = new RemoteKernelManager({
+			link,
+			pathMap: new RemotePathMap([]),
+			remoteCwd: srv.cwd,
+			sessionId: "frames",
+			hostHandlers: {
+				"t.echo": async (p) => (hostCalls.push(p), { n: p.n }),
+				"t.big": async () => ({ n: 10n }),
+			},
+		});
+		const call = (text) =>
+			"import json, os, urllib.request\n" +
+			`body = json.dumps({"server": "fixture", "tool": "echo", "args": {"text": ${text}}}).encode()\n` +
+			'print(urllib.request.urlopen(urllib.request.Request(os.environ["HARNESS_MCP_PROXY"] + "/call", data=body, headers={"content-type": "application/json"})).read().decode())';
+		try {
+			await km.start();
+			const tool = await km.execute(call('"x" * 2_000_000'));
+			assert.match(tool.stdout, /"ok":false.*larger than 1048576 characters/, tool.stdout + tool.stderr);
+			assert.equal(proxy.calls.length, 0, "the oversized call reached the proxy");
+
+			const host = await km.execute(
+				'from rlm import host_request\ntry:\n    await host_request("t.echo", {"n": 1, "blob": "x" * 2_000_000})\nexcept Exception as e:\n    print("raised", e)',
+			);
+			assert.match(host.stdout, /raised .*larger than 1048576 characters/, host.stdout + host.stderr);
+			assert.equal(hostCalls.length, 0);
+
+			const unencodable = await km.execute(
+				'from rlm import host_request\ntry:\n    await host_request("t.big", {})\nexcept Exception as e:\n    print("raised", e)',
+				{ signal: AbortSignal.timeout(20_000) },
+			);
+			assert.match(unencodable.stdout, /raised .*host reply could not be sent/, unencodable.stdout + unencodable.stderr);
+
+			const after = await km.execute(call('"small"') + "\nfrom rlm import host_request\nprint(await host_request('t.echo', {'n': 2}))");
+			assert.match(after.stdout, /"ok":true/);
+			assert.match(after.stdout, /'n': 2/);
+			assert.equal(proxy.calls.length, 1);
+		} finally {
+			await km.dispose();
+			await link.close({ bye: true });
+			await proxy.close();
+			await srv.stop();
+		}
+	});
+
+	it("a socket that never says hello is closed", { timeout: 30_000 }, async () => {
+		const { default: WebSocket } = await import(`${ROOT}/vendor/prime-agent/node_modules/ws/index.js`);
+		const srv = await startFakeServer({ env: { KERNEL_SERVER_HELLO_TIMEOUT_MS: "500" } });
+		try {
+			const ws = new WebSocket(srv.url);
+			const closed = new Promise((resolve) => ws.once("close", (code) => resolve(code)));
+			const code = await Promise.race([closed, new Promise((resolve) => setTimeout(() => resolve("still open"), 5000))]);
+			ws.terminate();
+			assert.equal(code, 4408);
+		} finally {
+			await srv.stop();
+		}
+	});
+});
+
 describe("the kernel's ports can be named [fake]", () => {
 	it("the tunnel and ipykernel take the ports they are given, for a sandbox that allows only those", { timeout: 180_000 }, async () => {
 		const { RemoteKernelLink } = await import(`${DIST}/core/kernel/remote/link.js`);

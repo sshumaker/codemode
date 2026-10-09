@@ -39,6 +39,19 @@ describe("protocol codec", () => {
 		for (const raw of bad) assert.throws(() => protocol.decodeClientFrame(raw), protocol.ProtocolError, raw);
 	});
 
+	it("refuses a host or tool call frame over 1 MB, and no other kind", () => {
+		const big = "x".repeat(protocol.MAX_CALL_FRAME_CHARS);
+		const http = { op: "http_request", reqId: 1, kernel: "k", method: "POST", path: "/call", headers: {}, body: big };
+		const host = { op: "host_request", reqId: 2, kernel: "k", payload: { type: "t", blob: big } };
+		for (const m of [http, host]) {
+			assert.equal(protocol.isOversizedCall(m), true);
+			assert.throws(() => protocol.decodeServerFrame(protocol.encodeFrame({ t: "d", seq: 1, m })), /exceeds the 1048576 cap/);
+		}
+		const result = { op: "result", id: 1, ok: true, value: big, serverMs: 0 };
+		assert.equal(protocol.decodeServerFrame(protocol.encodeFrame({ t: "d", seq: 1, m: result })).m.op, "result");
+		assert.equal(protocol.isOversizedCall({ ...http, body: "small" }), false);
+	});
+
 	it("keeps the server/client op sets apart", () => {
 		const result = JSON.stringify({ t: "d", seq: 1, m: { op: "result", id: 1, ok: true, value: 1, serverMs: 0 } });
 		assert.equal(protocol.decodeServerFrame(result).m.op, "result");
@@ -57,6 +70,14 @@ function pair() {
 }
 
 describe("reliable channel", () => {
+	it("a message that will not encode throws without using up a sequence number", () => {
+		const { a, b, got, wire } = pair();
+		a.attach(wire(b), 0);
+		assert.throws(() => a.send({ op: "host_response", value: 1n }), /BigInt/);
+		a.send({ op: "noop", n: 1 });
+		assert.deepEqual(got.b, [{ op: "noop", n: 1 }], "the next message read as a sequence gap");
+	});
+
 	it("delivers in order and drops replayed duplicates", () => {
 		const { a, b, got, wire } = pair();
 		a.attach(wire(b), 0);

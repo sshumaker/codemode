@@ -21,12 +21,12 @@ if (nsMode === "1" || nsMode === "delta") {
 			const lines = describeNamespace(names);
 			if (nsMode === "delta") {
 				const fresh = lines.filter((l) => !shownNames.has(l));
-				for (const l of lines) shownNames.set(l, l);
+				for (const l of lines) remember(shownNames, l, l);
 				if (fresh.length > 0) {
-					text += `${text ? "\n\n" : ""}[now available in the kernel:\n  ${fresh.join("\n  ")}\n]`;
+					text += `${text ? "\n\n" : ""}[now available in the kernel:\n  ${capRows(fresh).join("\n  ")}\n]`;
 				}
 			} else if (lines.length > 0) {
-				text += `${text ? "\n\n" : ""}[kernel — already available, do not re-fetch (cells in .cells/):\n  ${lines.join("\n  ")}\n]`;
+				text += `${text ? "\n\n" : ""}[kernel — already available, do not re-fetch (cells in .cells/):\n  ${capRows(lines).join("\n  ")}\n]`;
 			}
 		}
 	} catch {

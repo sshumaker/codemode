@@ -78,6 +78,13 @@ describe("kernel recovery", { skip: !existsSync(KERNEL_PYTHON) && "no kernel pyt
 		assert.match(text(died), /after it had already made tool or host calls/);
 	});
 
+	it("a host reply that will not encode is an error in the cell, not a hang", { timeout: 120_000 }, async () => {
+		process.env.HARNESS_CELL_TIMEOUT_MS = "20000";
+		const cell = tool({ hostHandlers: { "test.big": async () => ({ n: 10n }) } });
+		const r = await cell('from rlm import host_request\ntry:\n    await host_request("test.big", {})\nexcept Exception as e:\n    print("raised", e)');
+		assert.match(text(r), /raised .*host reply could not be sent/);
+	});
+
 	it("a kernel already dead before the cell is replaced, and the cell runs once", { timeout: 120_000 }, async () => {
 		const cell = tool();
 		const pid = Number(text(await cell("import os\nprint(os.getpid())")).match(/\d+/)[0]);

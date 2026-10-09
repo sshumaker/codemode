@@ -1625,6 +1625,20 @@ sub(
 	"HARNESS_SNAPSHOT_RESTORE_TIMEOUT_MS",
 );
 
+// A host reply that would not encode left the kernel awaiting it for the rest of
+// the cell: the failure was logged and nothing was sent. It now gets an error reply.
+sub(
+	"core/kernel/index.ts",
+	"\t\t\t\t\tthis.appendKernelDiagnostic(\n\t\t\t\t\t\t`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,\n\t\t\t\t\t);\n",
+	"\t\t\t\t\tthis.appendKernelDiagnostic(\n\t\t\t\t\t\t`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,\n\t\t\t\t\t);\n" +
+		"\t\t\t\t\tawait this.sendCommMessage(commId, {\n" +
+		'\t\t\t\t\t\tstatus: "error",\n' +
+		"\t\t\t\t\t\terror: `host reply could not be sent: ${errorMessage(replyError)}`,\n" +
+		"\t\t\t\t\t}).catch(() => undefined);\n",
+	"a host reply that will not encode still answers the kernel",
+	"host reply could not be sent",
+);
+
 /**
  * Every `scripts/patches/*.ts` body must be present VERBATIM in the vendored tree.
  *
