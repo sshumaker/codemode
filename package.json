@@ -17,7 +17,8 @@
     "eval:jobs": "node runtime/eval/all.mjs",
     "test:remote-kernel": "node --test --test-concurrency=1 --test-timeout=300000 runtime/remote-kernel/test/unit.test.mjs runtime/remote-kernel/test/link.test.mjs runtime/remote-kernel/test/fake.test.mjs",
     "test:remote-kernel:live": "node --test --test-concurrency=1 --test-timeout=900000 runtime/remote-kernel/test/live.test.mjs",
-    "test:integration": "node runtime/integration/run.mjs"
+    "test:integration": "node runtime/integration/run.mjs",
+    "test:live": "node runtime/integration/live/run.mjs --"
   },
   "keywords": [],
   "author": "",

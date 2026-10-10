@@ -142,8 +142,35 @@ fails with "Session is already active".
 
 ## The live tier
 
-A follow-up (`npm run test:live -- --env-file PATH`): the same worlds with a real model and
-the Daytona backend, sourced from an env file outside the repo, with a per-run cost cap.
+```bash
+npm run test:live -- --env-file ~/.config/harness/live.env [--max-cost 1.00]
+```
+
+The env file lives outside the repository (the runner refuses one inside it) and is
+sourced by a bash subshell that execs the test processes; the runner never reads it.
+Without it, the tier prints how to create one and exits 0. (`--` matters: Node 25
+treats an `--env-file` after the script as its own flag and would load the file into the
+runner itself; `package.json` already passes it.)
+
+| variable                                                           | for                                                   |
+| ------------------------------------------------------------------ | ----------------------------------------------------- |
+| `ANTHROPIC_API_KEY` (or `OPENROUTER_API_KEY` / `ZAI_API_KEY`)      | the real-model scenarios                              |
+| `HARNESS_LIVE_MODEL`                                               | the model (default `anthropic/claude-haiku-4-5`)      |
+| `DAYTONA_API_KEY` (+ optional `DAYTONA_API_URL`, `DAYTONA_TARGET`) | the Daytona scenarios; skipped without it             |
+| `HARNESS_LIVE_MAX_COST`                                            | the cap, if not given as `--max-cost` (default $1.00) |
+
+- `live/model.live.test.mjs` — the unwaited-job and barrier scenarios with a real model:
+  the model ends its turn without waiting, is woken by the scheduler, and uses the
+  outcome. Each scenario's cost (prime's own usage accounting) goes into a per-run
+  ledger; once the cap is reached the remaining scenarios skip.
+- `live/daytona.live.test.mjs` — `DaytonaKernelBackend`: create (a real prime turn with
+  the scripted model against the sandbox's kernel, files both ways, destroy), warm pool
+  (a new conversation claims the warm sandbox), sweep and restore (an idle sandbox is
+  swept; reopening restores the workspace from the host's copy). Every sandbox carries a
+  per-run `pool_owner` label and Daytona's auto-delete backstop; the suite's `after`
+  deletes every sandbox with that label and fails if any remain.
+
+The live tier has not been run yet; expect to fix small things the first time.
 
 ## What is not covered
 
