@@ -96,9 +96,19 @@ transitions the store applies.
   file); every write of it projects onto the job's invocation record
   (`JobStore._write` is the one place). The agent-facing `jobs.*` and `agents.*`
   APIs do not change.
-- **temporal** (optional, off by default) — one workflow per invocation, workflow id
-  derived from the invocation id, activity retry policy chosen by the delivery mode.
-  See `runtime/invocations_temporal.py` once it lands.
+- **temporal** (optional, off by default, `runtime/invocations_temporal.py`) — one
+  workflow per invocation, id `inv-<invocation id>`; a second submit of the same
+  invocation attaches to the running workflow instead of starting another. The work
+  is one activity whose id is the invocation id, which the tool also gets as its
+  idempotency key. The retry policy follows the delivery mode: Temporal retries for
+  idempotent / lookup / read_only / at_least_once; `at_most_once` runs one attempt
+  and the workflow retries only a `NotSent` failure, so anything else (timeout, lost
+  worker, error after sending) ends `unknown`. The deadline is enforced in workflow
+  code, and whatever ends the run, a `finally` reports the outcome to the store
+  through an activity, so it is durable. Nothing imports it unless you choose it;
+  `temporalio` is not a dependency. The tests run against
+  `temporalio.testing.WorkflowEnvironment.start_time_skipping()` and are skipped
+  when it is not installed.
 
 ## Owed items and waking
 
