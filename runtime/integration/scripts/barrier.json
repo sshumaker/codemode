@@ -1,0 +1,7 @@
+{
+  "about": "Barrier: jobs.wait on three jobs, one fails. One wake carries all three outcomes.",
+  "turns": [
+    { "expect": "start three jobs", "ipython": "jobs.submit('sleep 1; echo A', name='a')\njobs.submit('sleep 2; echo B; exit 3', name='b')\njobs.submit('sleep 3; echo C', name='c')\njobs.wait('a', 'b', 'c', wake_after='2m')" },
+    { "expect": "\\[woken: ", "text": "All three are back." }
+  ]
+}

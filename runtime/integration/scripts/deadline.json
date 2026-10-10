@@ -1,0 +1,7 @@
+{
+  "about": "Session deadline: the agent waits on a long job; at the deadline it is woken once to wrap up, the session ends when that turn returns, and its whole process tree is reaped.",
+  "turns": [
+    { "expect": "FOXTROT-{{NONCE}}", "ipython": "jobs.submit('sleep 600', name='long')\njobs.submit('sleep 600 & sleep 600; wait', name='tree')\njobs.wait('long', wake_after='10m')" },
+    { "expect": "Wrap up now", "text": "Wrapping up: long and tree are still running and will be stopped." }
+  ]
+}

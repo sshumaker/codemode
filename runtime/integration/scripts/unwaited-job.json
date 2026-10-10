@@ -1,0 +1,8 @@
+{
+  "about": "A job started and never waited on: the turn ends without jobs.wait, the job finishes later, the scheduler wakes the session with its outcome once.",
+  "turns": [
+    { "expect": "start the background job", "ipython": "h = jobs.submit('sleep 2; echo BG-DONE-{{NONCE}}', name='bg')\nprint('submitted', h.name)" },
+    { "expect": "submitted bg", "text": "Started bg; not waiting on it." },
+    { "expect": "\\[woken: job 'bg': succeeded \\(exit 0\\)", "text": "bg finished; nothing else to do." }
+  ]
+}

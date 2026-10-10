@@ -1,0 +1,7 @@
+{
+  "about": "An at_most_once call is claimed (fsynced) and the kernel dies before the request leaves. The model is shown UNKNOWN, and nothing ever sends it.",
+  "turns": [
+    { "expect": "ECHO-{{NONCE}}", "ipython": "import json, os, signal, socket, urllib.request\nP = os.environ['HARNESS_MCP_PROXY']\ndef _die(*a, **k):\n    os.kill(os.getpid(), signal.SIGKILL)\nsocket.create_connection = _die\nreq = urllib.request.Request(P + 'call', data=json.dumps({'server': 'fake', 'tool': 'charge', 'args': {'cents': 500}}).encode(), headers={'content-type': 'application/json'})\nurllib.request.urlopen(req)\nprint('never-printed')" },
+    { "expect": "fake\\.charge", "text": "The charge may or may not have happened; I will not resend it." }
+  ]
+}

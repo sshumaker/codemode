@@ -1,0 +1,6 @@
+# Installed into the kernel venv prime uses (scripts/dev-env.sh), beyond what prime's
+# own bootstrap puts there (ipykernel, prime-agent-runtime, dill, numpy, pandas, ...).
+# The tests that draw or send images need these: bench/test/kernel-read-scope.test.mjs
+# (matplotlib display_data), scripts/patches/display-images.ts (PIL).
+matplotlib==3.11.2
+pillow==12.3.0

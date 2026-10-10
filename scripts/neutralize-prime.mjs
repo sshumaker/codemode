@@ -1833,6 +1833,26 @@ function walkPrime() {
 	return out;
 }
 
+log("\nclient-owned worker lifetime:");
+
+// A print-mode `prime -p` is a client of prime's daemon; the turn itself runs in a
+// "client-owned" worker the daemon keeps for OWNED_WORKER_DISCONNECT_GRACE_MS after
+// its client disconnects. Under runtime/scheduler.py the client IS the harness the
+// turn supervisor watches, so a client that is killed mid-turn left the agent running
+// unsupervised for 30 s — still calling the model and running cells after the
+// scheduler had settled the turn — and every `prime -c` the scheduler started on the
+// session in that window failed with "Session is already active" (found by the
+// integration tier: runtime/integration/crashes.test.mjs). Hosts that own the turn
+// lifecycle set HARNESS_OWNED_WORKER_GRACE_MS=0 so the worker goes with its client.
+// Unset keeps upstream's 30 s.
+sub(
+	"modes/daemon/daemon-supervisor.ts",
+	"const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;",
+	"const OWNED_WORKER_DISCONNECT_GRACE_MS = /^\\d+$/.test(process.env.HARNESS_OWNED_WORKER_GRACE_MS ?? \"\")\n\t? Number(process.env.HARNESS_OWNED_WORKER_GRACE_MS)\n\t: 30_000;",
+	"client-owned worker disconnect grace honours HARNESS_OWNED_WORKER_GRACE_MS",
+	"HARNESS_OWNED_WORKER_GRACE_MS",
+);
+
 assertPatchesInSync();
 
 log("\ndone.");

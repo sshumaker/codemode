@@ -1,0 +1,8 @@
+{
+  "about": "Temporal backend against a real dev server: two invocations submitted into the session's store run on a worker that is SIGKILLed mid-activity. The idempotent one retries on a new worker under the same key and succeeds; the at_most_once one ends UNKNOWN and is never resent. Each outcome lands in the store and wakes the session.",
+  "turns": [
+    { "expect": "INDIA-{{NONCE}}", "text": "Nothing to do until the host's invocations finish." },
+    { "expect": "itest\\.(slow|once)", "text": "Noted." },
+    { "expect": "itest\\.(slow|once)", "text": "Noted." }
+  ]
+}

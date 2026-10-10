@@ -692,6 +692,8 @@ def _recover_turn(session_dir: str, log: Callable[[str], None] = print) -> Optio
     if not turn or turn.get("state") not in IN_FLIGHT:
         return None
     state = turn["state"]
+    if state == "exited" and not _exited_cleanly(_supervised_code(turn.get("exit_code")), turn):
+        return _recover_crashed(session_dir, turn, log)
     if state == "exited":
         # The harness returned and said so; only the scheduler's bookkeeping died.
         _finish_turn(session_dir, turn, state="done", settled_by="recovery")
@@ -711,6 +713,33 @@ def _delivery(session_dir: str, phase: str, run_id: Optional[str], ids: Sequence
     if phase == "commit":
         return store.commit_delivery(run_id)
     return store.rollback_delivery(run_id)
+
+
+def _settle_late_received(session_dir: str) -> List[str]:
+    """
+    Re-check, under the lease and before the run that answers a crash, which
+    re-queued messages the crashed turn's transcript holds by now. The recovery
+    checked the instant the harness died, but prime writes a session's transcript
+    lazily and its daemon worker flushes it as it stops — after its client is gone
+    (seen in the integration tier: the message landed 15 ms after the check, and the
+    next turn was shown it twice). Starting the next harness needs the old agent gone,
+    so this is the latest and best moment to look. A message found now is delivered,
+    not injected again. Returns the ids it settled.
+    """
+    turn = _read_turn(session_dir)
+    if not turn or turn.get("state") != "interrupted" or not turn.get("redelivered"):
+        return []
+    pending = [m for m in pending_user_messages(session_dir) if m["id"] in turn["redelivered"]]
+    seen = _ids_in_transcript(session_dir, turn.get("crashed") or {}, [m["id"] for m in pending])
+    if not seen:
+        return []
+    for msg in pending:
+        if msg["id"] in seen:
+            _move_message(msg["path"], "", ".delivered")
+    turn["late_received"] = sorted(seen)
+    turn["redelivered"] = [i for i in turn["redelivered"] if i not in seen]
+    _write_json(_turn_path(session_dir), turn)
+    return sorted(seen)
 
 
 def _unconsume(session_dir: str, turn: dict) -> None:
@@ -981,8 +1010,27 @@ def run_wake(session_dir: str, reason: str, *, runner=None, closing: bool = Fals
         code = getattr(runner(argv, cwd=cwd, env=env), "returncode", 0)
     # Reached only when the run returned to us: a scheduler that dies above leaves
     # turn.json in flight, which is the whole point.
-    _finish_turn(session_dir, _read_turn(session_dir) or turn, state="done", returncode=code)
+    final = _read_turn(session_dir) or turn
+    if not _exited_cleanly(code, final):
+        _recover_crashed(session_dir, dict(final, returncode=code), print)
+        return code
+    _finish_turn(session_dir, final, state="done", returncode=code)
     return code
+
+
+def _exited_cleanly(code: Optional[int], turn: dict) -> bool:
+    """
+    Did the harness finish its turn? Exit 0 did; so did a run the supervisor itself
+    stopped for the session's end, and one it never started because a recovery had
+    already settled it. Anything else — killed by a signal, or exited non-zero
+    without saying why — is a turn that did not finish, and is recovered as a crash:
+    its messages are checked against the transcript (one the harness never received
+    is re-queued, never marked delivered) and the session is re-woken once, saying
+    so, within MAX_CRASH_RECOVERIES. Marking such a turn "done" lost user messages: a
+    `prime -c` that failed at startup ("Session is already active") had its message
+    marked delivered without the model ever seeing it.
+    """
+    return code in (0, EXIT_TURN_SUPERSEDED) or bool(turn.get("stopped"))
 
 
 # -- the end of a session -------------------------------------------------------------
@@ -1292,6 +1340,9 @@ def _serve_session(session_dir: str, *, now, runner, log: Callable[[str], None])
     due = end_due(session_dir, now)
     if due and due[0] == "end":
         return False
+    late = _settle_late_received(session_dir)
+    if late:
+        log(f"[scheduler] {name}: the crashed turn's transcript received {', '.join(late)} after all")
     closing = bool(due)
     if closing:
         # Recorded before the run, so the wrap-up is owed once: a scheduler that dies
@@ -1444,6 +1495,13 @@ def _supervise_turn(turn_path: str, run_id: str, argv: List[str]) -> int:
                  child={"pid": child.pid, "pid_start": J._real_probe(child.pid)[1]})
     code = _wait_bounded(child, turn_path, run_id)
     _update_turn(turn_path, run_id, state="exited", exit_code=code, ended_at=time.time())
+    return _supervised_code(code)
+
+
+def _supervised_code(code: Optional[int]) -> Optional[int]:
+    """turn.json's raw exit_code (negative for a signal) as the supervisor's own exit code."""
+    if code is None:
+        return None
     return code if code >= 0 else 128 - code
 
 

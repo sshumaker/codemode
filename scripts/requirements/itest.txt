@@ -1,0 +1,5 @@
+# The integration tier's own venv (.venv-itest, scripts/dev-env.sh): what its Python
+# processes import that the runtime itself does not depend on. temporalio is optional
+# for the runtime (runtime/invocations_temporal.py) and required by
+# runtime/integration/temporal.test.mjs and the Temporal unit tests.
+temporalio==1.34.0

@@ -1,0 +1,7 @@
+{
+  "about": "SIGKILL the prime process mid-turn (its model request is held). The next scan re-wakes the session once, saying the turn was interrupted; a user message sent before the crash is neither lost nor duplicated.",
+  "turns": [
+    { "expect": "ALPHA-{{NONCE}}", "hold": "first", "text": "ack ALPHA (this response is never delivered)" },
+    { "expect": "interrupted", "text": "Recovered after the interruption." }
+  ]
+}

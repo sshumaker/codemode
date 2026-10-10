@@ -1,0 +1,7 @@
+{
+  "about": "The kernel dies mid-cell after making tool-proxy calls (HARNESS_KERNEL_AUTORESTART=1). The cell is not re-run; the model is shown which calls completed and which are UNKNOWN.",
+  "turns": [
+    { "expect": "DELTA-{{NONCE}}", "ipython": "import json, os, urllib.request\nP = os.environ['HARNESS_MCP_PROXY']\ndef call(tool):\n    req = urllib.request.Request(P + 'call', data=json.dumps({'server': 'fake', 'tool': tool, 'args': {}}).encode(), headers={'content-type': 'application/json'})\n    return urllib.request.urlopen(req).read().decode()\nprint(call('lookup'))\nprint(call('create'))\nprint(call('hang'))\nprint('never-printed')" },
+    { "expect": "fake\\.create", "text": "The kernel died; create completed and hang is unknown, so I will verify before retrying." }
+  ]
+}

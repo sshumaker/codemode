@@ -50,7 +50,13 @@ ln -s <primary-checkout>/vendor/mcp-bench vendor/mcp-bench
 
 ## Running
 
+Tests have three tiers — unit/chaos, integration (real scheduler, prime and kernels
+against a scripted model) and live — bootstrapped by `scripts/dev-env.sh`. See
+[docs/TESTING.md](docs/TESTING.md).
+
 ```bash
+scripts/dev-env.sh                          # build/refresh the local test environment (--check: report only)
+npm run test:integration                    # end to end, scripted model, no API key
 npm test                                    # 665 JS + 344 Python tests, no API key needed
 node bench/residency-report.mjs             # resident token cost per arm
 

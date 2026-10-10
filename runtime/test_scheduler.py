@@ -332,7 +332,7 @@ class TestTwoPhaseDelivery(TurnBase):
             with open(os.path.join(d, S.TURN_FILE)) as fh:
                 seen["turn"] = json.load(fh)
             seen["fired"] = os.path.exists(os.path.join(d, "wake.json.fired"))
-            return subprocess.CompletedProcess(argv, 3)
+            return subprocess.CompletedProcess(argv, 0)
 
         self.assertEqual(self.scan(runner), ["a"])
         self.assertTrue(seen["inbox"][0].endswith(".json.delivering"), seen)
@@ -343,7 +343,7 @@ class TestTwoPhaseDelivery(TurnBase):
         self.assertFalse(os.path.exists(os.path.join(d, S.TURN_FILE)))
         with open(os.path.join(d, S.TURN_FILE + ".last")) as fh:
             last = json.load(fh)
-        self.assertEqual((last["state"], last["returncode"]), ("done", 3), "any exit is a finished turn")
+        self.assertEqual((last["state"], last["returncode"]), ("done", 0))
 
     def test_the_run_goes_through_the_supervisor(self):
         self.session("a", wake_at=900)
@@ -369,6 +369,97 @@ class TestTwoPhaseDelivery(TurnBase):
             json.dump({"from": "user", "text": "old"}, fh)
         [msg] = S.pending_user_messages(d)
         self.assertEqual(msg["id"], "1.5-legacy")
+
+
+class TestUncleanExit(TurnBase):
+    """
+    A harness that returns to the scheduler without finishing its turn — killed by a
+    signal, or exited non-zero — is a crash, not a delivered turn. Found by the
+    integration tier: a SIGKILLed prime was settled "done" with no re-wake, and the
+    `prime -c` after it failed at startup with its user message marked delivered.
+    """
+
+    def exiting_runner(self, code, transcript=False, stopped=False):
+        def run(argv, cwd=None, env=None):
+            self.runs.append({"argv": argv, "env": env})
+            if transcript:
+                with open(os.path.join(self.transcripts, "s.jsonl"), "a") as fh:
+                    fh.write(json.dumps({"role": "user", "content": argv[-1]}) + "\n")
+            if stopped:
+                S._update_turn(argv[3], argv[4], stopped={"reason": "deadline", "at": self.now})
+            return subprocess.CompletedProcess(argv, code)
+
+        return run
+
+    def test_a_harness_that_failed_before_receiving_its_message_gets_it_again(self):
+        d = self.session("a")
+        S.post_user_message(d, "please deploy")
+        self.assertEqual(self.scan(self.exiting_runner(1)), ["a"])
+        self.assertTrue(self.inbox(d)[0].endswith(".json"), "never marked delivered")
+        self.assertEqual(self.scan(), ["a"])
+        second = self.runs[1]["argv"][-1]
+        self.assertIn("interrupted (crash)", second)
+        self.assertIn("please deploy", second)
+        self.assertTrue(self.inbox(d)[0].endswith(".json.delivered"))
+        self.assertEqual(self.scan(), [], "re-woken exactly once")
+
+    def test_a_signalled_harness_is_rewoken_once_without_repeating_its_message(self):
+        d = self.session("a")
+        S.post_user_message(d, "please deploy")
+        self.scan(self.exiting_runner(128 + 9, transcript=True))
+        with open(os.path.join(d, S.TURN_FILE)) as fh:
+            self.assertEqual(json.load(fh)["state"], "interrupted")
+        self.assertEqual(self.scan(), ["a"])
+        second = self.runs[1]["argv"][-1]
+        self.assertIn("interrupted (crash)", second)
+        self.assertNotIn("please deploy", second, "the transcript already holds it")
+        self.assertEqual(self.scan(), [])
+
+    def test_a_turn_stopped_for_the_session_end_is_not_a_crash(self):
+        d = self.session("a", wake_at=900)
+        self.scan(self.exiting_runner(128 + 15, stopped=True))
+        self.assertFalse(os.path.exists(os.path.join(d, S.TURN_FILE)))
+        with open(os.path.join(d, S.TURN_FILE + ".last")) as fh:
+            self.assertEqual(json.load(fh)["state"], "done")
+
+    def test_a_transcript_that_lands_after_the_crash_check_is_not_injected_twice(self):
+        d = self.session("a")
+        S.post_user_message(d, "please deploy")
+        self.scan(self.exiting_runner(128 + 9))
+        [msg] = S.pending_user_messages(d)
+        # prime's worker flushes the transcript as it stops, after its client died.
+        with open(os.path.join(self.transcripts, "s.jsonl"), "a") as fh:
+            fh.write(json.dumps({"role": "user", "content": f"[message ids: {msg['id']}] please deploy"}) + "\n")
+        self.assertEqual(self.scan(), ["a"])
+        second = self.runs[1]["argv"][-1]
+        self.assertIn("interrupted (crash)", second)
+        self.assertNotIn("please deploy", second)
+        self.assertTrue(self.inbox(d)[0].endswith(".json.delivered"))
+        with open(os.path.join(d, S.TURN_FILE + ".last")) as fh:
+            self.assertEqual(json.load(fh)["recovering"]["late_received"], [msg["id"]])
+
+    def test_unclean_exits_are_bounded_like_any_crash(self):
+        d = self.session("a")
+        S.post_user_message(d, "please deploy")
+        for _ in range(S.MAX_CRASH_RECOVERIES + 3):
+            self.scan(self.exiting_runner(1))
+        self.assertEqual(len(self.runs), 1 + S.MAX_CRASH_RECOVERIES)
+        self.assertTrue(os.path.exists(os.path.join(d, S.TURN_FILE + ".abandoned")))
+
+    def test_a_recorded_unclean_exit_whose_scheduler_died_is_recovered_as_a_crash(self):
+        d = self.session("a")
+        S.post_user_message(d, "please deploy")
+
+        def run(argv, cwd=None, env=None):
+            self.runs.append({"argv": argv, "env": env})
+            S._update_turn(argv[3], argv[4], state="exited", exit_code=-9,
+                           child=dead_identity(), supervisor=dead_identity())
+            raise Crash()
+
+        with self.assertRaises(Crash):
+            self.scan(run)
+        self.assertEqual(self.scan(), ["a"])
+        self.assertIn("interrupted (crash)", self.runs[1]["argv"][-1])
 
 
 class TestCrashRecovery(TurnBase):

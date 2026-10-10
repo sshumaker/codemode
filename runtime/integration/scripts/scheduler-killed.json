@@ -1,0 +1,7 @@
+{
+  "about": "SIGKILL the scheduler while a turn runs (the model response is held). A second scheduler must not start another prime on the session; the orphaned turn finishes and is settled once.",
+  "turns": [
+    { "expect": "CHARLIE-{{NONCE}}", "hold": "first", "ipython": "print('orphan-cell-ran')" },
+    { "expect": "orphan-cell-ran", "text": "Turn one finished under the orphaned supervisor." }
+  ]
+}

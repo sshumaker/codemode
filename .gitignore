@@ -19,3 +19,4 @@ vendor/terminal-bench/
 .harness/
 # Written by scripts/build-harness-artifact.sh; it names a machine-local path.
 harness.lock.json
+.venv-itest/

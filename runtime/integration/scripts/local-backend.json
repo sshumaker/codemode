@@ -1,0 +1,17 @@
+{
+  "about": "The local kernel backend opens a real, sandboxed kernel for a session: the prelude and the runtime (jobs.py, invocations.py, scheduler.py) are staged into its IPython dir, the srt posture denies reads outside the conversation, loopback reaches the tool proxy, and a job projects into the staged invocation store.",
+  "turns": [
+    {
+      "expect": "GOLF-{{NONCE}}",
+      "ipython": "import json, os, urllib.request\nimport invocations\nprint('RUNTIME', os.path.dirname(os.path.realpath(invocations.__file__)))\nprint('JOBDIR', os.environ['HARNESS_JOB_DIR'])\ntry:\n    open({{SECRET_PY}}).read()\n    print('SECRET-READ')\nexcept Exception as e:\n    print('SECRET-DENIED', type(e).__name__)\nh = jobs.submit('echo staged-job-ok', name='staged')\nreq = urllib.request.Request(os.environ['HARNESS_MCP_PROXY'] + '/call', data=json.dumps({'server': 'fake', 'tool': 'lookup', 'args': {}}).encode(), headers={'content-type': 'application/json'})\nprint('PROXY', urllib.request.urlopen(req).read().decode())"
+    },
+    {
+      "expect": "SECRET-",
+      "ipython": "import json, time, invocations\ntime.sleep(1)\nj = jobs.get('staged')\nprint('JOB', j.state, j.output.strip())\nst = invocations.InvocationStore(os.environ['HARNESS_JOB_DIR'])\nst.refresh()\nprint('STORE', json.dumps(sorted((r['kind'], r['name'], r['state']) for r in st.all())))"
+    },
+    {
+      "expect": "STORE",
+      "text": "The staged runtime works."
+    }
+  ]
+}
