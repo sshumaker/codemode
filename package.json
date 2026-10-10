@@ -7,11 +7,12 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "npm run test:js && npm run test:runtime",
+    "test": "npm run test:js && npm run test:kernel && npm run test:runtime",
     "report": "node bench/residency-report.mjs",
     "iterate": "node bench/quick.mjs",
     "validate": "node bench/validate.mjs",
     "test:js": "node --test \"bench/test/*.test.mjs\"",
+    "test:kernel": "node --test \"runtime/kernel/test/*.test.mjs\"",
     "test:runtime": "python3 -m unittest discover -s runtime -p 'test_*.py'",
     "eval:jobs": "node runtime/eval/all.mjs",
     "test:remote-kernel": "node --test --test-concurrency=1 --test-timeout=300000 runtime/remote-kernel/test/unit.test.mjs runtime/remote-kernel/test/link.test.mjs runtime/remote-kernel/test/fake.test.mjs",

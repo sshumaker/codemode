@@ -18,6 +18,11 @@ gateway ── DaytonaKernelProvider.ensure(id) ──► Daytona API (create/st
 
 ## What the gateway calls
 
+A host that runs prime per conversation can use `runtime/kernel/daytona.mjs`
+(`DaytonaKernelBackend`, with its warm pool and idle sweep) instead of calling the
+provider directly; see the top-level README, "Kernel backends". The provider API below
+is what that backend is built on.
+
 ```js
 import { DaytonaKernelProvider, connectionEnv, connectFileContents } from "<HARNESS_ROOT>/runtime/daytona/provider.mjs";
 
