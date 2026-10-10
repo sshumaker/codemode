@@ -108,6 +108,16 @@ SESSIONS_ROOT = f"{RUNTIME_DIR}/sessions"
 SESSION_DIR = f"{SESSIONS_ROOT}/task"
 REPO = Path(__file__).resolve().parents[2]
 
+# The runtime modules staged into RUNTIME_DIR. A module missing from these lists
+# fails only inside the container, where nothing on the host can see it:
+# scheduler.py's `from agent_mailbox import Mailbox` sank every exit-mode wake, and
+# the prelude's `import agents` (next to `import subagents`) reported SUBAGENTS
+# unavailable while `import subagents` alone passed the reachability check.
+# test_prime_agent.py derives what each module imports and pins these lists to it.
+JOBS_RUNTIME = ("jobs.py", "invocations.py", "kernel-prelude.py",
+                "harness_unshadow.py", "scheduler.py", "agent_mailbox.py")
+SUBAGENT_RUNTIME = ("subagents.py", "subagent_run.py", "agents.py")
+
 # codemode keeps its single execution tool and gains `edit` for safe targeted
 # writes. vanilla gets prime's real shell/file set — including bash, which
 # MCP-Bench withheld only because it let that arm curl past the MCP tools under
@@ -450,22 +460,16 @@ file you have already looked at.\
         if self._jobs != "on":
             return {"staged": False}
 
+        # JOBS_RUNTIME: jobs.py and its prelude; harness_unshadow.py, which
+        # unshadows stdlib at INTERPRETER STARTUP, before IPython imports
+        # `executing` (which does `from tokenize import detect_encoding` at import
+        # time) — a task cwd that ships e.g. /app/tokenize.py otherwise breaks that
+        # import during shell init, so `jobs` never binds and the ON arm is silently
+        # invalid (installed as a .pth below; measured on train-bpe-tokenizer); and
+        # the wake scheduler with the mailbox it imports, which travel with the
+        # runtime they schedule (exit mode).
         session.copy_to_container(
-            [REPO / "runtime" / "jobs.py", REPO / "runtime" / "invocations.py"], container_dir=RUNTIME_DIR)
-        session.copy_to_container(
-            [REPO / "runtime" / "kernel-prelude.py"], container_dir=RUNTIME_DIR)
-        # Unshadow stdlib at INTERPRETER STARTUP, before IPython imports `executing`
-        # (which does `from tokenize import detect_encoding` at import time). A task
-        # cwd that ships e.g. /app/tokenize.py otherwise breaks that import during
-        # shell init — before the startup file runs — so `jobs` never binds and the
-        # ON arm is silently invalid. Installed as a .pth in the kernel venv's
-        # site-packages so it runs earlier than any startup file could. See
-        # runtime/harness_unshadow.py. Measured on train-bpe-tokenizer.
-        session.copy_to_container(
-            [REPO / "runtime" / "harness_unshadow.py"], container_dir=RUNTIME_DIR)
-        # The wake scheduler travels with the runtime it schedules (exit mode).
-        session.copy_to_container(
-            [REPO / "runtime" / "scheduler.py"], container_dir=RUNTIME_DIR)
+            [REPO / "runtime" / name for name in JOBS_RUNTIME], container_dir=RUNTIME_DIR)
         # The session dir must exist BEFORE the first cell: the kernel writes
         # wake.json into it, and demo4 lost every wake to ENOENT here.
         if self._wait_mode == "exit":
@@ -478,16 +482,15 @@ file you have already looked at.\
         # (2026-08-15 review, H4/P1.8).
         if os.environ.get("HARNESS_SUBAGENTS") == "1":
             session.copy_to_container(
-                [REPO / "runtime" / "subagents.py"], container_dir=RUNTIME_DIR)
-            session.copy_to_container(
-                [REPO / "runtime" / "subagent_run.py"], container_dir=RUNTIME_DIR)
+                [REPO / "runtime" / name for name in SUBAGENT_RUNTIME], container_dir=RUNTIME_DIR)
             # Assert the capability is REACHABLE in the container, not merely
             # copied — the L1-that-was-L4 lesson: advertise nothing unverified.
+            # Import what the prelude imports to bind it, not a subset of it.
             r = self._exec(session, ["sh", "-c",
-                f"cd {RUNTIME_DIR} && {KERNEL_PYTHON} -c 'import subagents' 2>&1"])
+                f"cd {RUNTIME_DIR} && {KERNEL_PYTHON} -c 'import subagents, agents, subagent_run' 2>&1"])
             if r.exit_code != 0:
                 raise RuntimeError(
-                    f"HARNESS_SUBAGENTS=1 but `import subagents` fails in the "
+                    f"HARNESS_SUBAGENTS=1 but the subagent runtime fails to import in the "
                     f"container: {r.output.decode(errors='replace')[:400]}")
         # The bash guard travels with the runtime it calls, gated on the same
         # flag, for the reason the guidance is: an extension staged without
