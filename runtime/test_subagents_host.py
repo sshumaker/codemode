@@ -117,6 +117,7 @@ class TestTheRequest(Base):
                 timeout="10m",
                 system_prompt="be brief",
                 cwd="sub",
+                placement="cloud",
             )
         req = self.broker.sent[0]
         self.assertEqual(
@@ -132,6 +133,7 @@ class TestTheRequest(Base):
                 "timeout": 600,
                 "system_prompt": "be brief",
                 "cwd": "sub",
+                "placement": "cloud",
             },
         )
         self.assertEqual(os.listdir(self.dir), [], "the host transport wrote into the job directory")
