@@ -258,7 +258,12 @@ class PrimeAgent(BaseAgent):
             # resumes it. Present only in exit mode so sleep-mode runs are
             # byte-identical to every prior campaign run.
             **({"HARNESS_WAIT_MODE": "exit",
-                "HARNESS_WAKE_FILE": f"{SESSION_DIR}/wake.json"}
+                "HARNESS_WAKE_FILE": f"{SESSION_DIR}/wake.json",
+                # The scheduler owns each turn, so prime's daemon must not keep a
+                # killed client's turn running (upstream: 30 s) — it ran
+                # unsupervised and locked the session against the recovery run
+                # (scripts/neutralize-prime.mjs, owned-worker grace).
+                "HARNESS_OWNED_WORKER_GRACE_MS": "0"}
                if self._wait_mode == "exit" else {}),
             "DO_NOT_TRACK": "1",
             "PRIME_AGENT_TELEMETRY": "0",
@@ -576,6 +581,9 @@ file you have already looked at.\
         # exists for — the run must fail preflight, not lie in its label.
         if self._wait_mode == "exit":
             want.append("HARNESS_WAIT_MODE")
+            # A bundle without the owned-worker-grace patch ignores the variable
+            # and keeps a killed turn running for 30 s against the recovery run.
+            want.append("HARNESS_OWNED_WORKER_GRACE_MS")
         # The sharpest instance of this whole class of trap. The tb-agent volume
         # HONOURS HARNESS_KERNEL_SANDBOX_* while carrying no env allow-list at
         # all (measured: 0 matches for HARNESS_KERNEL_ENV_ALLOW anywhere under
@@ -658,6 +666,7 @@ file you have already looked at.\
                 "HARNESS_JOB_DIR": f"{RUNTIME_DIR}/jobs",
                 "HARNESS_WAIT_MODE": "exit",
                 "HARNESS_WAKE_FILE": f"{SESSION_DIR}/wake.json",
+                "HARNESS_OWNED_WORKER_GRACE_MS": "0",
             },
         }
         spec_path = logging_dir / "session.json"

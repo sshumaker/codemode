@@ -85,5 +85,26 @@ class ContainerStagingTest(unittest.TestCase):
         self.assertLessEqual(bound, staged, f"the prelude binds but the runner does not stage: {sorted(bound - staged)}")
 
 
+class ExitModeEnvTest(unittest.TestCase):
+    def test_exit_mode_lets_the_scheduler_own_the_turn(self):
+        # Exit mode runs turns under runtime/scheduler.py's supervisor: the first
+        # run's env and session.json's env (which the scheduler's resume runs use,
+        # and which wins over the process env) both have to stop prime's daemon
+        # outliving a killed client's turn, or the recovery run finds the session
+        # "already active" (see neutralize-prime.mjs, owned-worker grace).
+        found = 0
+        for node in ast.walk(ast.parse(RUNNER.read_text())):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {k.value: v for k, v in zip(node.keys, node.values) if isinstance(k, ast.Constant)}
+            mode = keys.get("HARNESS_WAIT_MODE")
+            if mode is None or getattr(mode, "value", None) != "exit":
+                continue
+            found += 1
+            grace = keys.get("HARNESS_OWNED_WORKER_GRACE_MS")
+            self.assertIsNotNone(grace, f"an exit-mode env (line {node.lineno}) does not set HARNESS_OWNED_WORKER_GRACE_MS")
+            self.assertEqual(ast.literal_eval(grace), "0")
+        self.assertEqual(found, 2, f"expected the first-run and session.json exit-mode envs in {RUNNER.name}")
+
 if __name__ == "__main__":
     unittest.main()
