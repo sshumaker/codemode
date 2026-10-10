@@ -246,7 +246,13 @@ The wake sources, first match wins:
 - the named targets finished: all of them, or any one with `mode="any"`. A condition job
   (`until <cond>; do sleep N; done`, `expect="once"`) finishing is its condition
   firing, and the message says succeeded, failed or timed out;
+- an owed item the wait did not name: a job, subagent or call that ended and whose
+  outcome the agent has not been given, whether or not anything waits on it
+  (`docs/TOOL-INVOCATIONS.md`);
 - the `wake_after` deadline.
+
+Every owed outcome rides on the wake that fires, and the scheduler delivers them in
+two phases with the turn.
 
 A user message wakes the session whether or not it is waiting. Under the scheduler it
 is a file in `<session>/inbox/` (`scheduler.post_user_message`), delivered after the

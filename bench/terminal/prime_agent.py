@@ -451,7 +451,7 @@ file you have already looked at.\
             return {"staged": False}
 
         session.copy_to_container(
-            [REPO / "runtime" / "jobs.py"], container_dir=RUNTIME_DIR)
+            [REPO / "runtime" / "jobs.py", REPO / "runtime" / "invocations.py"], container_dir=RUNTIME_DIR)
         session.copy_to_container(
             [REPO / "runtime" / "kernel-prelude.py"], container_dir=RUNTIME_DIR)
         # Unshadow stdlib at INTERPRETER STARTUP, before IPython imports `executing`

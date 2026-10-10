@@ -120,7 +120,12 @@ export function cellProgress(error: unknown): CellProgress | undefined {
 	return progress === "started" || progress === "called" ? progress : undefined;
 }
 
-import { readFileSync as callJournalReadFileSync, statSync as callJournalStatSync } from "node:fs";
+import {
+	appendFileSync as callJournalAppendFileSync,
+	mkdirSync as callJournalMkdirSync,
+	readFileSync as callJournalReadFileSync,
+	statSync as callJournalStatSync,
+} from "node:fs";
 
 /**
  * Every call a cell made out of the kernel, in arrival order, with what came of it.
@@ -247,6 +252,17 @@ export class CallJournal {
 				...(e.late ? { late: true } : {}),
 				...(e.background ? { background: true } : {}),
 			}));
+	}
+
+	/** The death report carried these calls to the model: the store counts them delivered. */
+	reported(): void {
+		if (!this.options.kernelFile || this.entries.length === 0) return;
+		try {
+			callJournalAppendFileSync(
+				this.options.kernelFile,
+				`${JSON.stringify({ k: "reported", msg: this.executionId, at: Date.now() / 1000 })}\n`,
+			);
+		} catch {}
 	}
 
 	/** Which ways out of the kernel this journal saw, for the report's honesty line. */
@@ -379,6 +395,7 @@ export async function journaled<T>(
 export function markCellCalls<E extends Error>(error: E, journal: CallJournal | undefined): E {
 	if (!journal) return error;
 	journal.died();
+	journal.reported();
 	(error as { cellCalls?: CallJournal }).cellCalls = journal;
 	if (journal.size > 0) return markCellProgress(error, "called");
 	return journal.kernelStarted ? markCellProgress(error, "started") : error;
@@ -439,12 +456,27 @@ export function describeCellDeath(head: string, journal: CallJournal | undefined
 	return `${head}\n\n${lines.join("\n")}\n\n${tail}`;
 }
 
-/** The kernel's env, with HARNESS_CALL_JOURNAL pointed into its own temp dir when dead cells are reported. */
+/**
+ * The kernel's env, with HARNESS_CALL_JOURNAL set when dead cells are reported: the
+ * session's invocation store (`<HARNESS_JOB_DIR>/invocations/calls.jsonl`, the inline
+ * backend's event log, docs/TOOL-INVOCATIONS.md) when there is one, else the kernel's
+ * own temp dir.
+ */
 export function withCallJournal(
 	env: Record<string, string> | undefined,
 	tempDir: string,
 ): Record<string, string> | undefined {
 	if (process.env.HARNESS_KERNEL_AUTORESTART !== "1") return env;
+	// A forked kernel inherits the fork server's environment, not this process's.
+	const delivery = env?.HARNESS_TOOL_DELIVERY ?? process.env.HARNESS_TOOL_DELIVERY;
+	if (delivery) env = { ...env, HARNESS_TOOL_DELIVERY: delivery };
+	const jobDir = env?.HARNESS_JOB_DIR ?? process.env.HARNESS_JOB_DIR;
+	if (jobDir) {
+		try {
+			callJournalMkdirSync(`${jobDir}/invocations`, { recursive: true });
+			return { ...env, HARNESS_CALL_JOURNAL: `${jobDir}/invocations/${CALL_JOURNAL_FILE}` };
+		} catch {}
+	}
 	return { ...env, HARNESS_CALL_JOURNAL: `${tempDir}/${CALL_JOURNAL_FILE}` };
 }
 

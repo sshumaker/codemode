@@ -28,6 +28,8 @@ const KEYS = [
 	"HARNESS_CELL_TIMEOUT_MS",
 	"HARNESS_SNAPSHOT_RESTORE_TIMEOUT_MS",
 	"HARNESS_MCP_PROXY",
+	"HARNESS_JOB_DIR",
+	"HARNESS_TOOL_DELIVERY",
 ];
 
 const text = (r) => r.content.map((c) => c.text ?? "").join("");
@@ -193,6 +195,50 @@ describe("kernel recovery", { skip: !existsSync(KERNEL_PYTHON) && "no kernel pyt
 		} finally {
 			release({ ok: 1 });
 		}
+	});
+
+	it("the journal is the session's inline invocation log, and the store folds it", { timeout: 120_000 }, async () => {
+		const proxy = await startProxy();
+		writeApiTree();
+		const jobDir = join(scratch, "jobs");
+		const table = join(scratch, "delivery.json");
+		writeFileSync(table, JSON.stringify({ "fixture.echo": "read_only" }));
+		process.env.HARNESS_JOB_DIR = jobDir;
+		process.env.HARNESS_TOOL_DELIVERY = table;
+		const cell = tool();
+		const died = text(
+			await cell(
+				"import asyncio, os\n" +
+					"from api.fixture import echo, slow\n" +
+					'print(await echo(text="a"))\n' +
+					'asyncio.ensure_future(slow(text="charge"))\n' +
+					"await asyncio.sleep(1.5)\n" +
+					"os._exit(1)",
+			),
+		);
+		assert.equal(proxy.calls.length, 2, died);
+		const log = join(jobDir, "invocations", "calls.jsonl");
+		assert.ok(existsSync(log), "the journal lives in the session's invocation store");
+		const lines = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		const calls = lines.filter((l) => l.k === "call");
+		assert.deepEqual(calls.map((c) => [c.name, c.delivery]), [["fixture.echo", "read_only"], ["fixture.slow", "at_most_once"]]);
+		assert.deepEqual(calls.map((c) => c.id), [`call:${calls[0].msg}:1`, `call:${calls[0].msg}:2`]);
+		assert.ok(lines.some((l) => l.k === "reported" && l.msg === calls[0].msg), "the death report marks its calls delivered");
+		const folded = JSON.parse(
+			execFileSync(
+				"python3",
+				[
+					"-c",
+					"import sys, json; sys.path.insert(0, sys.argv[1]); import invocations as I\n" +
+						"s = I.InvocationStore(sys.argv[2]); s.refresh()\n" +
+						"print(json.dumps({r['name']: [r['state'], bool(r['delivered_at'])] for r in s.all()}))",
+					join(ROOT, "runtime"),
+					jobDir,
+				],
+				{ encoding: "utf8" },
+			),
+		);
+		assert.deepEqual(folded, { "fixture.echo": ["succeeded", true], "fixture.slow": ["unknown", true] });
 	});
 
 	it("a kernel already dead before the cell is replaced, and the cell runs once", { timeout: 120_000 }, async () => {

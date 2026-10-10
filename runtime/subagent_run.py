@@ -118,7 +118,9 @@ def _wake_reason(request: dict) -> "str | None":
         if wake_at is not None and time.time() >= wake_at:
             return f"the requested wait of {request.get('wake_after', '?')}s elapsed"
         return None
-    reason = scheduler.reason_for(request, request.get("job_dir"))
+    _, reason, owed = scheduler.decide_owed(request, request.get("job_dir"))
+    if reason:
+        scheduler.mark_owed_delivered(request.get("job_dir"), owed, by="subagent launcher wake")
     if reason and request.get("mailboxes"):
         from agent_mailbox import Mailbox as _Box
 

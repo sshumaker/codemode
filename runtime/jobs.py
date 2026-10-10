@@ -53,6 +53,11 @@ import sys
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    import invocations as _inv
+except ImportError:  # staged without it (an old container volume): jobs work, nothing is owed
+    _inv = None
+
 # The tool wrapper greps stdout for this. Deliberately unmistakable.
 WAIT_SENTINEL = "__HARNESS_WAIT_SECONDS__"
 
@@ -703,10 +708,14 @@ class Job:
     def __hash__(self) -> int:
         return hash(("Job", self.name))
 
+    def _observe(self) -> dict:
+        rec = self._store._refresh(self._store._read(self.name)) or {}
+        self._store._seen(rec)
+        return rec
+
     @property
     def state(self) -> str:
-        rec = self._store._refresh(self._store._read(self.name)) or {}
-        return rec.get("state", "missing")
+        return self._observe().get("state", "missing")
 
     @property
     def done(self) -> bool:
@@ -714,18 +723,18 @@ class Job:
 
     @property
     def ok(self) -> bool:
-        rec = self._store._refresh(self._store._read(self.name)) or {}
+        rec = self._observe()
         return rec.get("state") == "done" and rec.get("exit_code") == 0
 
     @property
     def exit_code(self) -> Optional[int]:
-        rec = self._store._refresh(self._store._read(self.name)) or {}
+        rec = self._observe()
         return rec.get("exit_code")
 
     @property
     def reason(self) -> Optional[str]:
         """Why this job ended. A deadline that never fired says so explicitly."""
-        rec = self._store._refresh(self._store._read(self.name)) or {}
+        rec = self._observe()
         return rec.get("reason")
 
     @property
@@ -1161,6 +1170,31 @@ class JobStore:
             finally:
                 os.close(dfd)
         except OSError:
+            pass
+        self._project(rec)
+
+    # -- the invocation this job is (docs/TOOL-INVOCATIONS.md) -------------------
+    def invocations(self):
+        return _inv.InvocationStore(self.job_dir, now=self._now) if _inv else None
+
+    def _project(self, rec: dict) -> None:
+        """Every job write is reflected on its invocation; a failure here never fails the job."""
+        store = self.invocations()
+        if store is None:
+            return
+        try:
+            _inv.project_job(store, rec)
+        except Exception:  # noqa: BLE001 - the scheduler re-derives it from the job record
+            pass
+
+    def _seen(self, rec: Optional[dict]) -> None:
+        """The agent read a finished job's outcome itself: it is delivered."""
+        store = self.invocations()
+        if store is None or not rec or rec.get("state") in LIVE_STATES or "started_at" not in rec:
+            return
+        try:
+            store.mark_delivered([_inv.job_invocation_id(rec)], by="read")
+        except Exception:  # noqa: BLE001
             pass
 
     def _read_log(self, rec: dict, limit: int = 200_000) -> str:
@@ -1675,6 +1709,7 @@ class JobStore:
         seconds = parse_duration(wake_after)
         clamped = max(self._min_wait, min(seconds, self._max_wait))
         armed_at = time.time()
+        self._choose_blocking(watch)
         pending = []
         for rec in self._all():
             fresh = self._refresh(rec)
@@ -1759,6 +1794,9 @@ class JobStore:
             "targets": [*watch],
             "job_dir": self.job_dir,
         }
+        if _inv is not None:
+            request["invocations"] = _inv.invocation_dir(self.job_dir)
+            request["blocking"] = _inv.ids_for_jobs(self.job_dir, watch)
         if watch:
             request["mode"] = mode
             request["mailboxes"] = self._mailboxes(watch)
@@ -1766,6 +1804,17 @@ class JobStore:
             if streams:
                 request["streams"] = streams
         return request
+
+    def _choose_blocking(self, watch: Sequence[str]) -> None:
+        """This wait's named jobs block (a barrier); every other item watches on its own."""
+        store = self.invocations()
+        if store is None:
+            return
+        try:
+            store.sync_jobs()
+            store.set_blocking(_inv.ids_for_jobs(self.job_dir, watch))
+        except Exception:  # noqa: BLE001 - a wait must never fail on bookkeeping
+            pass
 
     def _stream_offsets(self, names: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """
@@ -1837,6 +1886,7 @@ class JobStore:
                     return found
             return None
         fresh = self._refresh(rec) or rec
+        self._seen(fresh)
         if fresh.get("state") == "pruned":
             existing = self._handles.get(name)
             if not isinstance(existing, Tombstone):
@@ -1847,6 +1897,8 @@ class JobStore:
 
     def list(self, external: bool = True) -> List[dict]:
         rows = [self._refresh(rec) for rec in self._all()]
+        for row in rows:
+            self._seen(row)
         if external:
             rows += [rec for provider in _EXTERNAL for rec in provider.records()]
         return rows
@@ -1906,6 +1958,8 @@ class JobStore:
         after it.
         """
         rows = [self._refresh(rec) for rec in self._all()]
+        for row in rows:
+            self._seen(row)
         external = [line for provider in _EXTERNAL for line in provider.manifest_lines()] if external else []
         if not rows and external:
             return "\n".join(external)

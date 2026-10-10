@@ -72,6 +72,11 @@ from typing import Callable, List, Optional, Sequence
 import jobs as J
 from agent_mailbox import Mailbox
 
+try:
+    import invocations as INV
+except ImportError:  # staged without it: wakes work as before, nothing is owed
+    INV = None
+
 WAKE_FILE = "wake.json"
 SESSION_FILE = "session.json"
 LEASE_DIR = "lease"
@@ -194,18 +199,26 @@ def wake_reason(session_dir: str, now: Callable[[], float] = time.time) -> Optio
     "not waiting", never a wake, and a present one is judged by `reason_for`.
     A session that is ending or has ended (end.json) is never woken this way.
     """
+    return wake_decision(session_dir, now)[0]
+
+
+def wake_decision(session_dir: str, now: Callable[[], float] = time.time) -> tuple:
+    """(reason, owed invocation ids the woken turn delivers) — `wake_reason` with its payload."""
     if os.path.exists(os.path.join(session_dir, END_FILE)):
-        return None
+        return None, []
+    wake = _read_wake(session_dir)
+    job_dir = _job_dir(session_dir, wake)
     turn = _turn_reason(session_dir)
     users = pending_user_messages(session_dir)
-    if users:
-        return f"{_user_reason(users)}; {turn}" if turn else _user_reason(users)
-    if turn:
-        return turn
-    wake = _read_wake(session_dir)
-    if wake is None:
-        return None
-    return reason_for(wake, _job_dir(session_dir, wake), now)
+    if users or turn:
+        reason = f"{_user_reason(users)}; {turn}" if users and turn else (_user_reason(users) if users else turn)
+        owed = owed_items(job_dir)
+        lines = [INV.describe(r) for r in owed]
+        if lines:
+            reason = f"{reason}; also: {'; '.join(lines)}"
+        return reason, [r["id"] for r in owed]
+    _, reason, ids = decide_owed(wake, job_dir, now)
+    return reason, ids
 
 
 def reason_for(
@@ -243,8 +256,100 @@ def decide(
     """`reason_for`, with which source fired: (source, reason), both None while nothing is due.
 
     Sources: "message" (a named agent wrote), "stream" (a stream job printed),
-    "finished" (the watched jobs or agents finished), "deadline".
+    "finished" (the watched jobs or agents finished), "owed" (an item the wait did not
+    name finished undelivered), "deadline".
     """
+    # A caller of this API does not mark what it reports delivered, so an owed item
+    # counts only if it ended after the wait was armed: it wakes such a host once.
+    source, reason, _ = decide_owed(wake, job_dir, now, agents, since=(wake or {}).get("armed_at"))
+    return source, reason
+
+
+def owed_items(job_dir: Optional[str]) -> List[dict]:
+    """Every terminal, undelivered invocation of this job dir, reconciled from disk first."""
+    if INV is None or not job_dir or not os.path.isdir(job_dir):
+        return []
+    store = INV.InvocationStore(job_dir)
+    try:
+        # Judge every job from the OS first: a job is owed the moment it ends, not
+        # the moment something happens to read its record.
+        jobs = J.JobStore(job_dir, emit=lambda m: None)
+        for rec in jobs._all():
+            jobs._refresh(rec)
+        store.refresh()
+        return store.owed()
+    except Exception:  # noqa: BLE001 - bookkeeping must never stop a wake
+        return []
+
+
+def _owed_lines(owed: List[dict], skip_names: Sequence[str] = ()) -> List[str]:
+    return [INV.describe(r) for r in owed
+            if not (r.get("kind") in ("job", "subagent") and r.get("name") in skip_names)]
+
+
+def decide_owed(
+    wake: Optional[dict],
+    job_dir: Optional[str] = None,
+    now: Callable[[], float] = time.time,
+    agents: Optional[dict] = None,
+    since: Optional[float] = None,
+) -> tuple:
+    """
+    (source, reason, ids) — `decide` plus the owed-items rule (docs/TOOL-INVOCATIONS.md).
+
+    `since` limits the owed items to those that ended after it, for a host that
+    cannot mark delivery (it would otherwise be woken by the same item every wait).
+
+    The wait's named targets block as a set, exactly as before. Any other owed item —
+    a job nobody waited on, a call whose kernel died — wakes by itself. Whatever fires,
+    every owed outcome rides on the wake and `ids` names them, so the caller can mark
+    them delivered (in two phases, under the scheduler).
+    """
+    wake = wake or {}
+    root = job_dir or wake.get("job_dir")
+    owed = owed_items(root)
+    if since is not None:
+        owed = [r for r in owed if float(r.get("finished_at") or 0) >= float(since)]
+    source, reason = _decide_wait(wake, root, now, agents) if wake else (None, None)
+    watch = wake.get("watch") or []
+    blocking = set(wake.get("blocking") or []) | {r["id"] for r in owed if r.get("blocking")}
+    if source is None:
+        loose = [r for r in owed if r["id"] not in blocking
+                 and not (r.get("kind") in ("job", "subagent") and r.get("name") in watch)]
+        if loose:
+            source, reason = "owed", "; ".join(INV.describe(r) for r in loose)
+            return source, reason + _also(owed, loose, watch), [r["id"] for r in owed]
+        if wake:
+            source, reason = _deadline(wake, now)
+        if source is None:
+            return None, None, []
+    extra = _owed_lines(owed, watch)
+    if extra:
+        reason = f"{reason}; also: {'; '.join(extra)}"
+    return source, reason, [r["id"] for r in owed]
+
+
+def _also(owed: List[dict], said: List[dict], watch: Sequence[str]) -> str:
+    rest = [r for r in owed if r not in said]
+    lines = _owed_lines(rest, watch) + [INV.describe(r) for r in rest
+                                        if r.get("kind") in ("job", "subagent") and r.get("name") in watch]
+    return f"; also: {'; '.join(lines)}" if lines else ""
+
+
+def _deadline(wake: dict, now: Callable[[], float]) -> tuple:
+    wake_at = wake.get("wake_at")
+    if wake_at is not None and now() >= wake_at:
+        return "deadline", f"the requested wait of {wake.get('wake_after', '?')}s elapsed"
+    return None, None
+
+
+def _decide_wait(
+    wake: dict,
+    job_dir: Optional[str] = None,
+    now: Callable[[], float] = time.time,
+    agents: Optional[dict] = None,
+) -> tuple:
+    """The wait's own sources, deadline excluded (the owed rule outranks a bare deadline)."""
     agents = agents or {}
     root = job_dir or wake.get("job_dir")
     # A host evaluating only its own facts (a remote kernel's jobs live elsewhere) passes
@@ -278,10 +383,13 @@ def decide(
         name, why = next(iter(finished.items()))
         kind = "agent" if name in agents else "job"
         return "finished", f"{kind} {name!r} finished: {why}"
-    wake_at = wake.get("wake_at")
-    if wake_at is not None and now() >= wake_at:
-        return "deadline", f"the requested wait of {wake.get('wake_after', '?')}s elapsed"
     return None, None
+
+
+def mark_owed_delivered(job_dir: Optional[str], ids: Sequence[str], by: str) -> None:
+    """One-phase delivery, for hosts with no turn record to roll back (RPC, print self-wake)."""
+    if INV is not None and job_dir and ids and os.path.isdir(job_dir):
+        INV.InvocationStore(job_dir).mark_delivered(ids, by=by)
 
 
 def describe_agent_finish(fact: dict) -> str:
@@ -562,6 +670,7 @@ def _finish_turn(session_dir: str, turn: dict, **fields) -> None:
     """The run returned: its messages were delivered, and the record becomes evidence."""
     for msg in turn.get("messages") or []:
         _move_message(msg["path"], ".delivering", ".delivered")
+    _delivery(session_dir, "commit", turn.get("run_id"))
     turn.update(fields, ended_at=turn.get("ended_at") or time.time())
     _write_json(_turn_path(session_dir) + ".last", turn)
     try:
@@ -592,8 +701,21 @@ def _recover_turn(session_dir: str, log: Callable[[str], None] = print) -> Optio
     return _recover_crashed(session_dir, turn, log)
 
 
+def _delivery(session_dir: str, phase: str, run_id: Optional[str], ids: Sequence[str] = ()) -> List[str]:
+    """Two-phase delivery of owed invocations, alongside the run's messages."""
+    if INV is None or not run_id:
+        return []
+    store = INV.InvocationStore(_job_dir(session_dir))
+    if phase == "begin":
+        return store.begin_delivery(ids, run_id)
+    if phase == "commit":
+        return store.commit_delivery(run_id)
+    return store.rollback_delivery(run_id)
+
+
 def _unconsume(session_dir: str, turn: dict) -> None:
     """Undo phase one: the run's messages are pending again, and so is its wake."""
+    _delivery(session_dir, "rollback", turn.get("run_id"))
     for msg in turn.get("messages") or []:
         _move_message(msg["path"], ".delivering", "")
     wake = os.path.join(session_dir, WAKE_FILE)
@@ -631,6 +753,7 @@ def _record_spawn_failure(session_dir: str, error: BaseException, log: Callable[
     failures = int(turn.get("spawn_failures") or 0) + 1
     turn.update(spawn_failures=failures, last_error=repr(error), failed_at=time.time())
     if failures >= MAX_SPAWN_FAILURES:
+        _delivery(session_dir, "rollback", turn.get("run_id"))
         for msg in turn.get("messages") or []:
             _move_message(msg["path"], ".delivering", ".undelivered")
         turn.update(state="abandoned")
@@ -671,6 +794,8 @@ def _recover_crashed(session_dir: str, turn: dict, log: Callable[[str], None]) -
             _move_message(msg["path"], ".delivering", "")
         _finish_turn(session_dir, turn, state="ended-in-wait", **evidence)
         return f"turn {turn.get('run_id')} died after it waited again; no re-wake needed"
+    # The crashed turn may not have shown its owed outcomes: owed again, re-delivered once.
+    evidence["redelivered_invocations"] = _delivery(session_dir, "rollback", turn.get("run_id"))
     recoveries = int(turn.get("recoveries") or 0) + 1
     if recoveries > MAX_CRASH_RECOVERIES:
         for msg in lost:
@@ -790,7 +915,8 @@ def _spawn_supervised(argv: List[str], cwd: str, env: dict, session_dir: str) ->
     return proc.wait()
 
 
-def run_wake(session_dir: str, reason: str, *, runner=None, closing: bool = False) -> int:
+def run_wake(session_dir: str, reason: str, *, runner=None, closing: bool = False,
+             deliver: Optional[Sequence[str]] = None) -> int:
     """
     Invoke the session's harness once, to exit — with two-phase delivery.
 
@@ -825,6 +951,8 @@ def run_wake(session_dir: str, reason: str, *, runner=None, closing: bool = Fals
         "scheduler": _self_identity(),
         "wake_fired": was_waiting,
         "messages": [{"id": m["id"], "path": m["path"]} for m in users],
+        # Owed outcomes this run's opening message carries (docs/TOOL-INVOCATIONS.md).
+        "invocations": list(deliver or []),
         # Both counts are carried only by the run that answers a crash or a failed
         # spawn, so a clean run resets them.
         "recoveries": 0,
@@ -836,6 +964,7 @@ def run_wake(session_dir: str, reason: str, *, runner=None, closing: bool = Fals
         turn["recoveries"] = previous.get("recoveries", 0)
         turn["recovering"] = previous  # the crash this run answers, kept as evidence
     _write_json(turn_path, turn)
+    _delivery(session_dir, "begin", run_id, turn["invocations"])
     if was_waiting:
         os.replace(wake_path, f"{wake_path}.fired")
     for msg in users:
@@ -974,6 +1103,7 @@ def _is_idle(session_dir: str) -> bool:
     return (not os.path.exists(os.path.join(session_dir, WAKE_FILE))
             and not os.path.exists(_turn_path(session_dir))
             and not pending_user_messages(session_dir)
+            and not owed_items(_job_dir(session_dir))
             and os.path.exists(_turn_path(session_dir) + ".last"))
 
 
@@ -1025,6 +1155,7 @@ def _settle_for_end(session_dir: str) -> List[str]:
     notes = []
     turn = _read_turn(session_dir)
     if turn:
+        _delivery(session_dir, "rollback", turn.get("run_id"))
         turn.update(ended_session=True, settled_at=time.time())
         _write_json(_turn_path(session_dir) + ".ended", turn)
         os.remove(_turn_path(session_dir))
@@ -1167,14 +1298,18 @@ def _serve_session(session_dir: str, *, now, runner, log: Callable[[str], None])
         # during it leaves a session that is finalized, not woken again.
         request_end(session_dir, due[1], due[2], state="wrapping-up")
         reason = due[2]
+        owed = owed_items(_job_dir(session_dir))
+        if owed:
+            reason = f"{reason}; also: {'; '.join(INV.describe(r) for r in owed)}"
+        deliver = [r["id"] for r in owed]
     else:
-        reason = wake_reason(session_dir, now)
+        reason, deliver = wake_decision(session_dir, now)
         if not reason:
             return False
     log(f"[scheduler] waking {name}: {reason}")
     consume_messages(session_dir)
     try:
-        code = run_wake(session_dir, reason, runner=runner, closing=closing)
+        code = run_wake(session_dir, reason, runner=runner, closing=closing, deliver=deliver)
     except Exception as error:  # noqa: BLE001 - any spawn failure is bounded the same way
         _record_spawn_failure(session_dir, error, log)
         return False
@@ -1192,6 +1327,7 @@ def _has_pending(session_dir: str, now: Callable[[], float] = time.time) -> bool
         or os.path.exists(os.path.join(session_dir, END_FILE))
         or pending_user_messages(session_dir)
         or end_due(session_dir, now)
+        or owed_items(_job_dir(session_dir))
     )
 
 
@@ -1247,10 +1383,12 @@ def _reason_for_request_cli(consume: bool) -> None:
     envelope = isinstance(payload.get("request"), dict)
     wake = payload["request"] if envelope else payload
     agents = payload.get("agents") if envelope else None
-    source, reason = decide(wake, wake.get("job_dir"), agents=agents)
+    source, reason, owed = decide_owed(wake, wake.get("job_dir"), agents=agents,
+                                       since=None if consume else wake.get("armed_at"))
     if reason and consume:
         for box in (wake.get("mailboxes") or {}).values():
             Mailbox(box).mark_read()
+        mark_owed_delivered(wake.get("job_dir"), owed, by="wake (--consume)")
     print(json.dumps({"reason": reason, "message": wake_message(reason) if reason else None, "source": source}))
 
 

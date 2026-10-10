@@ -601,10 +601,29 @@ def _harness_install_call_journal():
     except OSError:
         return
     numbers = _itertools.count(1)
+    # Each line is an inline invocation's event (docs/TOOL-INVOCATIONS.md): its id is
+    # (execution, seq within that execution), and a claim for anything but a
+    # read_only tool is fsynced before the request leaves, so a kernel killed after
+    # sending leaves a claim the store reads as UNKNOWN rather than as nothing.
+    per_cell = {}
+    try:
+        with _io.open(_prime_agent_os.environ.get("HARNESS_TOOL_DELIVERY") or "") as fh:
+            table = _json.load(fh)
+        if not isinstance(table, dict):
+            table = {}
+    except Exception:
+        table = {}
 
-    def write(record):
+    def delivery_of(name):
+        if name in table:
+            return table[name]
+        return table.get(name.split(".", 1)[0] + ".*", "at_most_once")
+
+    def write(record, durable=False):
         try:
             _prime_agent_os.write(fd, (_json.dumps(record, default=str) + chr(10)).encode())
+            if durable:
+                _prime_agent_os.fsync(fd)
         except Exception:
             pass
 
@@ -645,7 +664,12 @@ def _harness_install_call_journal():
             return original(self, fullurl, data, *args, **kwargs)
         n = next(numbers)
         name = name_of(fullurl, data, url[len(proxy):] or "/")
-        write({"k": "call", "n": n, "msg": cell(), "at": _time.time() * 1000, "name": name})
+        msg = cell()
+        seq = per_cell[msg] = per_cell.get(msg, 0) + 1
+        delivery = delivery_of(name)
+        write({"k": "call", "n": n, "msg": msg, "at": _time.time() * 1000, "name": name,
+               "id": "call:" + str(msg) + ":" + str(seq), "delivery": delivery},
+              durable=delivery != "read_only")
         try:
             response = original(self, fullurl, data, *args, **kwargs)
         except _urllib_error.HTTPError as exc:
@@ -654,7 +678,7 @@ def _harness_install_call_journal():
         except BaseException as exc:
             reason = getattr(exc, "reason", exc)
             refused = isinstance(reason, ConnectionRefusedError)
-            write({"k": "end", "n": n, "outcome": "failed" if refused else "unknown", "summary": type(reason).__name__ + ": " + str(reason)})
+            write({"k": "end", "n": n, "outcome": "failed" if refused else "unknown", "not_sent": refused, "summary": type(reason).__name__ + ": " + str(reason)})
             raise
         if not isinstance(response, _http_client.HTTPResponse):
             write({"k": "end", "n": n, "outcome": "completed", "summary": "HTTP " + str(getattr(response, "status", "?"))})

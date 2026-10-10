@@ -1048,3 +1048,223 @@ class TestSessionDeadlineForReal(SessionTreeBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- owed invocations (docs/TOOL-INVOCATIONS.md) -----------------------------------------
+
+OWED_HARNESS = r"""
+import json, os, sys, time
+runtime, log, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, runtime)
+import jobs as J
+message = sys.argv[-1]
+first = not os.path.exists(log)
+with open(log, "a") as fh:
+    fh.write(json.dumps({"pid": os.getpid(), "message": message}) + "\n")
+store = J.JobStore(emit=lambda m: None)
+if mode == "submit" and first:
+    store.submit("sleep 1; exit 0", name="build")
+elif mode == "barrier" and first:
+    store.submit("sleep 0.5; exit 0", name="a")
+    store.submit("sleep 1.5; exit 3", name="b")
+    store.submit("sleep 3; exit 0", name="c")
+    try:
+        store.wait("a", "b", "c", wake_after=600)
+    except J.WaitSignal:
+        pass
+elif mode == "hang-first" and first:
+    time.sleep(300)
+"""
+
+CALLER = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import invocations as I
+job_dir, sent_file, mode, delivery = sys.argv[2:6]
+store = I.InvocationStore(job_dir)
+
+def send(key):
+    if mode == "die-before-send":
+        os.kill(os.getpid(), signal.SIGKILL)
+    with open(sent_file, "a") as fh:
+        fh.write(key + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    if mode == "die-after-send":
+        os.kill(os.getpid(), signal.SIGKILL)
+    return "charged"
+
+try:
+    print(I.call_inline(store, "call:cell-1:1", "pay.charge", send, delivery=delivery))
+except I.UnknownOutcome as exc:
+    print("UNKNOWN", exc)
+"""
+
+
+class TestAClaimIsNeverResent(unittest.TestCase):
+    """A real SIGKILL between the claim and the answer, then a retry in a fresh process."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="chaos-claim-")
+        self.sent = os.path.join(self.dir, "sent.txt")
+        self.script = os.path.join(self.dir, "caller.py")
+        with open(self.script, "w") as fh:
+            fh.write(CALLER)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def call(self, mode, delivery):
+        return subprocess.run([sys.executable, self.script, HERE, self.dir, self.sent, mode, delivery],
+                              capture_output=True, text=True, timeout=60)
+
+    def sends(self):
+        try:
+            with open(self.sent) as fh:
+                return fh.read().split()
+        except OSError:
+            return []
+
+    def record(self):
+        import invocations as I
+        return I.InvocationStore(self.dir).get("call:cell-1:1")
+
+    def test_at_most_once_killed_after_sending_is_unknown_and_never_resent(self):
+        self.assertEqual(self.call("die-after-send", "at_most_once").returncode, -signal.SIGKILL)
+        self.assertEqual(self.record()["state"], "running", "the claim was on disk before the send")
+        retry = self.call("ok", "at_most_once")
+        self.assertIn("UNKNOWN", retry.stdout, retry.stderr)
+        self.assertIn("verify before retrying", retry.stdout)
+        self.assertEqual(self.sends(), ["call:cell-1:1"], "an at-most-once call was sent twice")
+        self.assertEqual(self.record()["state"], "unknown")
+
+    def test_at_most_once_killed_between_claim_and_send_is_still_never_sent(self):
+        self.assertEqual(self.call("die-before-send", "at_most_once").returncode, -signal.SIGKILL)
+        retry = self.call("ok", "at_most_once")
+        self.assertIn("UNKNOWN", retry.stdout)
+        self.assertEqual(self.sends(), [], "a claim with no outcome must not be resent")
+
+    def test_idempotent_killed_after_sending_resends_under_the_same_key(self):
+        self.assertEqual(self.call("die-after-send", "idempotent").returncode, -signal.SIGKILL)
+        retry = self.call("ok", "idempotent")
+        self.assertEqual(retry.stdout.strip(), "charged", retry.stderr)
+        self.assertEqual(self.sends(), ["call:cell-1:1", "call:cell-1:1"])
+        self.assertEqual(self.record()["state"], "succeeded")
+
+
+class TestOwedOutcomesWakeAndAreDelivered(unittest.TestCase):
+    """Real jobs, a real scheduler, a stand-in harness: what is owed wakes, and is delivered once."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="chaos-owed-")
+        self.sessions = os.path.join(self.root, "sessions")
+        self.session = os.path.join(self.sessions, "s")
+        self.jobs_dir = os.path.join(self.session, "jobs")
+        self.log = os.path.join(self.root, "harness.log")
+        os.makedirs(self.jobs_dir)
+        self.script = os.path.join(self.root, "harness.py")
+        with open(self.script, "w") as fh:
+            fh.write(OWED_HARNESS)
+        self.procs = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+        for run in self.runs():
+            try:
+                os.kill(run["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+        J._reap(self.jobs_dir, reason="test over", grace=0)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def configure(self, mode):
+        with open(os.path.join(self.session, S.SESSION_FILE), "w") as fh:
+            json.dump({"argv": [sys.executable, self.script, HERE, self.log, mode], "cwd": self.session}, fh)
+
+    def once(self):
+        out = subprocess.run([sys.executable, SCHEDULER, self.sessions, "--once"], cwd=HERE,
+                             capture_output=True, text=True, timeout=60, start_new_session=True)
+        return out.stdout + out.stderr
+
+    def runs(self):
+        try:
+            with open(self.log) as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        except OSError:
+            return []
+
+    def invocations(self):
+        import invocations as I
+        return {r["name"]: r for r in I.InvocationStore(self.jobs_dir).all()}
+
+    def job_state(self, name):
+        store = J.JobStore(self.jobs_dir, emit=lambda m: None)
+        return (store._refresh(store._read(name)) or {}).get("state")
+
+    def test_a_job_nobody_waited_on_wakes_the_session_when_it_finishes(self):
+        self.configure("submit")
+        S.post_user_message(self.session, "build it")
+        self.once()
+        self.assertEqual(len(self.runs()), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.session, S.WAKE_FILE)), "the turn did not wait")
+        self.once()
+        self.assertEqual(len(self.runs()), 1, "a running job is not a wake")
+        self.assertTrue(wait_until(lambda: self.job_state("build") == "done", timeout=30))
+        self.once()
+        runs = self.runs()
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("[woken: job 'build': succeeded (exit 0)]", runs[1]["message"])
+        rec = self.invocations()["build"]
+        self.assertTrue(rec["delivered_at"] and rec["delivered_by"].startswith("turn "), rec)
+        self.once()
+        self.assertEqual(len(self.runs()), 2, "a delivered outcome woke the session again")
+
+    def test_a_barrier_of_three_with_one_failing_wakes_once_when_all_are_terminal(self):
+        self.configure("barrier")
+        S.post_user_message(self.session, "run the suite")
+        self.once()
+        self.assertTrue(os.path.exists(os.path.join(self.session, S.WAKE_FILE)))
+        self.assertEqual({n: r["blocking"] for n, r in self.invocations().items()}, {"a": True, "b": True, "c": True})
+        self.assertTrue(wait_until(lambda: self.job_state("b") == "done", timeout=30))
+        self.once()
+        self.assertEqual(len(self.runs()), 1, "two of three finished, one failing: the barrier still holds")
+        self.assertTrue(wait_until(lambda: self.job_state("c") == "done", timeout=30))
+        self.once()
+        runs = self.runs()
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("all finished: a (succeeded (exit 0)), b (failed (exit 3)), c (succeeded (exit 0))",
+                      runs[1]["message"])
+        self.assertTrue(all(r["delivered_at"] for r in self.invocations().values()))
+        self.once()
+        self.assertEqual(len(self.runs()), 2)
+
+    def test_a_turn_killed_mid_delivery_redelivers_its_outcome_exactly_once(self):
+        store = J.JobStore(self.jobs_dir, emit=lambda m: None)
+        store.submit("exit 0", name="report")
+        self.assertTrue(wait_until(lambda: self.job_state("report") == "done", timeout=30))
+        self.configure("hang-first")
+        proc = subprocess.Popen([sys.executable, SCHEDULER, self.sessions, "--interval", "0.1"], cwd=HERE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.procs.append(proc)
+        self.assertTrue(wait_until(lambda: len(self.runs()) == 1
+                                   and (S._read_turn(self.session) or {}).get("state") == "running", timeout=60))
+        rec = self.invocations()["report"]
+        self.assertTrue(rec["delivering"] and not rec["delivered_at"], rec)
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        self.once()
+        runs = self.runs()
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("interrupted (crash)", runs[1]["message"])
+        self.assertIn("job 'report': succeeded (exit 0)", runs[1]["message"],
+                      "the outcome the crash swallowed was not carried again")
+        rec = self.invocations()["report"]
+        self.assertTrue(rec["delivered_at"], rec)
+        self.assertEqual(rec["redelivered"], 1)
+        self.once()
+        self.assertEqual(len(self.runs()), 2, "re-delivered more than once")
