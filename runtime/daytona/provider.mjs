@@ -131,6 +131,7 @@ export class DaytonaKernelProvider {
 		this.autoStopMinutes = options.autoStopMinutes ?? 15;
 		this.autoDeleteMinutes = options.autoDeleteMinutes ?? 1440;
 		this.snapshot = options.snapshot;
+		this.allowOpenEgress = options.allowOpenEgress ?? process.env.HARNESS_DAYTONA_ALLOW_OPEN_EGRESS === "1";
 		this.log = options.log ?? (() => {});
 		this.resources = options.resources;
 		this.bundle = undefined;
@@ -452,6 +453,15 @@ export class DaytonaKernelProvider {
 	}
 
 	checkPosture(server) {
+		if (server.posture?.egress !== "blocked" && this.allowOpenEgress) {
+			// Opted in explicitly (a demo on a Daytona tier that cannot lock egress). Credentials
+			// still never reach the sandbox (tool calls tunnel back); what is lost is the fence on
+			// exfiltrating data the kernel already holds.
+			const line = `WARNING: sandbox egress is NOT locked (probe: ${JSON.stringify(server.posture?.probe)}); proceeding because allowOpenEgress is set`;
+			this.log(line);
+			console.warn(`[daytona] ${line}`);
+			return server;
+		}
 		if (server.posture?.egress !== "blocked") {
 			throw new Error(
 				`sandbox egress is not locked (probe: ${JSON.stringify(server.posture?.probe)}); refusing to hand out a kernel`,
@@ -469,6 +479,11 @@ export class DaytonaKernelProvider {
 			KERNEL_SERVER_PORT: String(KERNEL_PORT),
 			KERNEL_SERVER_CWD: layout.workDir,
 			KERNEL_SERVER_BOUNDARY: "daytona-sandbox",
+			// The server refuses kernels on an open sandbox too; the same opt-in, recorded as the
+			// reason, lets it proceed.
+			...(this.allowOpenEgress
+				? { KERNEL_SERVER_ALLOW_OPEN_EGRESS: "allowOpenEgress (HARNESS_DAYTONA_ALLOW_OPEN_EGRESS): Daytona tier cannot lock egress" }
+				: {}),
 			KERNEL_SERVER_VERSION: version,
 		};
 		const envStr = Object.entries(env)

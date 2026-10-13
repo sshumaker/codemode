@@ -20,6 +20,12 @@ export interface DaytonaKernelProviderOptions {
 	snapshot?: string;
 	resources?: { cpu?: number; memory?: number; disk?: number };
 	log?: (line: string) => void;
+	/**
+	 * Hand out kernels even when the sandbox's egress probe is not blocked (a Daytona tier
+	 * that cannot lock egress). Default false, or HARNESS_DAYTONA_ALLOW_OPEN_EGRESS=1.
+	 * Credentials still stay out of the sandbox; data exfiltration is no longer fenced.
+	 */
+	allowOpenEgress?: boolean;
 }
 
 /** A local directory made available read-only in the sandbox (api/, skills/). */
