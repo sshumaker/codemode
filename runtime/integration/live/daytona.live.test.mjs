@@ -117,8 +117,12 @@ describe("live: Daytona kernel backend", { skip }, () => {
 			const before = await ours(client());
 			assert.ok(before.some((sb) => sb.labels?.conversation === ctx.conversationId), "the sandbox carries the run's owner label");
 			await backend.destroy(ctx.conversationId);
-			const afterDestroy = await ours(client());
-			assert.ok(!afterDestroy.some((sb) => sb.labels?.conversation === ctx.conversationId), "destroy removed it");
+			// Daytona deletes asynchronously: the sandbox can still be listed (destroying) for a while.
+			await until(async () => !(await ours(client())).some((sb) => sb.labels?.conversation === ctx.conversationId), {
+				what: "destroy to remove the sandbox",
+				timeoutMs: 120_000,
+				everyMs: 3_000,
+			});
 		});
 	});
 

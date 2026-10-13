@@ -18,8 +18,14 @@ export const SNAPSHOT_PREFIX = "harness-assistant-kernel-";
 /** Where the runtime lives in the image; the fallback path uses the same layout under $HOME. */
 export const IMAGE_RUNTIME_ROOT = "/opt/harness";
 
+/**
+ * Bump when kernelImage() changes: the bundle version alone does not see the image recipe,
+ * so without this an org keeps reusing a snapshot built from the old recipe.
+ */
+export const IMAGE_REVISION = "r2";
+
 export function snapshotName(version) {
-	return `${SNAPSHOT_PREFIX}${version}`;
+	return `${SNAPSHOT_PREFIX}${version}-${IMAGE_REVISION}`;
 }
 
 /** Env shared by the image build, the prebake, and the running server. */
@@ -46,7 +52,13 @@ export function kernelImage(bundleDir, root = IMAGE_RUNTIME_ROOT) {
 			`cd ${root}/kpkg && npm install --omit=dev --no-audit --no-fund --no-package-lock zeromq@${ZEROMQ_VERSION}`,
 			`cd ${root}/kpkg && PRIME_AGENT_INSTALL_UV=1 node dist/kernel-server.mjs --prebake`,
 			`chmod -R a+rwX ${root}`,
+			// Run as `daytona`, as Daytona's stock images do: the kernel backend predicts the
+			// sandbox's work dir as /home/daytona/work before the sandbox exists
+			// (runtime/kernel/daytona.mjs), and the provider derives it from the user's home.
+			// Built as root, home was /root and the two disagreed.
+			"id -u daytona >/dev/null 2>&1 || useradd --create-home --uid 1001 --shell /bin/bash daytona",
 		)
+		.dockerfileCommands(["USER daytona"])
 		.workdir("/home/daytona");
 }
 
