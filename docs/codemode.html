@@ -486,6 +486,7 @@ print(j.done, j.ok)
       </table>
     </div>
     <p class="muted" style="font-size:14px;font-family:var(--mono)">Cost advantage is 4.0× vs the tool-calling harness (full suite, n=432) and 2.3× vs Claude Code (held-out). Latency is warm-kernel; see integration notes. The long-build row is a single illustrative task (n=1) — an existence proof, not a rate.</p>
+    <div class="note"><b>On benchmarks.</b> Let's be honest: the benchmarks we all use are kind of questionable, and you can benchmaxx any of them by hill climbing. We hit plenty of that here. A TheAgentCompany task expects 4 meeting rooms when the correct answer is 5, so both arms got it right and both scored 0. One MCP-Bench server percent-encodes the slash in every id it looks up (<a href="https://github.com/sshumaker/codemode/blob/main/docs/MCPBENCH-HF-ENCODING-DEFECT.md">write-up</a>). An identical config scored 8/8, then 3/8 on a re-run. So don't read these numbers as a leaderboard claim. Score is reported as a tie because these suites saturate. Cost and context are reported because they actually move. The configuration was confirmed on 46 held-out tasks it was never tuned on. What we trust more is that the approach has held up <em>across benchmarks</em>: AppWorld, MCP-Bench, terminal-bench and TheAgentCompany, each with different failure modes. In fact, the core concepts, and some parts of this stack, have been applied to a production harness at a frontier lab.</div>
   </div>
 </section>
 
