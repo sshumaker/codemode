@@ -29,9 +29,9 @@ On matched tasks (Opus 5, paired):
 | wall-clock / task | **61s** | — | 88s |
 | score | tie | tie | tie (44/46 vs 44/46 held-out) |
 
-**→ Read the technical report: [`docs/codemode.html`](docs/codemode.html)**. It
-covers why it works, how it's built, what it costs and what we learned. Clone the
-repo and open the file locally, or view it via GitHub Pages.
+**→ [Read the technical report](https://sshumaker.github.io/codemode/codemode.html)**.
+It covers why it works, how it's built, what it costs and what we learned. The
+source is [`docs/codemode.html`](docs/codemode.html).
 
 ### On benchmarks
 
