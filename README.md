@@ -33,6 +33,27 @@ On matched tasks (Opus 5, paired):
 covers why it works, how it's built, what it costs and what we learned. Clone the
 repo and open the file locally, or view it via GitHub Pages.
 
+### On benchmarks
+
+Let's be honest: the benchmarks we all use are kind of questionable, and you can
+benchmaxx any of them by hill climbing. We hit plenty of that here:
+
+- Reference answers that are wrong. A TheAgentCompany task expects 4 meeting rooms
+  when the correct answer is 5, so both arms got it right and both scored 0.
+- Bugs inside the benchmark itself. One MCP-Bench server percent-encodes the slash
+  in every id it looks up ([write-up](docs/MCPBENCH-HF-ENCODING-DEFECT.md)).
+- Run-to-run noise as large as the effects people report. An identical config
+  scored 8/8, then 3/8 on a re-run.
+
+So don't read the numbers above as a leaderboard claim. Score is reported as a tie
+because these suites saturate. Cost and context are reported because they actually
+move. The configuration was confirmed on 46 held-out tasks it was never tuned on.
+
+What we trust more is that the approach has held up **across benchmarks**: AppWorld,
+MCP-Bench, terminal-bench and TheAgentCompany. Each has different failure modes. In
+fact, the core concepts, and some parts of this stack, have been applied to a
+production harness at a frontier lab.
+
 ## Why code beats tool-calling
 
 Models have practiced code from pre-training all the way through post-training.
