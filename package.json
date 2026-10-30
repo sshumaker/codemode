@@ -1,8 +1,7 @@
 {
   "name": "harness",
   "version": "1.0.0",
-  "description": "Code is all you need \u2014 agent harness experiment",
-  "main": "index.js",
+  "description": "Agent runtime where the model writes code, not tool calls — persistent kernel, MCP-to-Python compiler, durable jobs — plus the benchmark harness that measures it",
   "directories": {
     "doc": "docs"
   },
@@ -21,8 +20,8 @@
     "test:live": "node runtime/integration/live/run.mjs --"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Scott Shumaker",
+  "license": "MIT",
   "type": "module",
   "dependencies": {
     "@daytonaio/sdk": "^0.217.0",
