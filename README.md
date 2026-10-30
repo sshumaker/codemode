@@ -30,8 +30,7 @@ On matched tasks (Opus 5, paired):
 | score | tie | tie | tie (44/46 vs 44/46 held-out) |
 
 **→ [Read the technical report](https://executionatscale.org/codemode/codemode.html)**.
-It covers why it works, how it's built, what it costs and what we learned. The
-source is [`docs/codemode.html`](docs/codemode.html).
+It covers why it works, how it's built, what it costs and what we learned.
 
 ### On benchmarks
 
