@@ -1,14 +1,23 @@
 # codemode
 
-**An agent runtime where the model writes code, not tool calls.** It's built as a
-controlled experiment that measures whether that's actually better.
+**An agent runtime that is code-first and built to be hosted.** It comes with a
+controlled experiment that measures both claims.
 
-Codemode gives an agent a persistent Python kernel and compiles every tool (MCP
-server, OpenAPI spec, SDK) into a typed, importable module. The agent doesn't emit
-one JSON tool call per turn and get the whole result back in its context. It
-writes a program instead: it loops, filters, keeps state in variables and prints
-only what matters. Work that runs longer than a turn, like a 30-minute build, is a
-durable job the agent can start, step away from, and collect on a later turn.
+Codemode makes two bets, and each one makes the other cheaper:
+
+1. **The agent writes code, not tool calls.** Codemode gives the agent a
+   persistent Python kernel and compiles every tool (MCP server, OpenAPI spec, SDK)
+   into a typed, importable module. The agent doesn't emit one JSON tool call per
+   turn and get the whole result back in its context. It writes a program instead:
+   it loops, filters, keeps state in variables and prints only what matters.
+2. **The harness runs remotely, not on your laptop.** A local harness like Claude
+   Code has it easy: it can hold a process open on your machine for as long as it
+   likes. A hosted runtime serving many users can't pin a VM for 30 minutes while a
+   build runs. It has to release compute while it waits, survive losing the
+   machine, and keep agent-written code away from its credentials. Codemode is
+   designed around those constraints. Long work is a durable job, a wait ends the
+   turn instead of blocking, and the session is rebuilt from disk when a scheduler
+   wakes it, possibly on a different machine.
 
 On matched tasks (Opus 5, paired):
 
@@ -54,6 +63,54 @@ ids   = {s["song_id"] for s in lib}
 print([s["title"] for s in liked if s["song_id"] in ids])                # only 14 titles reach the model
 ```
 
+## Why a remote harness is harder, and how codemode handles it
+
+Backgrounding a long task is easy. Coming back to it reliably is the hard part. On a
+real 25–40 minute CompCert build, Claude Code backgrounded the build and polled it.
+Then it ended its turn with "I'll continue when it lands." There was no next turn,
+and the task failed. Codemode makes "come back to it" a primitive:
+
+```python
+jobs.submit("cd /tmp/CompCert && make -j$(nproc) all", name="build", max_runtime="4h")
+jobs.wait(wake_after=900)   # ends the turn; the host is released
+
+# a later turn, possibly in a fresh process on another machine
+j = jobs.get("build"); print(j.done, j.ok)   # True True
+```
+
+`wake_after` is a deadline, not a sleep: the session wakes the moment the job
+finishes. Each hosting problem has a matching part of the design:
+
+- **Release compute while waiting.** `wait` ends the turn instead of blocking. A
+  job is a file-backed process with a bounded lifetime, so the VM can be torn down
+  while it runs. Under the scheduler, the full CompCert build ran end to end with
+  six wakes and about 13 short-lived harness processes, for $0.39. Nothing was held
+  open.
+- **Survive losing the machine.** Between turns, the only durable state is what's
+  on disk: the transcript, the jobs manifest and the artifacts. Everything else is
+  rebuilt from it. In a live test, the kernel was SIGKILLed mid-task with two jobs
+  running. The fresh kernel's death notice said what survived, and the agent
+  collected both jobs, each run exactly once (10/10 checks, $0.07 per run). The wake
+  scheduler is about 200 lines. It gets single-writer leases and exactly-once wakes
+  from files rather than from coordination between processes.
+- **Keep secrets away from code the model wrote.** The agent loop holds the real
+  credentials and runs harness-side. Every cell runs in an OS sandbox with no
+  network and an allow-listed environment. The only way out is an egress proxy that
+  injects each upstream's credentials at the boundary and audits every request.
+  There's deliberately no route to the model provider. `spawn()` is the only way to
+  get more model calls, and it's metered and leaves a transcript.
+- **Place kernels anywhere.** Kernel backends cover a local sandbox, one
+  [Daytona](https://daytona.io) sandbox per conversation (with a warm pool, idle
+  sweep and file restore), and placement on the user's own device.
+
+The two bets compound. Splitting the agent loop from its execution environment
+means every action pays a trip across that boundary. A tool-calling agent making
+~40 calls per task pays it about 40 times. Codemode takes one action per turn and
+about 9 turns per task, so it pays about 9 times. Rebuilding the loop from the
+transcript on every wake is also nearly free when each turn is one code cell plus
+what the code chose to print, instead of a 100k-token catalogue re-read. The
+properties that make codemode cheap per task also make it cheap to host.
+
 ## What's in the runtime
 
 | component | what it does |
@@ -65,6 +122,7 @@ print([s["title"] for s in liked if s["song_id"] in ids])                # only 
 | **Read-gate** | The first call to an API is refused until its module has been read. The refusal names the exact lines to read. |
 | **Sandbox + egress proxy** (`runtime/posture.mjs`, `proxy/egress/`) | Agent code runs in an OS sandbox with no network except one proxy. The proxy injects credentials at the boundary, so no secret ever exists sandbox-side. It has no route to the model provider. |
 | **Kernel backends** (`runtime/kernel/`) | Local sandboxed, or one [Daytona](https://daytona.io) sandbox per conversation with a warm pool, idle sweep and file restore. See [`runtime/kernel/README.md`](runtime/kernel/README.md). |
+| **Remote kernel** (`scripts/patches/remote-kernel/`) | The agent loop drives a kernel inside a sandbox over one WebSocket. Frames are numbered and acknowledged, so a reconnect replays what was lost. File tools and tool calls go through the same socket, so the sandbox needs no egress. |
 
 The agent loop is [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)
 (itself a fork of [pi-mono](https://github.com/badlogic/pi-mono)), vendored and
